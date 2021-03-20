@@ -52,7 +52,7 @@ iniconfig==1.0.1          # via pytest
 ioloop==0.1a0
 ipaddress==1.0.22
 jaraco.functools==2.0
-jinja2==2.10.1
+jinja2==2.11.3
 jmespath==0.9.4
 jsondiff==1.2.0           # via moto
 jsonpatch==1.28           # via cfn-lint
