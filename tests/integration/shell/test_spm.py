@@ -1,8 +1,8 @@
 import os
 
 import pytest
+
 from tests.support.case import ShellCase, SPMCase
-from tests.support.helpers import slowTest
 
 
 @pytest.mark.windows_whitelisted
@@ -11,7 +11,7 @@ class SPMTest(ShellCase, SPMCase):
     Test spm script
     """
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_spm_help(self):
         """
         test --help argument for spm
@@ -21,7 +21,7 @@ class SPMTest(ShellCase, SPMCase):
         for arg in expected_args:
             self.assertIn(arg, "".join(output))
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_spm_bad_arg(self):
         """
         test correct output when bad argument passed
@@ -31,7 +31,7 @@ class SPMTest(ShellCase, SPMCase):
         for arg in expected_args:
             self.assertIn(arg, "".join(output))
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_spm_assume_yes(self):
         """
         test spm install with -y arg
@@ -41,15 +41,15 @@ class SPMTest(ShellCase, SPMCase):
 
         spm_file = os.path.join(config["spm_build_dir"], "apache-201506-2.spm")
 
-        build = self.run_spm("build {} -c {}".format(self.formula_dir, self._tmp_spm))
+        build = self.run_spm(f"build {self.formula_dir} -c {self._tmp_spm}")
 
-        install = self.run_spm("install {} -c {} -y".format(spm_file, self._tmp_spm))
+        install = self.run_spm(f"install {spm_file} -c {self._tmp_spm} -y")
 
         self.assertTrue(
             os.path.exists(os.path.join(config["formula_path"], "apache", "apache.sls"))
         )
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_spm_force(self):
         """
         test spm install with -f arg
@@ -59,15 +59,15 @@ class SPMTest(ShellCase, SPMCase):
 
         spm_file = os.path.join(config["spm_build_dir"], "apache-201506-2.spm")
 
-        build = self.run_spm("build {} -c {}".format(self.formula_dir, self._tmp_spm))
+        build = self.run_spm(f"build {self.formula_dir} -c {self._tmp_spm}")
 
-        install = self.run_spm("install {} -c {} -y".format(spm_file, self._tmp_spm))
+        install = self.run_spm(f"install {spm_file} -c {self._tmp_spm} -y")
 
         self.assertTrue(
             os.path.exists(os.path.join(config["formula_path"], "apache", "apache.sls"))
         )
 
         # check if it forces the install after its already been installed it
-        install = self.run_spm("install {} -c {} -y -f".format(spm_file, self._tmp_spm))
+        install = self.run_spm(f"install {spm_file} -c {self._tmp_spm} -y -f")
 
         self.assertEqual(["... installing apache"], install)

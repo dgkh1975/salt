@@ -37,7 +37,7 @@ network or hardware failure?
 .. note::
     There is also a MultiMaster-Tutorial with a different approach and topology
     than this one, that might also suite your needs or might even be better suited
-    `Multi-Master Tutorial <http://docs.saltstack.com/en/latest/topics/tutorials/multimaster.html>`_
+    `Multi-Master Tutorial <https://docs.saltproject.io/en/latest/topics/tutorials/multimaster.html>`_
 
 
 It is also desirable, to add some sort of authenticity-check to the very first
@@ -192,7 +192,7 @@ in the order they are defined. To randomize that order, set
 
 .. code-block:: yaml
 
-    master_shuffle: True
+    random_master: True
 
 The master-list will then be shuffled before the first connection attempt.
 
@@ -300,10 +300,8 @@ To avoid that, the master can use a pre-created signature of its public-key.
 The signature is saved as a base64 encoded string which the master reads
 once when starting and attaches only that string to auth-replies.
 
-Enabling this also gives paranoid users the possibility, to have the signing
-key-pair on a different system than the actual salt-master and create the public
-keys signature there. Probably on a system with more restrictive firewall rules,
-without internet access, less users, etc.
+This process turns each master into a "signing" master server that helps reduce overhead for auth-requests coming from minions.
+
 
 That signature can be created with
 

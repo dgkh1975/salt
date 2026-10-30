@@ -1,23 +1,16 @@
-# -*- coding: utf-8 -*-
 """
 Module for managing timezone on Windows systems.
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
-# Import Python libs
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
-# Import Salt libs
-from salt.exceptions import CommandExecutionError
-
-# Import 3rd party libs
 try:
-    import pytz
-
-    HAS_PYTZ = True
+    from zoneinfo import ZoneInfo
 except ImportError:
-    HAS_PYTZ = False
+    from backports.zoneinfo import ZoneInfo
+
+from salt.exceptions import CommandExecutionError
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +18,7 @@ log = logging.getLogger(__name__)
 __virtualname__ = "timezone"
 
 
-class TzMapper(object):
+class TzMapper:
     def __init__(self, unix_to_win):
         self.win_to_unix = {k.lower(): v for k, v in unix_to_win.items()}
         self.unix_to_win = {v.lower(): k for k, v in unix_to_win.items()}
@@ -139,6 +132,7 @@ mapper = TzMapper(
         "Pacific Standard Time (Mexico)": "America/Tijuana",
         "Pakistan Standard Time": "Asia/Karachi",
         "Paraguay Standard Time": "America/Asuncion",
+        "Qyzylorda Standard Time": "Asia/Qyzylorda",
         "Romance Standard Time": "Europe/Paris",
         "Russia Time Zone 10": "Asia/Srednekolymsk",
         "Russia Time Zone 11": "Asia/Kamchatka",
@@ -195,8 +189,6 @@ def __virtual__():
     """
     if not __utils__["platform.is_windows"]():
         return False, "Module win_timezone: Not on Windows client"
-    if not HAS_PYTZ:
-        return False, "Module win_timezone: pytz not found"
     if not __utils__["path.which"]("tzutil"):
         return False, "Module win_timezone: tzutil not found"
     return __virtualname__
@@ -224,7 +216,11 @@ def get_zone():
         raise CommandExecutionError(
             "tzutil encountered an error getting timezone", info=res
         )
-    return mapper.get_unix(res["stdout"].lower(), "Unknown")
+    tz = res["stdout"].lower()
+    if tz.endswith("_dstoff"):
+        tz = tz[:-7]
+
+    return mapper.get_unix(tz, "Unknown")
 
 
 def get_offset():
@@ -240,12 +236,9 @@ def get_offset():
 
         salt '*' timezone.get_offset
     """
-    # http://craigglennie.com/programming/python/2013/07/21/working-with-timezones-using-Python-and-pytz-localize-vs-normalize/
-    tz_object = pytz.timezone(get_zone())
-    utc_time = pytz.utc.localize(datetime.utcnow())
-    loc_time = utc_time.astimezone(tz_object)
-    norm_time = tz_object.normalize(loc_time)
-    return norm_time.strftime("%z")
+    tz = ZoneInfo(get_zone())
+    now = datetime.now(tz=timezone.utc).astimezone(tz)
+    return now.strftime("%z")
 
 
 def get_zonecode():
@@ -261,9 +254,9 @@ def get_zonecode():
 
         salt '*' timezone.get_zonecode
     """
-    tz_object = pytz.timezone(get_zone())
-    loc_time = tz_object.localize(datetime.utcnow())
-    return loc_time.tzname()
+    tz = ZoneInfo(get_zone())
+    now = datetime.now(tz=timezone.utc).astimezone(tz)
+    return now.tzname()
 
 
 def set_zone(timezone):
@@ -271,10 +264,11 @@ def set_zone(timezone):
     Sets the timezone using the tzutil.
 
     Args:
-        timezone (str): A valid timezone
+
+        timezone (str): A valid timezone.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     Raises:
         CommandExecutionError: If invalid timezone is passed
@@ -295,14 +289,14 @@ def set_zone(timezone):
 
     else:
         # Raise error because it's neither key nor value
-        raise CommandExecutionError("Invalid timezone passed: {0}".format(timezone))
+        raise CommandExecutionError(f"Invalid timezone passed: {timezone}")
 
     # Set the value
     cmd = ["tzutil", "/s", win_zone]
     res = __salt__["cmd.run_all"](cmd, python_shell=False)
     if res["retcode"]:
         raise CommandExecutionError(
-            "tzutil encountered an error setting " "timezone: {0}".format(timezone),
+            f"tzutil encountered an error setting timezone: {timezone}",
             info=res,
         )
     return zone_compare(timezone)
@@ -314,12 +308,13 @@ def zone_compare(timezone):
     running state checks.
 
     Args:
+
         timezone (str):
             The timezone to compare. This can be in Windows or Unix format. Can
-            be any of the values returned by the ``timezone.list`` function
+            be any of the values returned by the ``timezone.list`` function.
 
     Returns:
-        bool: ``True`` if they match, otherwise ``False``
+        bool: ``True`` if they match, otherwise ``False``.
 
     Example:
 
@@ -337,7 +332,7 @@ def zone_compare(timezone):
 
     else:
         # Raise error because it's neither key nor value
-        raise CommandExecutionError("Invalid timezone passed: {0}" "".format(timezone))
+        raise CommandExecutionError(f"Invalid timezone passed: {timezone}")
 
     return get_zone() == mapper.get_unix(check_zone, "Unknown")
 
@@ -350,12 +345,15 @@ def list(unix_style=True):
     .. versionadded:: 2018.3.3
 
     Args:
-        unix_style (bool):
+
+        unix_style (:obj:`bool`, optional):
             ``True`` returns Unix-style timezones. ``False`` returns
-            Windows-style timezones. Default is ``True``
+            Windows-style timezones. Default is ``True``.
+
+            Default is ``True``.
 
     Returns:
-        list: A list of supported timezones
+        list: A list of supported timezones.
 
     CLI Example:
 
@@ -379,7 +377,7 @@ def get_hwclock():
 
     .. note::
         The hardware clock is always local time on Windows so this will always
-        return "localtime"
+        return "localtime".
 
     CLI Example:
 

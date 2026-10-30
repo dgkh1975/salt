@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Network ACL
 ===========
@@ -31,9 +30,8 @@ it requires NAPALM_ library to be installed:  ``pip install napalm``.
 Please check Installation_ for complete details.
 
 .. _NAPALM: https://napalm.readthedocs.io
-.. _Installation: https://napalm.readthedocs.io/en/latest/installation.html
+.. _Installation: https://napalm.readthedocs.io/en/latest/installation/index.html
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
 
@@ -41,13 +39,12 @@ import salt.utils.napalm
 
 log = logging.getLogger(__file__)
 
-# Import third party libs
 try:
     # pylint: disable=W0611
     import capirca
     import capirca.aclgen
-    import capirca.lib.policy
     import capirca.lib.aclgenerator
+    import capirca.lib.policy
 
     HAS_CAPIRCA = True
     # pylint: enable=W0611
@@ -79,8 +76,7 @@ def __virtual__():
     else:
         return (
             False,
-            "The netacl state cannot be loaded: \
-                Please install capirca and napalm.",
+            "The netacl state cannot be loaded: Please install capirca and napalm.",
         )
 
 
@@ -111,7 +107,7 @@ def term(
     debug=False,
     source_service=None,
     destination_service=None,
-    **term_fields
+    **term_fields,
 ):
     """
     Manage the configuration of a specific policy term.
@@ -447,7 +443,7 @@ def term(
         test=test,
         commit=commit,
         debug=debug,
-        **term_fields
+        **term_fields,
     )
     return salt.utils.napalm.loaded_ret(ret, loaded, test, debug)
 

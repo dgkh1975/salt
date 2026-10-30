@@ -1,28 +1,21 @@
-# -*- coding: utf-8 -*-
 """
 Module for managing SNMP service settings on Windows servers.
 The Windows feature 'SNMP-Service' must be installed.
 """
-# Import Python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
 
-# Import Salt libs
 import salt.utils.platform
 from salt.exceptions import CommandExecutionError, SaltInvocationError
-
-# Import 3rd party libs
-from salt.ext import six
 
 _HKEY = "HKLM"
 
 _SNMP_KEY = r"SYSTEM\CurrentControlSet\Services\SNMP\Parameters"
-_AGENT_KEY = r"{0}\RFC1156Agent".format(_SNMP_KEY)
-_COMMUNITIES_KEY = r"{0}\ValidCommunities".format(_SNMP_KEY)
+_AGENT_KEY = rf"{_SNMP_KEY}\RFC1156Agent"
+_COMMUNITIES_KEY = rf"{_SNMP_KEY}\ValidCommunities"
 
 _SNMP_GPO_KEY = r"SOFTWARE\Policies\SNMP\Parameters"
-_COMMUNITIES_GPO_KEY = r"{0}\ValidCommunities".format(_SNMP_GPO_KEY)
+_COMMUNITIES_GPO_KEY = rf"{_SNMP_GPO_KEY}\ValidCommunities"
 
 _PERMISSION_TYPES = {
     "None": 1,
@@ -57,18 +50,6 @@ def __virtual__():
         return False, "Module win_snmp: SNMP not installed"
 
     return __virtualname__
-
-
-def _to_unicode(instr):
-    """
-    Converts from current users character encoding to unicode.
-    When instr has a value of None, the return value of the function
-    will also be None.
-    """
-    if instr is None or isinstance(instr, six.text_type):
-        return instr
-    else:
-        return six.text_type(instr, "utf8")
 
 
 def get_agent_service_types():
@@ -156,22 +137,26 @@ def set_agent_settings(contact=None, location=None, services=None):
     Manage the SNMP sysContact, sysLocation, and sysServices settings.
 
     Args:
-        contact (str, optional): The SNMP contact.
 
-        location (str, optional): The SNMP location.
+        contact (:obj:`str`, optional): The SNMP contact.
 
-        services (list, optional): A list of selected services. The possible
-            service names can be found via ``win_snmp.get_agent_service_types``.
-            To disable all services pass a list of None, ie: ['None']
+        location (:obj:`str`, optional): The SNMP location.
+
+        services (:obj:`list`, optional):
+            A list of selected services. The possible service names can be found
+            via ``win_snmp.get_agent_service_types``. To disable all services
+            pass a list of None, ie: ['None']
+
+            Default is ``None``.
 
     Returns:
-        bool: True if successful, otherwise False
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' win_snmp.set_agent_settings contact='Contact Name' location='Place' services="['Physical']"
+        salt '*' win_snmp.set_agent_settings contact='Contact Name' location='Place' services='["Physical"]'
     """
     if services is not None:
         # Filter services for unique items, and sort them for comparison
@@ -181,14 +166,10 @@ def set_agent_settings(contact=None, location=None, services=None):
         # Validate the services.
         for service in services:
             if service not in _SERVICE_TYPES:
-                message = (
-                    "Invalid service '{0}' specified. Valid services:" " {1}"
-                ).format(service, get_agent_service_types())
+                message = "Invalid service '{}' specified. Valid services: {}".format(
+                    service, get_agent_service_types()
+                )
                 raise SaltInvocationError(message)
-
-    if six.PY2:
-        contact = _to_unicode(contact)
-        location = _to_unicode(location)
 
     settings = {"contact": contact, "location": location, "services": services}
 
@@ -244,7 +225,7 @@ def get_auth_traps_enabled():
     Determine whether the host is configured to send authentication traps.
 
     Returns:
-        bool: True if traps are enabled, otherwise False
+        bool: ``True`` if traps are enabled, otherwise ``False``
 
     CLI Example:
 
@@ -264,10 +245,14 @@ def set_auth_traps_enabled(status=True):
     Manage the sending of authentication traps.
 
     Args:
-        status (bool): True to enable traps. False to disable.
+
+        status (:obj:`bool`, optional):
+            ``True`` to enable traps. ``False`` to disable.
+
+            Default is ``True``.
 
     Returns:
-        bool: True if successful, otherwise False
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -378,7 +363,7 @@ def get_community_names():
                 if not isinstance(current_value, dict):
                     continue
 
-                permissions = six.text_type()
+                permissions = ""
                 for permission_name in _PERMISSION_TYPES:
                     if current_value["vdata"] == _PERMISSION_TYPES[permission_name]:
                         permissions = permission_name
@@ -400,12 +385,13 @@ def set_community_names(communities):
         Policy settings it will raise a CommandExecutionError
 
     Args:
-        communities (dict): A dictionary of SNMP community names and
-            permissions. The possible permissions can be found via
-            ``win_snmp.get_permission_types``.
+
+        communities (dict):
+            A dictionary of SNMP community names and permissions. The possible
+            permissions can be found via ``win_snmp.get_permission_types``.
 
     Returns:
-        bool: True if successful, otherwise False
+        bool: ``True`` if successful, otherwise ``False``.
 
     Raises:
         CommandExecutionError:
@@ -415,7 +401,7 @@ def set_community_names(communities):
 
     .. code-block:: bash
 
-        salt '*' win_snmp.set_community_names communities="{'TestCommunity': 'Read Only'}'
+        salt '*' win_snmp.set_community_names communities='{"TestCommunity": "Read Only"}'
     """
     values = dict()
 
@@ -437,10 +423,11 @@ def set_community_names(communities):
         try:
             vdata = _PERMISSION_TYPES[communities[vname]]
         except KeyError:
-            message = (
-                "Invalid permission '{0}' specified. Valid permissions: " "{1}"
-            ).format(communities[vname], _PERMISSION_TYPES.keys())
-            raise SaltInvocationError(message)
+            raise SaltInvocationError(
+                "Invalid permission '{}' specified. Valid permissions: {}".format(
+                    communities[vname], _PERMISSION_TYPES.keys()
+                )
+            )
         values[vname] = vdata
 
     # Check current communities.

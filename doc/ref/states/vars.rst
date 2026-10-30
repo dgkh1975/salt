@@ -4,17 +4,9 @@ SLS Template Variable Reference
 
 
 .. warning::
-   In the 3002 release ``sls_path``, ``tplfile``, and ``tpldir`` have had some significant
+   In the 3005 release ``sls_path``, ``tplfile``, and ``tpldir`` have had some significant
    improvements which have the potential to break states that rely on old and
-   broken functionality. These fixes can be enabled by setting the
-   ``enable_slsvars_fixes`` feature flag to ``True`` in your minion's config file.
-   This functionality will become the default in the 3005 release.
-
-   .. code-block:: yaml
-
-       features:
-         enable_slsvars_fixes: True
-
+   broken functionality.
 
 
 The template engines available to sls files and file templates come loaded
@@ -127,6 +119,41 @@ will return ""
 
     {{ slspath }}
 
+When ``slspath`` and ``tpldir`` are populated
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``slspath`` and ``tpldir`` are template render-time variables. They are
+injected by Salt's state compiler when the SLS template is rendered as a
+state file. As a result:
+
+* They are populated inside any SLS file that is being rendered as state
+  data (top files, included SLS files, and the SLS being applied).
+* They are **not** populated inside templates that are rendered through
+  ``file.managed`` or ``template: jinja`` for non-state files. In those
+  contexts the template is rendered by the renderer subsystem, not by
+  the state compiler, and the state-only template variables are not in
+  scope. To get the SLS path inside a non-state template, pass it
+  explicitly via ``defaults`` or ``context``:
+
+  .. code-block:: yaml
+
+      configure-app:
+        file.managed:
+          - name: /etc/app.conf
+          - source: salt://app/files/app.conf.j2
+          - template: jinja
+          - defaults:
+              sls_dir: {{ slspath }}
+
+  Inside ``app.conf.j2`` the template can then use ``{{ sls_dir }}``.
+
+* When using a Jinja ``{% include %}`` from within an SLS file, the
+  included template inherits the current SLS render context, so
+  ``slspath`` and ``tpldir`` continue to refer to the *including* SLS.
+  When using Salt's ``include:`` directive at the top of an SLS file to
+  pull in another SLS, each SLS sees its own ``slspath`` while it is
+  being rendered.
+
 
 sls_path
 --------
@@ -190,6 +217,7 @@ is in root of the file roots, this will return ".". This is usually identical
 to `slspath` except in case of root-level sls, where this will return a "`.`".
 
 A Common use case for this variable is to generate relative salt urls like:
+
 .. code-block:: jinja
 
     my-file:

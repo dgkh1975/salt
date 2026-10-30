@@ -1,19 +1,15 @@
-# -*- coding: utf-8 -*-
 """
 This module allows SPM to use sqlite3 as the backend for SPM's package database.
 
 .. versionadded:: 2015.8.0
 """
 
-from __future__ import absolute_import, print_function, unicode_literals
-
-import datetime
 import logging
 import os
 import sqlite3
 from sqlite3 import OperationalError
 
-from salt.ext.six.moves import zip
+import salt.utils.timeutil
 
 # Get logging started
 log = logging.getLogger(__name__)
@@ -98,7 +94,7 @@ def info(package, conn=None):
         "description",
     )
     data = conn.execute(
-        "SELECT {0} FROM packages WHERE package=?".format(",".join(fields)), (package,)
+        "SELECT {} FROM packages WHERE package=?".format(",".join(fields)), (package,)
     )
     row = data.fetchone()
     if close:
@@ -171,7 +167,7 @@ def register_pkg(name, formula_def, conn=None):
             name,
             formula_def["version"],
             formula_def["release"],
-            datetime.datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            salt.utils.timeutil.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT"),
             formula_def.get("os", None),
             formula_def.get("os_family", None),
             formula_def.get("dependencies", None),
@@ -198,7 +194,7 @@ def register_file(name, member, path, digest="", conn=None):
         "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             name,
-            "{0}/{1}".format(path, member.path),
+            f"{path}/{member.path}",
             member.size,
             member.mode,
             digest,

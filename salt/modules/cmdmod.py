@@ -25,23 +25,25 @@ import salt.utils.data
 import salt.utils.files
 import salt.utils.json
 import salt.utils.path
+import salt.utils.pkg
 import salt.utils.platform
 import salt.utils.powershell
 import salt.utils.stringutils
 import salt.utils.templates
 import salt.utils.timed_subprocess
+import salt.utils.url
 import salt.utils.user
 import salt.utils.versions
 import salt.utils.vt
 import salt.utils.win_chcp
 import salt.utils.win_dacl
 import salt.utils.win_reg
+from salt._logging import LOG_LEVELS
 from salt.exceptions import (
     CommandExecutionError,
     SaltInvocationError,
     TimedProcTimeoutError,
 )
-from salt.log import LOG_LEVELS
 
 # Only available on POSIX systems, nonfatal on windows
 try:
@@ -51,6 +53,9 @@ except ImportError:
     pass
 
 if salt.utils.platform.is_windows():
+    import pywintypes
+
+    import salt.platform.win
     from salt.utils.win_functions import escape_argument as _cmd_quote
     from salt.utils.win_runas import runas as win_runas
 
@@ -72,9 +77,16 @@ DEFAULT_SHELL = salt.grains.extra.shell()["shell"]
 
 
 # Overwriting the cmd python module makes debugging modules with pdb a bit
-# harder so lets do it this way instead.
+# harder so let's do it this way instead.
 def __virtual__():
     return __virtualname__
+
+
+def _log_cmd(cmd):
+    if isinstance(cmd, (tuple, list)):
+        return cmd[0].strip()
+    else:
+        return str(cmd).split()[0].strip()
 
 
 def _check_cb(cb_):
@@ -92,7 +104,7 @@ def _check_cb(cb_):
 
 def _python_shell_default(python_shell, __pub_jid):
     """
-    Set python_shell default based on remote execution and __opts__['cmd_safe']
+    Set python_shell default based on the shell parameter and __opts__['cmd_safe']
     """
     try:
         # Default to python_shell=True when run directly from remote execution
@@ -119,21 +131,24 @@ def _chroot_pids(chroot):
     return pids
 
 
-def _render_cmd(
-    cmd, cwd, template, saltenv="base", pillarenv=None, pillar_override=None
-):
+def _render_cmd(cmd, cwd, template, saltenv=None, pillarenv=None, pillar_override=None):
     """
     If template is a valid template engine, process the cmd and cwd through
     that engine.
     """
+    if saltenv is None:
+        try:
+            saltenv = __opts__.get("saltenv", "base")
+        except NameError:
+            saltenv = "base"
+
     if not template:
         return (cmd, cwd)
 
     # render the path as a template using path_template_engine as the engine
     if template not in salt.utils.templates.TEMPLATE_REGISTRY:
         raise CommandExecutionError(
-            "Attempted to render file paths with unavailable engine "
-            "{}".format(template)
+            f"Attempted to render file paths with unavailable engine {template}"
         )
 
     kwargs = {}
@@ -199,13 +214,28 @@ def _parse_env(env):
     return env
 
 
+def _ensure_env_str(env):
+    """
+    Ensure that environment variables are strings
+    """
+    if not env:
+        env = {}
+    if not isinstance(env, dict):
+        env = {}
+    for key, val in env.items():
+        if not isinstance(val, str):
+            env[key] = str(val)
+        if not isinstance(key, str):
+            env[str(key)] = env.pop(key)
+
+
 def _gather_pillar(pillarenv, pillar_override):
     """
     Whenever a state run starts, gather the pillar data fresh
     """
     pillar = salt.pillar.get_pillar(
         __opts__,
-        __grains__,
+        __grains__.value(),
         __opts__["id"],
         __opts__["saltenv"],
         pillar_override=pillar_override,
@@ -244,6 +274,38 @@ def _check_avail(cmd):
     return bret and wret
 
 
+def _prep_powershell_cmd(win_shell, cmd, encoded_cmd):
+    """
+    Prep cmd when shell is powershell.exe or pwsh.exe. If we were called by script(), then
+    run it via the -File parameter, Otherwise, run the command via the -Command parameter.
+    """
+    new_cmd = [
+        win_shell,
+        "-NonInteractive",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+    ]
+
+    # extract_stack() returns a list of tuples.
+    # The last item in the list [-1] is the current method.
+    # The third item[2] in each tuple is the name of that method.
+    stack = traceback.extract_stack(limit=3)
+    if stack[-3][2] == "script":
+        new_cmd.append("-File")
+        new_cmd.extend(cmd)
+    elif encoded_cmd:
+        new_cmd.extend(["-EncodedCommand", cmd])
+    else:
+        new_cmd.append("-Command")
+        if isinstance(cmd, list):
+            cmd = " ".join(cmd)
+        new_cmd.append(cmd)
+
+    log.debug(new_cmd)
+    return new_cmd
+
+
 def _run(
     cmd,
     cwd=None,
@@ -267,7 +329,7 @@ def _run(
     with_communicate=True,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     pillarenv=None,
     pillar_override=None,
     use_vt=False,
@@ -275,8 +337,10 @@ def _run(
     bg=False,
     encoded_cmd=False,
     success_retcodes=None,
+    success_stdout=None,
+    success_stderr=None,
     windows_codepage=65001,
-    **kwargs
+    **kwargs,
 ):
     """
     Do the DRY thing and only call subprocess.Popen() once
@@ -310,7 +374,7 @@ def _run(
         # when run from sudo or another environment where the euid is
         # changed ~ will expand to the home of the original uid and
         # the euid might not have access to it. See issue #1844
-        if not os.access(cwd, os.R_OK):
+        if not os.access(cwd, os.R_OK) or not os.path.isdir(cwd):
             cwd = "/"
             if salt.utils.platform.is_windows():
                 cwd = os.path.abspath(os.sep)
@@ -325,10 +389,11 @@ def _run(
 
     change_windows_codepage = False
     if not salt.utils.platform.is_windows():
-        if not os.path.isfile(shell) or not os.access(shell, os.X_OK):
-            msg = "The shell {} is not available".format(shell)
-            raise CommandExecutionError(msg)
-    elif use_vt:  # Memozation so not much overhead
+        if shell:
+            if not os.path.isfile(shell) or not os.access(shell, os.X_OK):
+                msg = f"The shell {shell} is not available"
+                raise CommandExecutionError(msg)
+    elif use_vt:  # Memoization so not much overhead
         raise CommandExecutionError("VT not available on windows")
     else:
         if windows_codepage:
@@ -338,32 +403,6 @@ def _run(
             if windows_codepage != previous_windows_codepage:
                 change_windows_codepage = True
 
-    if shell.lower().strip() == "powershell":
-        # Strip whitespace
-        if isinstance(cmd, str):
-            cmd = cmd.strip()
-        elif isinstance(cmd, list):
-            cmd = " ".join(cmd).strip()
-
-        # If we were called by script(), then fakeout the Windows
-        # shell to run a Powershell script.
-        # Else just run a Powershell command.
-        stack = traceback.extract_stack(limit=2)
-
-        # extract_stack() returns a list of tuples.
-        # The last item in the list [-1] is the current method.
-        # The third item[2] in each tuple is the name of that method.
-        if stack[-2][2] == "script":
-            cmd = "Powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass {}".format(
-                cmd.replace('"', '\\"')
-            )
-        elif encoded_cmd:
-            cmd = "Powershell -NonInteractive -EncodedCommand {}".format(cmd)
-        else:
-            cmd = 'Powershell -NonInteractive -NoProfile "{}"'.format(
-                cmd.replace('"', '\\"')
-            )
-
     # munge the cmd and cwd through the template
     (cmd, cwd) = _render_cmd(cmd, cwd, template, saltenv, pillarenv, pillar_override)
     ret = {}
@@ -372,9 +411,65 @@ def _run(
     # checked if blacklisted
     if "__pub_jid" in kwargs:
         if not _check_avail(cmd):
-            raise CommandExecutionError(
-                'The shell command "{}" is not permitted'.format(cmd)
+            raise CommandExecutionError(f'The shell command "{cmd}" is not permitted')
+
+    # The powershell binary is "powershell"
+    # The powershell core binary is "pwsh"
+    # you can also pass a path here as long as the binary name is one of the two
+    if salt.utils.platform.is_windows():
+        if runas:
+            if not HAS_WIN_RUNAS:
+                msg = "missing salt/utils/win_runas.py"
+                raise CommandExecutionError(msg)
+
+        if shell is None:
+            shell = DEFAULT_SHELL
+
+        # Find the full path to the shell
+        win_shell = salt.utils.path.which(shell)
+        if not win_shell:
+            raise CommandExecutionError(f"shell binary not found: {win_shell}")
+
+        # Prepare the command to be executed
+        win_shell_lower = win_shell.lower()
+        if any(
+            win_shell_lower.endswith(word) for word in ["powershell.exe", "pwsh.exe"]
+        ):
+            cmd = _prep_powershell_cmd(win_shell, cmd, encoded_cmd)
+        elif any(win_shell_lower.endswith(word) for word in ["cmd.exe"]):
+            # win_runas: use CreateProcess-style one ``/c`` argument (see
+            # ``prepend_cmd``) only when the line can be misparsed at the
+            # process boundary: argv lists (e.g. :func:`script`) and plain
+            # ``cmd.exe /c path`` lines are fine with list2cmdline + unquoted
+            # /c; compound ``&``/``|`` *strings* need the extra wrap. Literal
+            # paths with spaces but no metacharacters must stay unwrapped.
+            win_cmd_is_argv = isinstance(cmd, (list, tuple))
+            win_cmd_needs_cswitch = (
+                bool(runas)
+                and (not win_cmd_is_argv)
+                and (
+                    python_shell
+                    or (isinstance(cmd, str) and (("&" in cmd) or ("|" in cmd)))
+                )
             )
+            if python_shell or runas:
+                cmd = salt.platform.win.prepend_cmd(
+                    win_shell,
+                    cmd,
+                    quote_c_payload=win_cmd_needs_cswitch,
+                    msvc_quote_bare_path_string=bool(runas) and (not python_shell),
+                )
+                # prepend_cmd may have silently converted -Command { } to
+                # -EncodedCommand; treat that the same as encoded_cmd=True so
+                # the CLIXML PowerShell emits to stderr is suppressed.
+                if (
+                    not encoded_cmd
+                    and isinstance(cmd, str)
+                    and "-EncodedCommand" in cmd
+                ):
+                    encoded_cmd = True
+        else:
+            raise CommandExecutionError(f"unsupported shell type: {win_shell}")
 
     env = _parse_env(env)
 
@@ -386,79 +481,63 @@ def _run(
         )
         env[bad_env_key] = ""
 
-    def _get_stripped(cmd):
-        # Return stripped command string copies to improve logging.
-        if isinstance(cmd, list):
-            return [x.strip() if isinstance(x, str) else x for x in cmd]
-        elif isinstance(cmd, str):
-            return cmd.strip()
-        else:
-            return cmd
-
     if output_loglevel is not None:
         # Always log the shell commands at INFO unless quiet logging is
         # requested. The command output is what will be controlled by the
         # 'loglevel' parameter.
         msg = "Executing command {}{}{} {}{}in directory '{}'{}".format(
             "'" if not isinstance(cmd, list) else "",
-            _get_stripped(cmd),
+            _log_cmd(cmd),
             "'" if not isinstance(cmd, list) else "",
-            "as user '{}' ".format(runas) if runas else "",
-            "in group '{}' ".format(group) if group else "",
+            f"as user '{runas}' " if runas else "",
+            f"in group '{group}' " if group else "",
             cwd,
-            ". Executing command in the background, no output will be logged."
-            if bg
-            else "",
+            (
+                ". Executing command in the background, no output will be logged."
+                if bg
+                else ""
+            ),
         )
         log.info(log_callback(msg))
 
-    if runas and salt.utils.platform.is_windows():
-        if not HAS_WIN_RUNAS:
-            msg = "missing salt/utils/win_runas.py"
-            raise CommandExecutionError(msg)
-
-        if isinstance(cmd, (list, tuple)):
-            cmd = " ".join(cmd)
-
-        return win_runas(cmd, runas, password, cwd)
-
     if runas and salt.utils.platform.is_darwin():
         # We need to insert the user simulation into the command itself and not
-        # just run it from the environment on macOS as that method doesn't work
+        # just run it from the environment on MacOS as that method doesn't work
         # properly when run as root for certain commands.
         if isinstance(cmd, (list, tuple)):
             cmd = " ".join(map(_cmd_quote, cmd))
 
         # Ensure directory is correct before running command
-        cmd = "cd -- {dir} && {{ {cmd}\n }}".format(dir=_cmd_quote(cwd), cmd=cmd)
+        cmd = f"cd -- {_cmd_quote(cwd)} && {{ {cmd}\n }}"
 
         # Ensure environment is correct for a newly logged-in user by running
         # the command under bash as a login shell
         try:
-            user_shell = __salt__["user.info"](runas)["shell"]
+            # Do not rely on populated __salt__ dict (ie avoid __salt__['user.info'])
+            user_shell = [x for x in pwd.getpwall() if x.pw_name == runas][0].pw_shell
             if re.search("bash$", user_shell):
                 cmd = "{shell} -l -c {cmd}".format(
                     shell=user_shell, cmd=_cmd_quote(cmd)
                 )
-        except KeyError:
+        except (AttributeError, IndexError):
             pass
 
         # Ensure the login is simulated correctly (note: su runs sh, not bash,
         # which causes the environment to be initialised incorrectly, which is
         # fixed by the previous line of code)
-        cmd = "su -l {} -c {}".format(_cmd_quote(runas), _cmd_quote(cmd))
+        cmd = f"su -l {_cmd_quote(runas)} -c {_cmd_quote(cmd)}"
 
         # Set runas to None, because if you try to run `su -l` after changing
         # user, su will prompt for the password of the user and cause salt to
         # hang.
         runas = None
 
-    if runas:
+    if runas and not salt.utils.platform.is_windows():
         # Save the original command before munging it
         try:
             pwd.getpwnam(runas)
         except KeyError:
-            raise CommandExecutionError("User '{}' is not available".format(runas))
+            raise CommandExecutionError(f"User '{runas}' is not available")
 
     if group:
         if salt.utils.platform.is_windows():
@@ -470,11 +549,11 @@ def _run(
         try:
             grp.getgrnam(group)
         except KeyError:
-            raise CommandExecutionError("Group '{}' is not available".format(runas))
+            raise CommandExecutionError(f"Group '{runas}' is not available")
         else:
             use_sudo = True
 
-    if runas or group:
+    if (runas or group) and not salt.utils.platform.is_windows():
         try:
             # Getting the environment for the runas user
             # Use markers to thwart any stdout noise
@@ -484,10 +563,9 @@ def _run(
             marker = "<<<" + str(uuid.uuid4()) + ">>>"
             marker_b = marker.encode(__salt_system_encoding__)
             py_code = (
-                "import sys, os, itertools; "
-                'sys.stdout.write("' + marker + '"); '
-                'sys.stdout.write("\\0".join(itertools.chain(*os.environ.items()))); '
-                'sys.stdout.write("' + marker + '");'
+                "import sys, os, itertools; sys.stdout.write('{0}'); "
+                "sys.stdout.write('\\0'.join(itertools.chain(*os.environ.items()))); "
+                "sys.stdout.write('{0}');".format(marker)
             )
 
             if use_sudo:
@@ -497,35 +575,70 @@ def _run(
                     env_cmd.extend(["-u", runas])
                 if group:
                     env_cmd.extend(["-g", group])
-                if shell != DEFAULT_SHELL:
-                    env_cmd.extend(["-s", "--", shell, "-c"])
+                if shell:
+                    if shell != DEFAULT_SHELL:
+                        env_cmd.extend(["-s", "--", shell, "-c"])
+                    else:
+                        env_cmd.extend(["-i", "--"])
                 else:
-                    env_cmd.extend(["-i", "--"])
-                env_cmd.extend([sys.executable])
+                    # do not invoke a shell at all
+                    env_cmd.extend(["--"])
             elif __grains__["os"] in ["FreeBSD"]:
-                env_cmd = (
+                env_cmd = [
                     "su",
                     "-",
                     runas,
                     "-c",
-                    "{} -c {}".format(shell, sys.executable),
-                )
+                ]
             elif __grains__["os_family"] in ["Solaris"]:
-                env_cmd = ("su", "-", runas, "-c", sys.executable)
+                env_cmd = ["su", "-", runas, "-c"]
             elif __grains__["os_family"] in ["AIX"]:
-                env_cmd = ("su", "-", runas, "-c", sys.executable)
+                env_cmd = ["su", "-", runas, "-c"]
             else:
-                env_cmd = ("su", "-s", shell, "-", runas, "-c", sys.executable)
-            msg = "env command: {}".format(env_cmd)
-            log.debug(log_callback(msg))
+                # su invokes a shell by design
+                if shell:
+                    env_cmd = ["su", "-s", shell, "-", runas, "-c"]
+                else:
+                    env_cmd = ["su", "-", runas, "-c"]
 
-            env_bytes, env_encoded_err = subprocess.Popen(
-                env_cmd,
-                stderr=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-            ).communicate(salt.utils.stringutils.to_bytes(py_code))
-            marker_count = env_bytes.count(marker_b)
+            if not salt.utils.pkg.check_bundled():
+                if __grains__["os"] in ["FreeBSD"]:
+                    env_cmd.extend([f"{shell} -c {sys.executable}"])
+                else:
+                    env_cmd.extend([sys.executable])
+            else:
+                with tempfile.NamedTemporaryFile("w", delete=False) as fp:
+                    if __grains__["os"] in ["FreeBSD"]:
+                        env_cmd.extend(
+                            [
+                                "{} -c {} python {}".format(
+                                    shell, sys.executable, fp.name
+                                )
+                            ]
+                        )
+                    else:
+                        env_cmd.extend([f"{sys.executable} python {fp.name}"])
+                    fp.write(py_code)
+                    shutil.chown(fp.name, runas)
+
+            msg = f"env command: {env_cmd}"
+            log.debug(log_callback(msg))
+            try:
+                env_bytes, env_encoded_err = subprocess.Popen(
+                    env_cmd,
+                    stderr=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                ).communicate(salt.utils.stringutils.to_bytes(py_code), timeout=10)
+            except subprocess.TimeoutExpired:
+                marker_count = 0
+                env_encoded_err = None
+                env_bytes = None
+            else:
+                marker_count = env_bytes.count(marker_b)
+
+            if salt.utils.pkg.check_bundled():
+                os.remove(fp.name)
             if marker_count == 0:
                 # Possibly PAM prevented the login
                 log.error(
@@ -562,7 +675,7 @@ def _run(
 
             # Fix some corner cases where shelling out to get the user's
             # environment returns the wrong home directory.
-            runas_home = os.path.expanduser("~{}".format(runas))
+            runas_home = os.path.expanduser(f"~{runas}")
             if env_runas.get("HOME") != runas_home:
                 env_runas["HOME"] = runas_home
 
@@ -594,7 +707,8 @@ def _run(
             env.setdefault("LC_IDENTIFICATION", "C")
             env.setdefault("LANGUAGE", "C")
 
-    if clean_env:
+    if clean_env or (runas and salt.utils.platform.is_windows()):
+        # always use a clean environment with CreateProcess on Windows
         run_env = env
 
     else:
@@ -608,6 +722,11 @@ def _run(
 
     if prepend_path:
         run_env["PATH"] = ":".join((prepend_path, run_env["PATH"]))
+
+    if "NOTIFY_SOCKET" not in env:
+        run_env.pop("NOTIFY_SOCKET", None)
+
+    _ensure_env_str(run_env)
 
     if python_shell is None:
         python_shell = False
@@ -637,7 +756,7 @@ def _run(
         try:
             _umask = int(_umask, 8)
         except ValueError:
-            raise CommandExecutionError("Invalid umask: '{}'".format(umask))
+            raise CommandExecutionError(f"Invalid umask: '{umask}'")
     else:
         _umask = None
 
@@ -659,11 +778,12 @@ def _run(
 
     if not os.path.isabs(cwd) or not os.path.isdir(cwd):
         raise CommandExecutionError(
-            "Specified cwd '{}' either not absolute or does not exist".format(cwd)
+            f"Specified cwd '{cwd}' either not absolute or does not exist"
         )
 
     if (
         python_shell is not True
+        and shell is not None
         and not salt.utils.platform.is_windows()
         and not isinstance(cmd, list)
     ):
@@ -678,32 +798,102 @@ def _run(
             ]
         except ValueError:
             raise SaltInvocationError("success_retcodes must be a list of integers")
+
+    if success_stdout is None:
+        success_stdout = []
+    else:
+        success_stdout = salt.utils.args.split_input(success_stdout)
+
+    if success_stderr is None:
+        success_stderr = []
+    else:
+        success_stderr = salt.utils.args.split_input(success_stderr)
+
     if not use_vt:
         # This is where the magic happens
-        try:
-            if change_windows_codepage:
-                salt.utils.win_chcp.set_codepage_id(windows_codepage)
-            try:
-                proc = salt.utils.timed_subprocess.TimedProc(cmd, **new_kwargs)
-            except OSError as exc:
-                msg = "Unable to run command '{}' with the context '{}', reason: {}".format(
-                    cmd if output_loglevel is not None else "REDACTED", new_kwargs, exc
-                )
-                raise CommandExecutionError(msg)
+
+        if runas and salt.utils.platform.is_windows():
+            # We can't use TimedProc with runas on Windows
+            new_kwargs.update(
+                {
+                    "redirect_stderr": True if stderr == subprocess.STDOUT else False,
+                }
+            )
 
             try:
-                proc.run()
-            except TimedProcTimeoutError as exc:
-                ret["stdout"] = str(exc)
-                ret["stderr"] = ""
-                ret["retcode"] = None
-                ret["pid"] = proc.process.pid
-                # ok return code for timeouts?
-                ret["retcode"] = 1
-                return ret
-        finally:
-            if change_windows_codepage:
-                salt.utils.win_chcp.set_codepage_id(previous_windows_codepage)
+                if change_windows_codepage:
+                    salt.utils.win_chcp.set_codepage_id(windows_codepage)
+                try:
+                    proc = win_runas(cmd, runas, password, **new_kwargs)
+                except (OSError, pywintypes.error) as exc:
+                    msg = "Unable to run command '{}' with the context '{}', reason: {}".format(
+                        cmd if output_loglevel is not None else "REDACTED",
+                        new_kwargs,
+                        exc,
+                    )
+                    raise CommandExecutionError(msg)
+                except TimedProcTimeoutError as exc:
+                    ret["stdout"] = str(exc)
+                    ret["stderr"] = ""
+                    ret["retcode"] = ""
+                    ret["pid"] = ""
+                    # ok return code for timeouts?
+                    ret["retcode"] = 1
+                    return ret
+            finally:
+                if change_windows_codepage:
+                    salt.utils.win_chcp.set_codepage_id(previous_windows_codepage)
+
+            proc_pid = proc.get("pid")
+            proc_retcode = proc.get("retcode")
+            proc_stdout = proc.get("stdout")
+            proc_stderr = proc.get("stderr")
+
+        else:
+            try:
+                if change_windows_codepage:
+                    salt.utils.win_chcp.set_codepage_id(windows_codepage)
+                try:
+                    proc = salt.utils.timed_subprocess.TimedProc(cmd, **new_kwargs)
+                except OSError as exc:
+                    # Drop ``env`` and ``stdin`` from the debug context.
+                    # ``env`` is the run environment and routinely
+                    # carries credentials passed in via
+                    # ``cmd.run env={'DB_PASSWORD': '...'}``; ``stdin``
+                    # is the data piped to the command and is also a
+                    # common place for callers to put a password. The
+                    # error message ends up in minion/master logs *and*
+                    # in event-bus return data visible to the API
+                    # caller, so leaking either one is a wide-channel
+                    # exposure of a secret on what is typically a
+                    # routine ENOENT (binary not found).
+                    safe_kwargs = {
+                        k: v for k, v in new_kwargs.items() if k not in ("env", "stdin")
+                    }
+                    msg = "Unable to run command '{}' with the context '{}', reason: {}".format(
+                        cmd if output_loglevel is not None else "REDACTED",
+                        safe_kwargs,
+                        exc,
+                    )
+                    raise CommandExecutionError(msg)
+                try:
+                    proc.run()
+                except TimedProcTimeoutError as exc:
+                    ret["stdout"] = str(exc)
+                    ret["stderr"] = ""
+                    ret["retcode"] = None
+                    ret["pid"] = proc.process.pid
+                    # ok return code for timeouts?
+                    ret["retcode"] = 1
+                    return ret
+            finally:
+                if change_windows_codepage:
+                    salt.utils.win_chcp.set_codepage_id(previous_windows_codepage)
+
+            proc_pid = proc.process.pid
+            proc_retcode = proc.process.returncode
+            proc_stdout = proc.stdout
+            proc_stderr = proc.stderr
 
         if output_loglevel != "quiet" and output_encoding is not None:
             log.debug(
@@ -714,57 +904,68 @@ def _run(
 
         try:
             out = salt.utils.stringutils.to_unicode(
-                proc.stdout, encoding=output_encoding
+                proc_stdout, encoding=output_encoding
             )
         except TypeError:
             # stdout is None
             out = ""
         except UnicodeDecodeError:
             out = salt.utils.stringutils.to_unicode(
-                proc.stdout, encoding=output_encoding, errors="replace"
+                proc_stdout, encoding=output_encoding, errors="replace"
             )
             if output_loglevel != "quiet":
                 log.error(
                     "Failed to decode stdout from command %s, non-decodable "
                     "characters have been replaced",
-                    cmd,
+                    _log_cmd(cmd),
                 )
 
         try:
             err = salt.utils.stringutils.to_unicode(
-                proc.stderr, encoding=output_encoding
+                proc_stderr, encoding=output_encoding
             )
         except TypeError:
             # stderr is None
             err = ""
         except UnicodeDecodeError:
             err = salt.utils.stringutils.to_unicode(
-                proc.stderr, encoding=output_encoding, errors="replace"
+                proc_stderr, encoding=output_encoding, errors="replace"
             )
             if output_loglevel != "quiet":
                 log.error(
                     "Failed to decode stderr from command %s, non-decodable "
                     "characters have been replaced",
-                    cmd,
+                    _log_cmd(cmd),
                 )
 
+        # Encoded commands dump CLIXML data in stderr. It's not an actual error
+        if encoded_cmd and "CLIXML" in err:
+            err = ""
         if rstrip:
             if out is not None:
                 out = out.rstrip()
             if err is not None:
                 err = err.rstrip()
-        ret["pid"] = proc.process.pid
-        ret["retcode"] = proc.process.returncode
-        if ret["retcode"] in success_retcodes:
-            ret["retcode"] = 0
+
+        ret["pid"] = proc_pid
+        ret["retcode"] = proc_retcode
         ret["stdout"] = out
         ret["stderr"] = err
+
+        if ret["retcode"] in success_retcodes:
+            ret["retcode"] = 0
+        if any(
+            [stdo in ret["stdout"] for stdo in success_stdout]
+            + [stde in ret["stderr"] for stde in success_stderr]
+        ):
+            ret["retcode"] = 0
+
     else:
         formatted_timeout = ""
         if timeout:
-            formatted_timeout = " (timeout: {}s)".format(timeout)
+            formatted_timeout = f" (timeout: {timeout}s)"
         if output_loglevel is not None:
-            msg = "Running {} in VT{}".format(cmd, formatted_timeout)
+            msg = f"Running {cmd} in VT{formatted_timeout}"
             log.debug(log_callback(msg))
         stdout, stderr = "", ""
         now = time.time()
@@ -788,6 +989,8 @@ def _run(
                 stream_stderr=True,
             )
             ret["pid"] = proc.pid
+            stdout = ""
+            stderr = ""
             while proc.has_unread_data:
                 try:
                     try:
@@ -798,20 +1001,16 @@ def _run(
                             cstdout, cstderr = "", ""
                         if cstdout:
                             stdout += cstdout
-                        else:
-                            stdout = ""
                         if cstderr:
                             stderr += cstderr
-                        else:
-                            stderr = ""
                         if timeout and (time.time() > will_timeout):
-                            ret["stderr"] = ("SALT: Timeout after {}s\n{}").format(
+                            ret["stderr"] = "SALT: Timeout after {}s\n{}".format(
                                 timeout, stderr
                             )
                             ret["retcode"] = None
                             break
                     except KeyboardInterrupt:
-                        ret["stderr"] = "SALT: User break\n{}".format(stderr)
+                        ret["stderr"] = f"SALT: User break\n{stderr}"
                         ret["retcode"] = 1
                         break
                 except salt.utils.vt.TerminalException as exc:
@@ -827,6 +1026,11 @@ def _run(
                     ret["stderr"] = stderr
                     ret["retcode"] = proc.exitstatus
                     if ret["retcode"] in success_retcodes:
+                        ret["retcode"] = 0
+                    if any(
+                        [stdo in ret["stdout"] for stdo in success_stdout]
+                        + [stde in ret["stderr"] for stde in success_stderr]
+                    ):
                         ret["retcode"] = 0
                 ret["pid"] = proc.pid
         finally:
@@ -845,7 +1049,9 @@ def _run(
         if not ignore_retcode and ret["retcode"] != 0:
             if output_loglevel < LOG_LEVELS["error"]:
                 output_loglevel = LOG_LEVELS["error"]
-            msg = "Command '{}' failed with return code: {}".format(cmd, ret["retcode"])
+            msg = "Command '{}' failed with return code: {}".format(
+                _log_cmd(cmd), ret["retcode"]
+            )
             log.error(log_callback(msg))
         if ret["stdout"]:
             log.log(output_loglevel, "stdout: %s", log_callback(ret["stdout"]))
@@ -870,10 +1076,13 @@ def _run_quiet(
     umask=None,
     timeout=None,
     reset_system_locale=True,
-    saltenv="base",
+    saltenv=None,
     pillarenv=None,
     pillar_override=None,
     success_retcodes=None,
+    success_stdout=None,
+    success_stderr=None,
+    ignore_retcode=None,
 ):
     """
     Helper for running commands quietly for minion startup
@@ -898,6 +1107,9 @@ def _run_quiet(
         pillarenv=pillarenv,
         pillar_override=pillar_override,
         success_retcodes=success_retcodes,
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        ignore_retcode=ignore_retcode,
     )["stdout"]
 
 
@@ -913,13 +1125,15 @@ def _run_all_quiet(
     umask=None,
     timeout=None,
     reset_system_locale=True,
-    saltenv="base",
+    saltenv=None,
     pillarenv=None,
     pillar_override=None,
     output_encoding=None,
     success_retcodes=None,
+    success_stdout=None,
+    success_stderr=None,
+    ignore_retcode=None,
 ):
-
     """
     Helper for running commands quietly for minion startup.
     Returns a dict of return data.
@@ -948,6 +1162,9 @@ def _run_all_quiet(
         pillarenv=pillarenv,
         pillar_override=pillar_override,
         success_retcodes=success_retcodes,
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        ignore_retcode=ignore_retcode,
     )
 
 
@@ -971,15 +1188,18 @@ def run(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
+    redirect_stderr=True,
     bg=False,
     password=None,
     encoded_cmd=False,
     raise_err=False,
     prepend_path=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     r"""
     Execute the passed command and return the output as a string
@@ -999,7 +1219,7 @@ def run(
 
         .. warning::
 
-            For versions 2018.3.3 and above on macosx while using runas,
+            For versions 2018.3.3 and above on MacOS while using runas,
             on linux while using run, to pass special characters to the
             command you need to escape the characters on the shell.
 
@@ -1009,11 +1229,35 @@ def run(
 
                 cmd.run 'echo '\''h=\"baz\"'\''' runas=macuser
 
+        .. note::
+
+            On Linux ``runas`` switches the effective user but does **not**
+            run a login shell, so the supplementary groups, ``$HOME`` and
+            ``$PATH`` of the target account are not loaded. The primary
+            group of the salt-minion process (typically ``root``) is kept,
+            which is why ``id`` from inside the executed command may report
+            ``gid=0(root)``. Pass ``group=`` to switch the primary group as
+            well, or invoke a login shell explicitly (for example
+            ``su - <user> -c '...'``) when the full target environment is
+            required.
+
     :param str group: Group to run command as. Not currently supported
         on Windows.
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
+
+        .. note::
+
+            On Windows, when ``runas`` is supplied but no logon token is
+            available (i.e. the salt-minion is not running as SYSTEM or as
+            an elevated Administrator), ``password`` must also be provided.
+            Omitting it surfaces as an opaque "embedded null character"
+            error.
 
         .. versionadded:: 2016.3.0
 
@@ -1029,6 +1273,9 @@ def run(
 
         .. versionadded:: 2016.3.0
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param dict env: Environment variables to be set prior to execution.
 
         .. note::
@@ -1038,6 +1285,14 @@ def run(
             .. code-block:: bash
 
                 salt myminion cmd.run 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param bool clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
@@ -1098,11 +1353,44 @@ def run(
 
     :param int timeout: A timeout in seconds for the executed process to return.
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
         more interactively to the console and the logs. This is experimental.
 
+    :param bool redirect_stderr: If set to ``True``, then stderr will be
+        redirected to stdout. This is helpful for cases where obtaining both
+        the retcode and output is desired. Default is ``True``
+
+        .. versionadded:: 3006.9
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool encoded_cmd: Specify if the supplied command is encoded.
-        Only applies to shell 'powershell'.
+        Only applies to shell 'powershell' and 'pwsh'.
+
+        .. versionadded:: 2018.3.0
+
+        Older versions of powershell seem to return raw xml data in the return.
+        To avoid raw xml data in the return, prepend your command with the
+        following before encoding:
+
+        `$ProgressPreference='SilentlyContinue'; <your command>`
+
+        The following powershell code block will encode the `Write-Output`
+        command so that it will not have the raw xml data in the return:
+
+        .. code-block:: powershell
+
+            # target string
+            $Command = '$ProgressPreference="SilentlyContinue"; Write-Output "hello"'
+
+            # Convert to Base64 encoded string
+            $Encoded = [convert]::ToBase64String([System.Text.encoding]::Unicode.GetBytes($command))
+
+            Write-Output $Encoded
 
     :param bool raise_err: If ``True`` and the command has a nonzero exit code,
         a CommandExecutionError exception will be raised.
@@ -1119,12 +1407,26 @@ def run(
         Be absolutely certain that you have sanitized your input prior to using
         python_shell=True
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -1138,7 +1440,6 @@ def run(
         Code page 65001 corresponds with UTF-8 and allows international localization of Windows.
 
       .. versionadded:: 3002
-
 
     CLI Example:
 
@@ -1178,6 +1479,7 @@ def run(
         salt '*' cmd.run cmd='sed -e s/=/:/g'
     """
     python_shell = _python_shell_default(python_shell, kwargs.get("__pub_jid", ""))
+    stderr = subprocess.STDOUT if redirect_stderr else subprocess.PIPE
     ret = _run(
         cmd,
         runas=runas,
@@ -1186,7 +1488,7 @@ def run(
         python_shell=python_shell,
         cwd=cwd,
         stdin=stdin,
-        stderr=subprocess.STDOUT,
+        stderr=stderr,
         env=env,
         clean_env=clean_env,
         prepend_path=prepend_path,
@@ -1205,7 +1507,9 @@ def run(
         password=password,
         encoded_cmd=encoded_cmd,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
 
     log_callback = _check_cb(log_callback)
@@ -1215,7 +1519,9 @@ def run(
         if not ignore_retcode and ret["retcode"] != 0:
             if lvl < LOG_LEVELS["error"]:
                 lvl = LOG_LEVELS["error"]
-            msg = "Command '{}' failed with return code: {}".format(cmd, ret["retcode"])
+            msg = "Command '{}' failed with return code: {}".format(
+                _log_cmd(cmd), ret["retcode"]
+            )
             log.error(log_callback(msg))
             if raise_err:
                 raise CommandExecutionError(
@@ -1244,13 +1550,15 @@ def shell(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     bg=False,
     password=None,
     prepend_path=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Execute the passed command and return the output as a string.
@@ -1268,13 +1576,11 @@ def shell(
         cases where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
         .. warning::
 
-            For versions 2018.3.3 and above on macosx while using runas,
+            For versions 2018.3.3 and above on MacOS while using runas,
             to pass special characters to the command you need to escape
             the characters on the shell.
 
@@ -1287,8 +1593,12 @@ def shell(
     :param str group: Group to run command as. Not currently supported
       on Windows.
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
         .. versionadded:: 2016.3.0
 
@@ -1297,6 +1607,9 @@ def shell(
 
     :param bool bg: If True, run command in background and do not await or
         deliver its results
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param dict env: Environment variables to be set prior to execution.
 
@@ -1307,6 +1620,14 @@ def shell(
             .. code-block:: bash
 
                 salt myminion cmd.shell 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param bool clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
@@ -1368,6 +1689,9 @@ def shell(
     :param int timeout: A timeout in seconds for the executed process to
         return.
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
         more interactively to the console and the logs. This is experimental.
 
@@ -1377,12 +1701,26 @@ def shell(
         processing! Be absolutely sure that you have properly sanitized the
         command passed to this function and do not use untrusted inputs.
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -1427,9 +1765,10 @@ def shell(
 
         salt '*' cmd.shell cmd='sed -e s/=/:/g'
     """
-    if "python_shell" in kwargs:
-        python_shell = kwargs.pop("python_shell")
-    else:
+    # for cmd.shell, we always want to use python_shell, unless otherwise
+    # specified. If it is None, we will make it True
+    python_shell = kwargs.pop("python_shell", True)
+    if python_shell is None:
         python_shell = True
     return run(
         cmd,
@@ -1457,7 +1796,9 @@ def shell(
         bg=bg,
         password=password,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
 
 
@@ -1481,12 +1822,14 @@ def run_stdout(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     password=None,
     prepend_path=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Execute a command, and only return the standard out
@@ -1502,13 +1845,11 @@ def run_stdout(
         cases where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
         .. warning::
 
-            For versions 2018.3.3 and above on macosx while using runas,
+            For versions 2018.3.3 and above on MacOS while using runas,
             to pass special characters to the command you need to escape
             the characters on the shell.
 
@@ -1518,8 +1859,12 @@ def run_stdout(
 
                 cmd.run_stdout 'echo '\\''h=\\"baz\\"'\\''' runas=macuser
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
         .. versionadded:: 2016.3.0
 
@@ -1542,6 +1887,14 @@ def run_stdout(
             .. code-block:: bash
 
                 salt myminion cmd.run_stdout 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param bool clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
@@ -1603,15 +1956,32 @@ def run_stdout(
     :param int timeout: A timeout in seconds for the executed process to
         return.
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
         more interactively to the console and the logs. This is experimental.
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -1666,7 +2036,9 @@ def run_stdout(
         use_vt=use_vt,
         password=password,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
 
     return ret["stdout"] if not hide_output else ""
@@ -1692,12 +2064,14 @@ def run_stderr(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     password=None,
     prepend_path=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Execute a command and only return the standard error
@@ -1713,13 +2087,11 @@ def run_stderr(
         cases where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
         .. warning::
 
-            For versions 2018.3.3 and above on macosx while using runas,
+            For versions 2018.3.3 and above on MacOS while using runas,
             to pass special characters to the command you need to escape
             the characters on the shell.
 
@@ -1729,8 +2101,12 @@ def run_stderr(
 
                 cmd.run_stderr 'echo '\\''h=\\"baz\\"'\\''' runas=macuser
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
         .. versionadded:: 2016.3.0
 
@@ -1753,6 +2129,14 @@ def run_stderr(
             .. code-block:: bash
 
                 salt myminion cmd.run_stderr 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param bool clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
@@ -1814,15 +2198,32 @@ def run_stderr(
     :param int timeout: A timeout in seconds for the executed process to
         return.
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
         more interactively to the console and the logs. This is experimental.
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -1877,7 +2278,9 @@ def run_stderr(
         saltenv=saltenv,
         password=password,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
 
     return ret["stderr"] if not hide_output else ""
@@ -1903,14 +2306,16 @@ def run_all(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     redirect_stderr=False,
     password=None,
     encoded_cmd=False,
     prepend_path=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Execute the passed command and return a dict of return data
@@ -1926,13 +2331,11 @@ def run_all(
         cases where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
         .. warning::
 
-            For versions 2018.3.3 and above on macosx while using runas,
+            For versions 2018.3.3 and above on MacOS while using runas,
             to pass special characters to the command you need to escape
             the characters on the shell.
 
@@ -1942,8 +2345,12 @@ def run_all(
 
                 cmd.run_all 'echo '\\''h=\\"baz\\"'\\''' runas=macuser
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
         .. versionadded:: 2016.3.0
 
@@ -1966,6 +2373,14 @@ def run_all(
             .. code-block:: bash
 
                 salt myminion cmd.run_all 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param bool clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
@@ -2027,13 +2442,35 @@ def run_all(
     :param int timeout: A timeout in seconds for the executed process to
         return.
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
         more interactively to the console and the logs. This is experimental.
 
     :param bool encoded_cmd: Specify if the supplied command is encoded.
-       Only applies to shell 'powershell'.
+        Only applies to shell 'powershell' and 'pwsh'.
 
-       .. versionadded:: 2018.3.0
+        .. versionadded:: 2018.3.0
+
+        Older versions of powershell seem to return raw xml data in the return.
+        To avoid raw xml data in the return, prepend your command with the
+        following before encoding:
+
+        `$ProgressPreference='SilentlyContinue'; <your command>`
+
+        The following powershell code block will encode the `Write-Output`
+        command so that it will not have the raw xml data in the return:
+
+        .. code-block:: powershell
+
+            # target string
+            $Command = '$ProgressPreference="SilentlyContinue"; Write-Output "hello"'
+
+            # Convert to Base64 encoded string
+            $Encoded = [convert]::ToBase64String([System.Text.encoding]::Unicode.GetBytes($command))
+
+            Write-Output $Encoded
 
     :param bool redirect_stderr: If set to ``True``, then stderr will be
         redirected to stdout. This is helpful for cases where obtaining both
@@ -2042,8 +2479,15 @@ def run_all(
 
         .. versionadded:: 2015.8.2
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
           .. versionadded:: 2016.3.0
 
@@ -2052,12 +2496,29 @@ def run_all(
 
         .. versionadded:: 2016.3.6
 
-    :param list success_retcodes: This parameter will be allow a list of
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -2115,7 +2576,9 @@ def run_all(
         password=password,
         encoded_cmd=encoded_cmd,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
 
     if hide_output:
@@ -2141,11 +2604,13 @@ def retcode(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     password=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Execute a shell command and return the command's return code.
@@ -2161,13 +2626,11 @@ def retcode(
         cases where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
         .. warning::
 
-            For versions 2018.3.3 and above on macosx while using runas,
+            For versions 2018.3.3 and above on MacOS while using runas,
             to pass special characters to the command you need to escape
             the characters on the shell.
 
@@ -2177,8 +2640,12 @@ def retcode(
 
                 cmd.retcode 'echo '\\''h=\\"baz\\"'\\''' runas=macuser
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
         .. versionadded:: 2016.3.0
 
@@ -2201,6 +2668,14 @@ def retcode(
             .. code-block:: bash
 
                 salt myminion cmd.retcode 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param bool clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
@@ -2247,6 +2722,9 @@ def retcode(
 
     :param int timeout: A timeout in seconds for the executed process to return.
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
       more interactively to the console and the logs. This is experimental.
 
@@ -2254,12 +2732,26 @@ def retcode(
     :rtype: None
     :returns: Return Code as an int or None if there was an exception.
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -2290,7 +2782,6 @@ def retcode(
         salt '*' cmd.retcode "grep f" stdin='one\\ntwo\\nthree\\nfour\\nfive\\n'
     """
     python_shell = _python_shell_default(python_shell, kwargs.get("__pub_jid", ""))
-
     ret = _run(
         cmd,
         runas=runas,
@@ -2314,7 +2805,9 @@ def retcode(
         use_vt=use_vt,
         password=password,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
     return ret["retcode"]
 
@@ -2336,11 +2829,13 @@ def _retcode_quiet(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     password=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Helper for running commands quietly for minion startup. Returns same as
@@ -2368,7 +2863,9 @@ def _retcode_quiet(
         use_vt=use_vt,
         password=password,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
 
 
@@ -2390,12 +2887,14 @@ def script(
     hide_output=False,
     timeout=None,
     reset_system_locale=True,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     bg=False,
     password=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Download a script from a remote location and execute the script locally.
@@ -2411,28 +2910,29 @@ def script(
 
     :param str args: String of command line args to pass to the script. Only
         used if no args are specified as part of the `name` argument. To pass a
-        string containing spaces in YAML, you will need to doubly-quote it:
+        string containing spaces in YAML, you will need to doubly-quote it.
+        Additionally, if you need to pass falsey values (e.g., "0", "", "False"),
+        you should doubly-quote them to ensure they are correctly interpreted:
 
         .. code-block:: bash
 
             salt myminion cmd.script salt://foo.sh "arg1 'arg two' arg3"
+            salt myminion cmd.script salt://foo.sh "''0''"
+            salt myminion cmd.script salt://foo.sh "''False''"
 
     :param str cwd: The directory from which to execute the command. Defaults
-        to the home directory of the user specified by ``runas`` (or the user
-        under which Salt is running if ``runas`` is not specified).
+        to the directory returned from Python's tempfile.mkstemp.
 
     :param str stdin: A string of standard input can be specified for the
         command to be run using the ``stdin`` parameter. This can be useful in
         cases where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
         .. note::
 
-            For Window's users, specifically Server users, it may be necessary
+            For Windows users, specifically Server users, it may be necessary
             to specify your runas user using the User Logon Name instead of the
             legacy logon name. Traditionally, logons would be in the following
             format.
@@ -2446,8 +2946,12 @@ def script(
 
             More information <https://github.com/saltstack/salt/issues/55080>
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
         .. versionadded:: 2016.3.0
 
@@ -2464,6 +2968,9 @@ def script(
     :param bool bg: If True, run script in background and do not await or
         deliver its results
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param dict env: Environment variables to be set prior to execution.
 
         .. note::
@@ -2473,6 +2980,14 @@ def script(
             .. code-block:: bash
 
                 salt myminion cmd.script 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param str template: If this setting is applied then the named templating
         engine will be used to render the downloaded file. Currently jinja,
@@ -2523,21 +3038,42 @@ def script(
         seconds, send the subprocess sigterm, and if sigterm is ignored, follow
         up with sigkill
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
         more interactively to the console and the logs. This is experimental.
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
 
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
         present in the ``stdin`` value to newlines.
 
       .. versionadded:: 2019.2.0
+
+    :return: The return value of the script execution, including stdout, stderr,
+        and the exit code. If the script returns a falsey string value, it should be
+        doubly-quoted to ensure it is correctly interpreted by Salt.
 
     CLI Example:
 
@@ -2552,6 +3088,12 @@ def script(
 
         salt '*' cmd.script salt://scripts/runme.sh stdin='one\\ntwo\\nthree\\nfour\\nfive\\n'
     """
+    if saltenv is None:
+        try:
+            saltenv = __opts__.get("saltenv", "base")
+        except NameError:
+            saltenv = "base"
+
     python_shell = _python_shell_default(python_shell, kwargs.get("__pub_jid", ""))
 
     def _cleanup_tempfile(path):
@@ -2570,15 +3112,40 @@ def script(
         kwargs.pop("__env__")
 
     win_cwd = False
-    if salt.utils.platform.is_windows() and runas and cwd is None:
-        # Create a temp working directory
-        cwd = tempfile.mkdtemp(dir=__opts__["cachedir"])
-        win_cwd = True
-        salt.utils.win_dacl.set_permissions(
-            obj_name=cwd, principal=runas, permissions="full_control"
-        )
+    if salt.utils.platform.is_windows() and runas:
+        # user.info uses NetUserGetInfo which only resolves local-machine
+        # accounts (and, when a DC is reachable, accounts in the joined
+        # domain). It silently returns an empty dict for many valid runas
+        # forms such as DOMAIN\user, user@DOMAIN and SIDs. Treat a missing
+        # lookup as advisory: log it and continue. salt.utils.win_runas
+        # uses LookupAccountName / LogonUser downstream and will surface a
+        # precise Win32 error if the account is truly invalid.
+        if not __salt__["user.info"](runas):
+            log.warning(
+                "cmd.script: user.info did not return information for "
+                "runas user '%s'; continuing and letting the underlying "
+                "runas implementation validate the account.",
+                runas,
+            )
+        if cwd is None:
+            # Create a temp working directory
+            cwd = tempfile.mkdtemp(dir=__opts__["cachedir"])
+            win_cwd = True
+            salt.utils.win_dacl.set_permissions(
+                obj_name=cwd, principal=runas, permissions="full_control"
+            )
 
-    path = salt.utils.files.mkstemp(dir=cwd, suffix=os.path.splitext(source)[1])
+    (_, ext) = os.path.splitext(salt.utils.url.split_env(source)[0])
+
+    if salt.utils.platform.is_windows() and not shell:
+        extension_map = {
+            ".bat": "cmd",
+            ".cmd": "cmd",
+            ".ps1": "powershell",
+        }
+        shell = extension_map.get(ext)
+
+    path = salt.utils.files.mkstemp(dir=cwd, suffix=ext)
 
     if template:
         if "pillarenv" in kwargs or "pillar" in kwargs:
@@ -2611,38 +3178,65 @@ def script(
                 "stderr": "",
                 "cache_error": True,
             }
-        shutil.copyfile(fn_, path)
+        try:
+            shutil.copyfile(fn_, path)
+        except FileNotFoundError:
+            _cleanup_tempfile(path)
+            # If a temp working directory was created (Windows), let's remove that
+            if win_cwd:
+                _cleanup_tempfile(cwd)
+            return {
+                "pid": 0,
+                "retcode": 1,
+                "stdout": "",
+                "stderr": "",
+                "cache_error": True,
+            }
     if not salt.utils.platform.is_windows():
         os.chmod(path, 320)
         os.chown(path, __salt__["file.user_to_uid"](runas), -1)
 
-    if salt.utils.platform.is_windows() and shell.lower() != "powershell":
-        cmd_path = _cmd_quote(path, escape=False)
-    else:
-        cmd_path = _cmd_quote(path)
+    if args:
+        python_shell = False
 
-    ret = _run(
-        cmd_path + " " + str(args) if args else cmd_path,
-        cwd=cwd,
-        stdin=stdin,
-        output_encoding=output_encoding,
-        output_loglevel=output_loglevel,
-        log_callback=log_callback,
-        runas=runas,
-        group=group,
-        shell=shell,
-        python_shell=python_shell,
-        env=env,
-        umask=umask,
-        timeout=timeout,
-        reset_system_locale=reset_system_locale,
-        saltenv=saltenv,
-        use_vt=use_vt,
-        bg=bg,
-        password=password,
-        success_retcodes=success_retcodes,
-        **kwargs
-    )
+    if isinstance(args, str):
+        args = salt.utils.args.shlex_split(args)
+
+    new_cmd = [path, *args] if args else [path]
+
+    ret = {}
+    try:
+        ret = _run(
+            new_cmd,
+            cwd=cwd,
+            stdin=stdin,
+            output_encoding=output_encoding,
+            output_loglevel=output_loglevel,
+            log_callback=log_callback,
+            runas=runas,
+            group=group,
+            shell=shell,
+            python_shell=python_shell,
+            env=env,
+            umask=umask,
+            timeout=timeout,
+            reset_system_locale=reset_system_locale,
+            saltenv=saltenv,
+            use_vt=use_vt,
+            bg=bg,
+            password=password,
+            success_retcodes=success_retcodes,
+            success_stdout=success_stdout,
+            success_stderr=success_stderr,
+            **kwargs,
+        )
+    except (CommandExecutionError, SaltInvocationError) as exc:
+        log.error(
+            "cmd.script: Unable to run script '%s': %s",
+            new_cmd,
+            exc,
+            exc_info_on_loglevel=logging.DEBUG,
+        )
     _cleanup_tempfile(path)
     # If a temp working directory was created (Windows), let's remove that
     if win_cwd:
@@ -2667,14 +3261,16 @@ def script_retcode(
     umask=None,
     timeout=None,
     reset_system_locale=True,
-    saltenv="base",
+    saltenv=None,
     output_encoding=None,
     output_loglevel="debug",
     log_callback=None,
     use_vt=False,
     password=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Download a script from a remote location and execute the script locally.
@@ -2706,12 +3302,14 @@ def script_retcode(
         cases where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
         .. versionadded:: 2016.3.0
 
@@ -2734,6 +3332,14 @@ def script_retcode(
             .. code-block:: bash
 
                 salt myminion cmd.script_retcode 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param str template: If this setting is applied then the named templating
         engine will be used to render the downloaded file. Currently jinja,
@@ -2775,15 +3381,32 @@ def script_retcode(
         seconds, send the subprocess sigterm, and if sigterm is ignored, follow
         up with sigkill
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
         more interactively to the console and the logs. This is experimental.
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -2832,7 +3455,9 @@ def script_retcode(
         use_vt=use_vt,
         password=password,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )["retcode"]
 
 
@@ -2929,8 +3554,24 @@ def exec_code_all(lang, code, cwd=None, args=None, **kwargs):
     elif isinstance(args, list):
         cmd += args
 
+    def _cleanup_tempfile(path):
+        try:
+            __salt__["file.remove"](path)
+        except (SaltInvocationError, CommandExecutionError) as exc:
+            log.error(
+                "cmd.exec_code_all: Unable to clean tempfile '%s': %s",
+                path,
+                exc,
+                exc_info_on_loglevel=logging.DEBUG,
+            )
+
+    runas = kwargs.get("runas")
+    if runas is not None:
+        if not salt.utils.platform.is_windows():
+            os.chown(codefile, __salt__["file.user_to_uid"](runas), -1)
+
     ret = run_all(cmd, cwd=cwd, python_shell=False, **kwargs)
-    os.remove(codefile)
+    _cleanup_tempfile(codefile)
     return ret
 
 
@@ -2946,7 +3587,7 @@ def tty(device, echo=""):
         salt '*' cmd.tty pts3 'This is a test'
     """
     if device.startswith("tty"):
-        teletype = "/dev/{}".format(device)
+        teletype = f"/dev/{device}"
     elif device.startswith("pts"):
         teletype = "/dev/{}".format(device.replace("pts", "pts/"))
     else:
@@ -2954,9 +3595,9 @@ def tty(device, echo=""):
     try:
         with salt.utils.files.fopen(teletype, "wb") as tty_device:
             tty_device.write(salt.utils.stringutils.to_bytes(echo))
-        return {"Success": "Message was successfully echoed to {}".format(teletype)}
+        return {"Success": f"Message was successfully echoed to {teletype}"}
     except OSError:
-        return {"Error": "Echoing to {} returned error".format(teletype)}
+        return {"Error": f"Echoing to {teletype} returned error"}
 
 
 def run_chroot(
@@ -2981,11 +3622,13 @@ def run_chroot(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     bg=False,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     .. versionadded:: 2014.7.0
@@ -3018,9 +3661,7 @@ def run_chroot(
         cases where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
     :param str shell: Specify an alternate shell. Defaults to the system's
         default shell.
@@ -3043,6 +3684,11 @@ def run_chroot(
             .. code-block:: bash
 
                 salt myminion cmd.run_chroot 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
 
     :param dict clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
@@ -3104,12 +3750,26 @@ def run_chroot(
         Use VT utils (saltstack) to stream the command output more
         interactively to the console and the logs. This is experimental.
 
-    success_retcodes: This parameter will be allow a list of
+    :param success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     CLI Example:
 
@@ -3142,7 +3802,7 @@ def run_chroot(
     else:
         userspec = ""
 
-    cmd = "chroot {} {} {} -c {}".format(userspec, root, sh_, _cmd_quote(cmd))
+    cmd = f"chroot {userspec} {root} {sh_} -c {_cmd_quote(cmd)}"
 
     run_func = __context__.pop("cmd.run_chroot.func", run_all)
 
@@ -3168,6 +3828,8 @@ def run_chroot(
         pillar=kwargs.get("pillar"),
         use_vt=use_vt,
         success_retcodes=success_retcodes,
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
         bg=bg,
     )
 
@@ -3238,7 +3900,9 @@ def shells():
 
     .. versionadded:: 2015.5.0
 
-    CLI Example::
+    CLI Example:
+
+    .. code-block:: bash
 
         salt '*' cmd.shells
     """
@@ -3343,14 +4007,15 @@ def shell_info(shell, list_modules=False):
         pw_keys.sort(key=int)
         if not pw_keys:
             return {
-                "error": "Unable to locate 'powershell' Reason: Cannot be "
-                "found in registry.",
+                "error": (
+                    "Unable to locate 'powershell' Reason: Cannot be found in registry."
+                ),
                 "installed": False,
             }
         for reg_ver in pw_keys:
             install_data = salt.utils.win_reg.read_value(
                 hive="HKEY_LOCAL_MACHINE",
-                key="Software\\Microsoft\\PowerShell\\{}".format(reg_ver),
+                key=f"Software\\Microsoft\\PowerShell\\{reg_ver}",
                 vname="Install",
             )
             if (
@@ -3359,8 +4024,9 @@ def shell_info(shell, list_modules=False):
             ):
                 details = salt.utils.win_reg.list_values(
                     hive="HKEY_LOCAL_MACHINE",
-                    key="Software\\Microsoft\\PowerShell\\{}\\"
-                    "PowerShellEngine".format(reg_ver),
+                    key="Software\\Microsoft\\PowerShell\\{}\\PowerShellEngine".format(
+                        reg_ver
+                    ),
                 )
 
                 # reset data, want the newest version details only as powershell
@@ -3393,8 +4059,11 @@ def shell_info(shell, list_modules=False):
     else:
         if shell not in regex_shells:
             return {
-                "error": "Salt does not know how to get the version number for "
-                "{}".format(shell),
+                "error": (
+                    "Salt does not know how to get the version number for {}".format(
+                        shell
+                    )
+                ),
                 "installed": None,
             }
         shell_data = regex_shells[shell]
@@ -3477,7 +4146,7 @@ def powershell(
     cwd=None,
     stdin=None,
     runas=None,
-    shell=DEFAULT_SHELL,
+    shell="powershell",
     env=None,
     clean_env=False,
     template=None,
@@ -3489,13 +4158,15 @@ def powershell(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     password=None,
     depth=None,
     encode_cmd=False,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Execute the passed PowerShell command and return the output as a dictionary.
@@ -3544,17 +4215,19 @@ def powershell(
       where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-      parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+      by ``runas``. Required only when the salt-minion is **not** running as
+      SYSTEM or as an elevated Administrator. When Salt has sufficient
+      privileges it can obtain a logon token for the target user through
+      Windows impersonation APIs without needing their credentials. This
+      parameter is ignored on non-Windows platforms.
 
       .. versionadded:: 2016.3.0
 
-    :param str shell: Specify an alternate shell. Defaults to the system's
-        default shell.
+    :param str shell: Specify an alternate shell. Defaults to "powershell". Can
+        also use "pwsh" for powershell core if present on the system
 
     :param bool python_shell: If False, let python handle the positional
       arguments. Set to True to use shell features, such as pipes or
@@ -3569,6 +4242,14 @@ def powershell(
             .. code-block:: bash
 
                 salt myminion cmd.powershell 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param bool clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
@@ -3624,6 +4305,9 @@ def powershell(
 
     :param int timeout: A timeout in seconds for the executed process to return.
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
         more interactively to the console and the logs. This is experimental.
 
@@ -3641,12 +4325,26 @@ def powershell(
         where characters may be dropped or incorrectly converted when executed.
         Default is False.
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -3663,43 +4361,53 @@ def powershell(
 
         salt '*' cmd.powershell "$PSVersionTable.CLRVersion"
     """
+    if shell not in ["powershell", "pwsh"]:
+        raise CommandExecutionError(
+            "Must specify a valid powershell binary. Must be 'powershell' or 'pwsh'"
+        )
+
     if "python_shell" in kwargs:
         python_shell = kwargs.pop("python_shell")
     else:
-        python_shell = True
+        python_shell = False
+
+    if isinstance(cmd, list):
+        cmd = " ".join(cmd)
 
     # Append PowerShell Object formatting
     # ConvertTo-JSON is only available on PowerShell 3.0 and later
     psversion = shell_info("powershell")["psversion"]
     if salt.utils.versions.version_cmp(psversion, "2.0") == 1:
-        cmd += " | ConvertTo-JSON"
+        cmd += " | ConvertTo-JSON "
         if depth is not None:
-            cmd += " -Depth {}".format(depth)
-
-    if encode_cmd:
-        # Convert the cmd to UTF-16LE without a BOM and base64 encode.
-        # Just base64 encoding UTF-8 or including a BOM is not valid.
-        log.debug("Encoding PowerShell command '%s'", cmd)
-        cmd_utf16 = cmd.decode("utf-8").encode("utf-16le")
-        cmd = base64.standard_b64encode(cmd_utf16)
-        encoded_cmd = True
-    else:
-        encoded_cmd = False
+            cmd += f"-Depth {depth} "
 
     # Put the whole command inside a try / catch block
     # Some errors in PowerShell are not "Terminating Errors" and will not be
     # caught in a try/catch block. For example, the `Get-WmiObject` command will
     # often return a "Non Terminating Error". To fix this, make sure
     # `-ErrorAction Stop` is set in the powershell command
-    cmd = "try {" + cmd + '} catch { "{}" }'
+    cmd = "try { " + cmd + " } catch { Write-Error $_ }"
+
+    if encode_cmd:
+        # Convert the cmd to UTF-16LE without a BOM and base64 encode.
+        # Just base64 encoding UTF-8 or including a BOM is not valid.
+        log.debug("Encoding PowerShell command '%s'", cmd)
+        cmd = f"$ProgressPreference='SilentlyContinue'; {cmd}"
+        cmd_utf16 = cmd.encode("utf-16-le")
+        cmd = base64.standard_b64encode(cmd_utf16)
+        cmd = salt.utils.stringutils.to_str(cmd)
+        encoded_cmd = True
+    else:
+        encoded_cmd = False
 
     # Retrieve the response, while overriding shell with 'powershell'
-    response = run(
+    response = run_stdout(
         cmd,
         cwd=cwd,
         stdin=stdin,
         runas=runas,
-        shell="powershell",
+        shell=shell,
         env=env,
         clean_env=clean_env,
         template=template,
@@ -3717,12 +4425,13 @@ def powershell(
         password=password,
         encoded_cmd=encoded_cmd,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
 
-    # Sometimes Powershell returns an empty string, which isn't valid JSON
-    if response == "":
-        response = "{}"
+    response = _prep_powershell_json(response)
+
     try:
         return salt.utils.json.loads(response)
     except Exception:  # pylint: disable=broad-except
@@ -3735,7 +4444,7 @@ def powershell_all(
     cwd=None,
     stdin=None,
     runas=None,
-    shell=DEFAULT_SHELL,
+    shell="powershell",
     env=None,
     clean_env=False,
     template=None,
@@ -3747,14 +4456,16 @@ def powershell_all(
     timeout=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     use_vt=False,
     password=None,
     depth=None,
     encode_cmd=False,
     force_list=False,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     """
     Execute the passed PowerShell command and return a dictionary with a result
@@ -3855,15 +4566,17 @@ def powershell_all(
         cases where sensitive information must be read from standard input.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
-    :param str shell: Specify an alternate shell. Defaults to the system's
-        default shell.
+    :param str shell: Specify an alternate shell. Defaults to "powershell". Can
+        also use "pwsh" for powershell core if present on the system
 
     :param bool python_shell: If False, let python handle the positional
         arguments. Set to True to use shell features, such as pipes or
@@ -3878,6 +4591,14 @@ def powershell_all(
             .. code-block:: bash
 
                 salt myminion cmd.powershell_all 'some command' env='{"FOO": "bar"}'
+
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
 
     :param bool clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
@@ -3925,6 +4646,9 @@ def powershell_all(
     :param int timeout: A timeout in seconds for the executed process to
         return.
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool use_vt: Use VT utils (saltstack) to stream the command output
         more interactively to the console and the logs. This is experimental.
 
@@ -3950,12 +4674,26 @@ def powershell_all(
     :param bool force_list: The purpose of this parameter is described in the
         preamble of this function's documentation. Default value is False.
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -3995,22 +4733,35 @@ def powershell_all(
 
         salt '*' cmd.powershell_all "dir mydirectory" force_list=True
     """
+    if shell not in ["powershell", "pwsh"]:
+        raise CommandExecutionError(
+            "Must specify a valid powershell binary. Must be 'powershell' or 'pwsh'"
+        )
+
     if "python_shell" in kwargs:
         python_shell = kwargs.pop("python_shell")
     else:
-        python_shell = True
+        python_shell = False
+
+    if isinstance(cmd, list):
+        cmd = " ".join(cmd)
 
     # Append PowerShell Object formatting
-    cmd += " | ConvertTo-JSON"
-    if depth is not None:
-        cmd += " -Depth {}".format(depth)
+    # ConvertTo-JSON is only available on PowerShell 3.0 and later
+    psversion = shell_info("powershell")["psversion"]
+    if salt.utils.versions.version_cmp(psversion, "2.0") == 1:
+        cmd += " | ConvertTo-JSON"
+        if depth is not None:
+            cmd += f" -Depth {depth}"
 
     if encode_cmd:
         # Convert the cmd to UTF-16LE without a BOM and base64 encode.
         # Just base64 encoding UTF-8 or including a BOM is not valid.
         log.debug("Encoding PowerShell command '%s'", cmd)
-        cmd_utf16 = cmd.decode("utf-8").encode("utf-16le")
+        cmd = f"$ProgressPreference='SilentlyContinue'; {cmd}"
+        cmd_utf16 = cmd.encode("utf-16-le")
         cmd = base64.standard_b64encode(cmd_utf16)
+        cmd = salt.utils.stringutils.to_str(cmd)
         encoded_cmd = True
     else:
         encoded_cmd = False
@@ -4021,7 +4772,7 @@ def powershell_all(
         cwd=cwd,
         stdin=stdin,
         runas=runas,
-        shell="powershell",
+        shell=shell,
         env=env,
         clean_env=clean_env,
         template=template,
@@ -4039,7 +4790,9 @@ def powershell_all(
         password=password,
         encoded_cmd=encoded_cmd,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
     stdoutput = response["stdout"]
 
@@ -4050,6 +4803,8 @@ def powershell_all(
         if force_list:
             response["result"] = []
         return response
+
+    stdoutput = _prep_powershell_json(stdoutput)
 
     # If we fail to parse stdoutput we will raise an exception
     try:
@@ -4069,7 +4824,28 @@ def powershell_all(
     else:
         # result type is list so the force_list param has no effect
         response["result"] = result
+
+    # Encoded commands dump CLIXML data in stderr. It's not an actual error
+    if "CLIXML" in response["stderr"]:
+        response["stderr"] = ""
+
     return response
+
+
+def _prep_powershell_json(text):
+    """
+    Try to fix the output from OutputTo-JSON in powershell commands to make it
+    valid JSON
+    """
+    # An empty string just needs to be an empty quote
+    if text == "":
+        text = '""'
+    else:
+        # Raw text needs to be quoted
+        starts_with = ['"', "{", "["]
+        if not any(text.startswith(x) for x in starts_with):
+            text = f'"{text}"'
+    return text
 
 
 def run_bg(
@@ -4089,14 +4865,16 @@ def run_bg(
     log_callback=None,
     reset_system_locale=True,
     ignore_retcode=False,
-    saltenv="base",
+    saltenv=None,
     password=None,
     prepend_path=None,
     success_retcodes=None,
-    **kwargs
+    success_stdout=None,
+    success_stderr=None,
+    **kwargs,
 ):
     r"""
-    .. versionadded: 2016.3.0
+    .. versionadded:: 2016.3.0
 
     Execute the passed command in the background and return its PID
 
@@ -4151,13 +4929,11 @@ def run_bg(
         skip logging the output if the command has a nonzero exit code.
 
     :param str runas: Specify an alternate user to run the command. The default
-        behavior is to run as the user under which Salt is running. If running
-        on a Windows minion you must also use the ``password`` argument, and
-        the target user account must be in the Administrators group.
+        behavior is to run as the user under which Salt is running.
 
         .. warning::
 
-            For versions 2018.3.3 and above on macosx while using runas,
+            For versions 2018.3.3 and above on MacOS while using runas,
             to pass special characters to the command you need to escape
             the characters on the shell.
 
@@ -4167,8 +4943,12 @@ def run_bg(
 
                 cmd.run_bg 'echo '\''h=\"baz\"'\''' runas=macuser
 
-    :param str password: Windows only. Required when specifying ``runas``. This
-        parameter will be ignored on non-Windows platforms.
+    :param str password: Windows only. The password for the account specified
+        by ``runas``. Required only when the salt-minion is **not** running as
+        SYSTEM or as an elevated Administrator. When Salt has sufficient
+        privileges it can obtain a logon token for the target user through
+        Windows impersonation APIs without needing their credentials. This
+        parameter is ignored on non-Windows platforms.
 
         .. versionadded:: 2016.3.0
 
@@ -4189,6 +4969,14 @@ def run_bg(
 
                 salt myminion cmd.run_bg 'some command' env='{"FOO": "bar"}'
 
+        .. note::
+            When using environment variables on Window's, case-sensitivity
+            matters, i.e. Window's uses `Path` as opposed to `PATH` for other
+            systems.
+
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     :param bool clean_env: Attempt to clean out all other shell environment
         variables and set only those provided in the 'env' argument to this
         function.
@@ -4206,6 +4994,9 @@ def run_bg(
 
     :param int timeout: A timeout in seconds for the executed process to return.
 
+        .. versionchanged:: 3007.7
+            Supported on Windows when running a command as an alternate user.
+
     .. warning::
 
         This function does not process commands through a shell unless the
@@ -4219,12 +5010,26 @@ def run_bg(
         -rf /'.  Be absolutely certain that you have sanitized your input prior
         to using ``python_shell=True``.
 
-    :param list success_retcodes: This parameter will be allow a list of
+    :param list success_retcodes: This parameter will allow a list of
         non-zero return codes that should be considered a success.  If the
         return code returned from the run matches any in the provided list,
         the return code will be overridden with zero.
 
       .. versionadded:: 2019.2.0
+
+    :param list success_stdout: This parameter will allow a list of
+        strings that when found in standard out should be considered a success.
+        If stdout returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
+
+    :param list success_stderr: This parameter will allow a list of
+        strings that when found in standard error should be considered a success.
+        If stderr returned from the run matches any in the provided list,
+        the return code will be overridden with zero.
+
+      .. versionadded:: 3004
 
     :param bool stdin_raw_newlines: False
         If ``True``, Salt will not automatically convert the characters ``\\n``
@@ -4261,7 +5066,6 @@ def run_bg(
 
         salt '*' cmd.run_bg cmd='ls -lR / | sed -e s/=/:/g > /tmp/dontwait'
     """
-
     python_shell = _python_shell_default(python_shell, kwargs.get("__pub_jid", ""))
     res = _run(
         cmd,
@@ -4290,7 +5094,9 @@ def run_bg(
         saltenv=saltenv,
         password=password,
         success_retcodes=success_retcodes,
-        **kwargs
+        success_stdout=success_stdout,
+        success_stderr=success_stderr,
+        **kwargs,
     )
 
     return {"pid": res["pid"]}

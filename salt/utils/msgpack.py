@@ -1,6 +1,7 @@
 """
 Functions to work with MessagePack
 """
+
 import logging
 
 log = logging.getLogger(__name__)
@@ -11,12 +12,9 @@ try:
 
     # There is a serialization issue on ARM and potentially other platforms for some msgpack bindings, check for it
     if (
-        msgpack.version >= (0, 4, 0)
-        and msgpack.loads(msgpack.dumps([1, 2, 3], use_bin_type=False), use_list=True)
+        msgpack.loads(msgpack.dumps([1, 2, 3], use_bin_type=False), use_list=True)
         is None
     ):
-        raise ImportError
-    elif msgpack.loads(msgpack.dumps([1, 2, 3]), use_list=True) is None:
         raise ImportError
     HAS_MSGPACK = True
 except ImportError:
@@ -59,13 +57,7 @@ def _sanitize_msgpack_kwargs(kwargs):
     https://github.com/msgpack/msgpack-python/blob/master/ChangeLog.rst
     """
     assert isinstance(kwargs, dict)
-    if version < (0, 6, 0) and kwargs.pop("strict_map_key", None) is not None:
-        log.info("removing unsupported `strict_map_key` argument from msgpack call")
-    if version < (0, 5, 2) and kwargs.pop("raw", None) is not None:
-        log.info("removing unsupported `raw` argument from msgpack call")
-    if version < (0, 4, 0) and kwargs.pop("use_bin_type", None) is not None:
-        log.info("removing unsupported `use_bin_type` argument from msgpack call")
-    if version >= (1, 0, 0) and kwargs.pop("encoding", None) is not None:
+    if kwargs.pop("encoding", None) is not None:
         log.debug("removing unsupported `encoding` argument from msgpack call")
 
     return kwargs
@@ -73,28 +65,23 @@ def _sanitize_msgpack_kwargs(kwargs):
 
 def _sanitize_msgpack_unpack_kwargs(kwargs):
     """
-    Clean up msgpack keyword arguments for unpack operations, based on
-    the version
-    https://github.com/msgpack/msgpack-python/blob/master/ChangeLog.rst
+    Clean up msgpack keyword arguments for unpack operations.
+
+    The historical ``salt.utils.versions.reqs.msgpack > "0.5.2"`` gate
+    here was dead code on any supported install: 3006.x requires
+    ``msgpack>=1.1.2``, 3007.x/3008.x require ``msgpack>=1.1.0``, and
+    even the CentOS 7 EPEL system ``python-msgpack`` was 0.5.6 (already
+    newer than 0.5.2 by the time EPEL 7 shipped it).  The gate was never
+    false in practice, but its per-call ``Requirement.__gt__`` walk
+    allocated two fresh ``packaging.version.Version`` objects on every
+    ``unpackb``/``packb`` call.  Under a stressed master this cost
+    ~4 million ``Version`` constructions per 60 s just in the
+    ``EventPublisher``, ~7 GB of transient allocation churn per minute.
     """
     assert isinstance(kwargs, dict)
-    if version >= (1, 0, 0):
-        kwargs.setdefault("raw", True)
-        kwargs.setdefault("strict_map_key", False)
+    kwargs.setdefault("raw", True)
+    kwargs.setdefault("strict_map_key", False)
     return _sanitize_msgpack_kwargs(kwargs)
-
-
-def _add_msgpack_unpack_kwargs(kwargs):
-    """
-    Add any msgpack unpack kwargs here.
-
-    max_buffer_size: will make sure the buffer is set to a minimum
-    of 100MiB in versions >=6 and <1.0
-    """
-    assert isinstance(kwargs, dict)
-    if version >= (0, 6, 0) and version < (1, 0, 0):
-        kwargs["max_buffer_size"] = 100 * 1024 * 1024
-    return _sanitize_msgpack_unpack_kwargs(kwargs)
 
 
 class Unpacker(msgpack.Unpacker):
@@ -103,7 +90,9 @@ class Unpacker(msgpack.Unpacker):
     """
 
     def __init__(self, *args, **kwargs):
-        msgpack.Unpacker.__init__(self, *args, **_add_msgpack_unpack_kwargs(kwargs))
+        msgpack.Unpacker.__init__(
+            self, *args, **_sanitize_msgpack_unpack_kwargs(kwargs)
+        )
 
 
 def pack(o, stream, **kwargs):

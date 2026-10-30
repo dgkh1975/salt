@@ -1,12 +1,10 @@
-# -*- coding: utf-8 -*-
 """
-The check Thorium state is used to create gateways to commands, the checks
-make it easy to make states that watch registers for changes and then just
-succeed or fail based on the state of the register, this creates the pattern
-of having a command execution get gated by a check state via a requisite.
+Create gate states that succeed or fail based on Thorium register contents or
+incoming events.
+
+These states are usually placed between a register-building state and an action
+state. The action then uses a requisite to run only when the check succeeds.
 """
-# import python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
 
@@ -38,7 +36,7 @@ def gt(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if __reg__[name]["val"] > value:
         ret["result"] = True
@@ -68,7 +66,7 @@ def gte(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if __reg__[name]["val"] >= value:
         ret["result"] = True
@@ -98,7 +96,7 @@ def lt(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if __reg__[name]["val"] < value:
         ret["result"] = True
@@ -128,7 +126,7 @@ def lte(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if __reg__[name]["val"] <= value:
         ret["result"] = True
@@ -158,7 +156,7 @@ def eq(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if __reg__[name]["val"] == value:
         ret["result"] = True
@@ -188,7 +186,7 @@ def ne(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if __reg__[name]["val"] != value:
         ret["result"] = True
@@ -207,13 +205,20 @@ def contains(
 ):
     """
     Only succeed if the value in the given register location contains
-    the given value
+    the given value.
+
+    This is most useful with ``reg.set`` for simple membership checks. When the
+    ``count_*`` options are used, the check compares how many times a value
+    appears in the register.
 
     USAGE:
 
     .. code-block:: yaml
 
         foo:
+          reg.set:
+            - add: bar
+            - match: my/custom/event
           check.contains:
             - value: itni
 
@@ -227,7 +232,7 @@ def contains(
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     try:
         count_compare = (
@@ -259,8 +264,11 @@ def contains(
 
 def event(name):
     """
-    Chekcs for a specific event match and returns result True if the match
-    happens
+    Check the current Thorium event batch for a matching event tag and return
+    ``True`` if the match happens.
+
+    Use this when you want a direct event-to-action trigger without storing the
+    event in a register first.
 
     USAGE:
 
@@ -308,7 +316,7 @@ def len_gt(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if len(__reg__[name]["val"]) > value:
         ret["result"] = True
@@ -338,7 +346,7 @@ def len_gte(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if len(__reg__[name]["val"]) >= value:
         ret["result"] = True
@@ -368,7 +376,7 @@ def len_lt(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if len(__reg__[name]["val"]) < value:
         ret["result"] = True
@@ -398,7 +406,7 @@ def len_lte(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if len(__reg__[name]["val"]) <= value:
         ret["result"] = True
@@ -428,7 +436,7 @@ def len_eq(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if __reg__[name]["val"] == value:
         ret["result"] = True
@@ -458,7 +466,7 @@ def len_ne(name, value):
     ret = {"name": name, "result": False, "comment": "", "changes": {}}
     if name not in __reg__:
         ret["result"] = False
-        ret["comment"] = "Value {0} not in register".format(name)
+        ret["comment"] = f"Value {name} not in register"
         return ret
     if len(__reg__[name]["val"]) != value:
         ret["result"] = True

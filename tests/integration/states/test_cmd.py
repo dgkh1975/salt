@@ -3,15 +3,17 @@ Tests for the file state
 """
 
 import errno
+import json
 import os
 import tempfile
 import textwrap
 import time
 
+import pytest
+
 import salt.utils.files
 import salt.utils.platform
 from tests.support.case import ModuleCase
-from tests.support.helpers import slowTest
 from tests.support.mixins import SaltReturnAssertsMixin
 from tests.support.runtests import RUNTIME_VARS
 
@@ -25,6 +27,7 @@ class CMDTest(ModuleCase, SaltReturnAssertsMixin):
     def setUpClass(cls):
         cls.__cmd = "dir" if salt.utils.platform.is_windows() else "ls"
 
+    @pytest.mark.windows_whitelisted
     def test_run_simple(self):
         """
         cmd.run
@@ -32,6 +35,7 @@ class CMDTest(ModuleCase, SaltReturnAssertsMixin):
         ret = self.run_state("cmd.run", name=self.__cmd, cwd=tempfile.gettempdir())
         self.assertSaltTrueReturn(ret)
 
+    @pytest.mark.windows_whitelisted
     def test_run_output_loglevel(self):
         """
         cmd.run with output_loglevel=quiet
@@ -44,6 +48,7 @@ class CMDTest(ModuleCase, SaltReturnAssertsMixin):
         )
         self.assertSaltTrueReturn(ret)
 
+    @pytest.mark.windows_whitelisted
     def test_run_simple_test_true(self):
         """
         cmd.run test interface
@@ -53,6 +58,7 @@ class CMDTest(ModuleCase, SaltReturnAssertsMixin):
         )
         self.assertSaltNoneReturn(ret)
 
+    @pytest.mark.windows_whitelisted
     def test_run_hide_output(self):
         """
         cmd.run with output hidden
@@ -104,7 +110,8 @@ class CMDRunRedirectTest(ModuleCase, SaltReturnAssertsMixin):
                 pass
         super().tearDown()
 
-    @slowTest
+    @pytest.mark.slow_test
+    @pytest.mark.windows_whitelisted
     def test_run_unless(self):
         """
         test cmd.run unless
@@ -128,7 +135,8 @@ class CMDRunRedirectTest(ModuleCase, SaltReturnAssertsMixin):
         ret = self.run_function("state.sls", [self.state_name])
         self.assertTrue(ret[state_key]["result"])
 
-    @slowTest
+    @pytest.mark.slow_test
+    @pytest.mark.windows_whitelisted
     def test_run_unless_multiple_cmds(self):
         """
         test cmd.run using multiple unless options where the first cmd in the
@@ -147,7 +155,8 @@ class CMDRunRedirectTest(ModuleCase, SaltReturnAssertsMixin):
             'Command "echo "hello"" run',
         )
 
-    @slowTest
+    @pytest.mark.slow_test
+    @pytest.mark.windows_whitelisted
     def test_run_creates_exists(self):
         """
         test cmd.run creates already there
@@ -172,7 +181,8 @@ class CMDRunRedirectTest(ModuleCase, SaltReturnAssertsMixin):
         self.assertTrue(ret[state_key]["result"])
         self.assertEqual(len(ret[state_key]["changes"]), 0)
 
-    @slowTest
+    @pytest.mark.slow_test
+    @pytest.mark.windows_whitelisted
     def test_run_creates_new(self):
         """
         test cmd.run creates not there
@@ -198,7 +208,8 @@ class CMDRunRedirectTest(ModuleCase, SaltReturnAssertsMixin):
         self.assertTrue(ret[state_key]["result"])
         self.assertEqual(len(ret[state_key]["changes"]), 4)
 
-    @slowTest
+    @pytest.mark.slow_test
+    @pytest.mark.windows_whitelisted
     def test_run_redirect(self):
         """
         test cmd.run with shell redirect
@@ -239,6 +250,7 @@ class CMDRunWatchTest(ModuleCase, SaltReturnAssertsMixin):
         os.remove(self.state_file)
         super().tearDown()
 
+    @pytest.mark.windows_whitelisted
     def test_run_watch(self):
         """
         test cmd.run watch
@@ -246,6 +258,7 @@ class CMDRunWatchTest(ModuleCase, SaltReturnAssertsMixin):
         saltines_key = "cmd_|-saltines_|-echo changed=true_|-run"
         biscuits_key = "cmd_|-biscuits_|-echo biscuits_|-wait"
 
+        work_cwd = json.dumps(tempfile.gettempdir())
         with salt.utils.files.fopen(self.state_file, "w") as fb_:
             fb_.write(
                 salt.utils.stringutils.to_str(
@@ -254,16 +267,18 @@ class CMDRunWatchTest(ModuleCase, SaltReturnAssertsMixin):
                 saltines:
                   cmd.run:
                     - name: echo changed=true
-                    - cwd: /
+                    - cwd: {work_cwd}
                     - stateful: True
 
                 biscuits:
                   cmd.wait:
                     - name: echo biscuits
-                    - cwd: /
+                    - cwd: {work_cwd}
                     - watch:
                         - cmd: saltines
-                """
+                """.format(
+                            work_cwd=work_cwd
+                        )
                     )
                 )
             )

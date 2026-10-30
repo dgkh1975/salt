@@ -1,11 +1,14 @@
+# isort:skip_file
+
 import os
 import sys
 
+sys.modules["pkg_resources"] = None
+
 import salt.defaults.exitcodes
-import salt.log
-import salt.utils.job
 import salt.utils.parsers
 import salt.utils.stringutils
+import salt.utils.tracing
 from salt.exceptions import (
     AuthenticationError,
     AuthorizationError,
@@ -16,9 +19,6 @@ from salt.exceptions import (
     SaltSystemExit,
 )
 from salt.utils.args import yamlify_arg
-from salt.utils.verify import verify_log
-
-sys.modules["pkg_resources"] = None
 
 
 class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
@@ -30,14 +30,29 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
         """
         Execute the salt command line
         """
-        import salt.client
+        import salt.client  # noqa: F401
 
         self.parse_args()
+        salt.utils.tracing.configure({**self.config, "__role": "cli"})
+        span_name = (
+            f"salt.cli.{self.config.get('fun', '')}"
+            if self.config.get("fun")
+            else "salt.cli"
+        )
+        with salt.utils.tracing.start_span(
+            span_name,
+            attributes={
+                "salt.cli.tgt": str(self.config.get("tgt", "")),
+                "salt.cli.fun": self.config.get("fun", ""),
+            },
+        ):
+            try:
+                self._run()
+            finally:
+                salt.utils.tracing.shutdown()
 
-        if self.config["log_level"] not in ("quiet",):
-            # Setup file logging!
-            self.setup_logfile_logger()
-            verify_log(self.config)
+    def _run(self):
+        import salt.client
 
         try:
             # We don't need to bail on config file permission errors
@@ -50,7 +65,7 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
                 auto_reconnect=True,
             )
         except SaltClientError as exc:
-            self.exit(2, "{}\n".format(exc))
+            self.exit(2, f"{exc}\n")
             return
 
         if self.options.batch or self.options.static:
@@ -132,6 +147,9 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
         if getattr(self.options, "metadata"):
             kwargs["metadata"] = yamlify_arg(getattr(self.options, "metadata"))
 
+        if getattr(self.options, "start_event", False):
+            kwargs["start_event"] = True
+
         # If using eauth and a token hasn't already been loaded into
         # kwargs, prompt the user to enter auth credentials
         if "token" not in kwargs and "key" not in kwargs and self.options.eauth:
@@ -152,9 +170,7 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
 
         if self.config["async"]:
             jid = self.local_client.cmd_async(**kwargs)
-            salt.utils.stringutils.print_cli(
-                "Executed command with job ID: {}".format(jid)
-            )
+            salt.utils.stringutils.print_cli(f"Executed command with job ID: {jid}")
             return
 
         # local will be None when there was an error
@@ -167,7 +183,7 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
         try:
             if self.options.subset:
                 cmd_func = self.local_client.cmd_subset
-                kwargs["sub"] = self.options.subset
+                kwargs["subset"] = self.options.subset
                 kwargs["cli"] = True
             else:
                 cmd_func = self.local_client.cmd_cli
@@ -230,8 +246,7 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
             EauthAuthenticationError,
             SaltClientError,
         ) as exc:
-            ret = str(exc)
-            self._output_ret(ret, "", retcode=1)
+            self._output_ret(str(exc), "", retcode=1)
         finally:
             self.local_client.destroy()
 
@@ -268,6 +283,14 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
             eauth.update(res)
             eauth["eauth"] = self.options.eauth
 
+        # When --async and --batch are both set, hand off to the
+        # master-side BatchManager: publish the first sub-batch under
+        # a shared JID, persist BatchState, and exit.  The CLI does
+        # not wait for returns.
+        if self.config.get("async") and self.options.batch:
+            self._run_batch_async(eauth)
+            return
+
         if self.options.static:
 
             if not self.options.batch:
@@ -280,7 +303,7 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
 
             ret = {}
 
-            for res in batch.run():
+            for res, _ in batch.run():
                 ret.update(res)
 
             self._output_ret(ret, "")
@@ -289,20 +312,141 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
             try:
                 self.config["batch"] = self.options.batch
                 batch = salt.cli.batch.Batch(
-                    self.config, eauth=eauth, parser=self.options
+                    self.config, eauth=eauth, _parser=self.options
                 )
             except SaltClientError:
                 # We will print errors to the console further down the stack
                 sys.exit(1)
             # Printing the output is already taken care of in run() itself
             retcode = 0
-            for res in batch.run():
-                for ret in res.values():
-                    job_retcode = salt.utils.job.get_retcode(ret)
-                    if job_retcode > retcode:
-                        # Exit with the highest retcode we find
-                        retcode = job_retcode
+            for res, job_retcode in batch.run():
+                if job_retcode > retcode:
+                    # Exit with the highest retcode we find
+                    retcode = job_retcode
+            if not batch.minions:
+                # No minions matched the target. Mirror the non-batch CLI,
+                # which prints "No return received" and exits 2 rather than
+                # silently exiting 0 (#57357).
+                sys.stderr.write("ERROR: No return received\n")
+                sys.exit(2)
             sys.exit(retcode)
+
+    def _run_batch_async(self, eauth):
+        """
+        Hand off an async batch to the master-side BatchManager.
+
+        Resolves the target (sync gather_minions via
+        :class:`salt.cli.batch.Batch`), generates a single JID,
+        publishes the first sub-batch under that JID via the CLI's
+        ``LocalClient`` (so eauth runs the normal auth pipeline
+        exactly once), writes ``.batch.p``, registers the JID in the
+        active index, fires ``salt/batch/<jid>/new`` so BatchManager
+        adopts it, prints the JID, and exits.
+
+        Subsequent sub-batch publishes are issued by the BatchManager
+        using ``state["user"]`` captured here so publisher-ACL and
+        audit still attribute every sub-batch publish to the original
+        operator.
+        """
+        import time
+
+        import salt.cli.batch
+        import salt.utils.batch_output
+        import salt.utils.batch_state
+        import salt.utils.event
+        import salt.utils.jid
+        import salt.utils.user
+
+        batch_jid = salt.utils.jid.gen_jid(self.config)
+
+        try:
+            helper = salt.cli.batch.Batch(self.config, eauth=eauth, quiet=True)
+        except SaltClientError:
+            sys.exit(2)
+        try:
+            minions, _ping_gen, down_minions = helper.gather_minions()
+        finally:
+            try:
+                helper.local.destroy()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+        if not minions:
+            salt.utils.stringutils.print_cli("No minions matched the target.")
+            sys.exit(0)
+
+        for m in sorted(down_minions or ()):
+            salt.utils.stringutils.print_cli(
+                f"Minion {m} did not respond. No job will be sent."
+            )
+
+        opts_for_state = dict(self.config)
+        opts_for_state["batch"] = self.options.batch
+        opts_for_state["user"] = (
+            eauth.get("username") if eauth else salt.utils.user.get_user()
+        )
+        state = salt.utils.batch_state.create_batch_state(
+            opts_for_state, minions, batch_jid, driver="master"
+        )
+
+        batch_size = state["batch_size"]
+        initial = state["pending"][:batch_size]
+        state["pending"] = state["pending"][batch_size:]
+
+        pub_kwargs = dict(eauth or {})
+        try:
+            self.local_client.run_job(
+                tgt=list(initial),
+                fun=self.config["fun"],
+                arg=list(self.config.get("arg") or []),
+                tgt_type="list",
+                ret=self.config.get("ret", "") or "",
+                timeout=self.config.get("timeout", 60),
+                jid=batch_jid,
+                listen=False,
+                **pub_kwargs,
+            )
+        except (
+            AuthenticationError,
+            AuthorizationError,
+            EauthAuthenticationError,
+            SaltClientError,
+            SaltInvocationError,
+        ) as exc:
+            sys.stderr.write(f"ERROR: {exc}\n")
+            sys.exit(2)
+
+        now = time.time()
+        for m in initial:
+            state["active"][m] = now
+        state["last_progress"] = now
+
+        salt.utils.batch_state.write_batch_state(batch_jid, state, self.config)
+        salt.utils.batch_state.add_to_active_index(batch_jid, self.config)
+
+        try:
+            with salt.utils.event.get_master_event(
+                self.config, self.config["sock_dir"], listen=False
+            ) as event:
+                event.fire_event(
+                    salt.utils.batch_output.new_payload(state),
+                    salt.utils.batch_output.tag_new(batch_jid),
+                )
+        except Exception:  # pylint: disable=broad-except
+            # Non-fatal — BatchManager's _tick() reconciliation will
+            # pick this batch up from the active index within one
+            # loop interval.  Log the failure so operators see it.
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "Failed to fire salt/batch/%s/new; BatchManager will adopt "
+                "via active-index reconciliation on its next tick",
+                batch_jid,
+            )
+
+        salt.utils.stringutils.print_cli(
+            f"Executed batch command with job ID: {batch_jid}"
+        )
 
     def _print_errors_summary(self, errors):
         if errors:
@@ -345,16 +489,14 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
         salt.utils.stringutils.print_cli("Summary")
         salt.utils.stringutils.print_cli("-------------------------------------------")
         salt.utils.stringutils.print_cli(
-            "# of minions targeted: {}".format(return_counter + not_return_counter)
+            f"# of minions targeted: {return_counter + not_return_counter}"
+        )
+        salt.utils.stringutils.print_cli(f"# of minions returned: {return_counter}")
+        salt.utils.stringutils.print_cli(
+            f"# of minions that did not return: {not_return_counter}"
         )
         salt.utils.stringutils.print_cli(
-            "# of minions returned: {}".format(return_counter)
-        )
-        salt.utils.stringutils.print_cli(
-            "# of minions that did not return: {}".format(not_return_counter)
-        )
-        salt.utils.stringutils.print_cli(
-            "# of minions with errors: {}".format(len(failed_minions))
+            f"# of minions with errors: {len(failed_minions)}"
         )
         if self.options.verbose:
             if not_connected_minions:
@@ -457,7 +599,7 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
         if not ret:
             self.exit(2, "No minions found to gather docs from\n")
         if isinstance(ret, str):
-            self.exit(2, "{}\n".format(ret))
+            self.exit(2, f"{ret}\n")
         for host in ret:
             if isinstance(ret[host], str) and (
                 ret[host].startswith("Minion did not return")
@@ -472,6 +614,6 @@ class SaltCMD(salt.utils.parsers.SaltCMDOptionParser):
                 salt.output.display_output({fun: docs[fun]}, "nested", self.config)
         else:
             for fun in sorted(docs):
-                salt.utils.stringutils.print_cli("{}:".format(fun))
+                salt.utils.stringutils.print_cli(f"{fun}:")
                 salt.utils.stringutils.print_cli(docs[fun])
                 salt.utils.stringutils.print_cli("")

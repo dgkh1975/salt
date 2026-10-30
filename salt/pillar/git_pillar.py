@@ -65,6 +65,28 @@ GitFS, as described :ref:`here <gitfs-dependencies>`.
     See :ref:`here <git-pillar-config-opts>` for documentation on the
     git_pillar configuration options and their usage.
 
+Each ``- git:`` entry is a list of remote definitions. Every remote is a
+single string that starts with the branch (or tag) name to use as the Pillar
+environment, followed by a space, followed by a URL that ``pygit2`` or
+GitPython_ can clone. Supported URL forms are the same as for ``git clone``
+on the command line:
+
+* ``https://gitserver.example.com/group/repo.git`` — HTTPS. Credentials, if
+  needed, are configured per-remote via ``user`` and ``password`` (see
+  below).
+* ``ssh://git@gitserver.example.com/group/repo.git`` or
+  ``git@gitserver.example.com:group/repo.git`` — SSH. The scp-style
+  ``user@host:path`` form is also accepted. Note the ``:`` (colon) before
+  ``path`` — using ``/`` here is the most common cause of "Failed to resolve
+  address" or "Unable to exchange encryption keys" errors at master start.
+* ``file:///srv/git/repo.git`` — a bare repository on the local filesystem
+  (handy for testing).
+
+When a remote requires per-remote configuration (root, env override, auth
+credentials, etc.) the URL string must end with a trailing ``:`` and the
+options follow as a YAML list. Without any per-remote options, no trailing
+colon is needed.
+
 Here is an example git_pillar configuration:
 
 .. code-block:: yaml
@@ -72,16 +94,16 @@ Here is an example git_pillar configuration:
     ext_pillar:
       - git:
         # Use 'prod' instead of the branch name 'production' as the environment
-        - production https://gitserver/git-pillar.git:
+        - production https://gitserver.example.com/group/git-pillar.git:
           - env: prod
         # Use 'dev' instead of the branch name 'develop' as the environment
-        - develop https://gitserver/git-pillar.git:
+        - develop https://gitserver.example.com/group/git-pillar.git:
           - env: dev
         # No per-remote config parameters (and no trailing colon), 'qa' will
         # be used as the environment
-        - qa https://gitserver/git-pillar.git
-        # SSH key authentication
-        - master git@other-git-server:pillardata-ssh.git:
+        - qa https://gitserver.example.com/group/git-pillar.git
+        # SSH key authentication. Note the ':' (colon) between host and path.
+        - master git@other-git-server.example.com:group/pillardata-ssh.git:
           # Pillar SLS files will be read from the 'pillar' subdirectory in
           # this repository
           - root: pillar
@@ -89,7 +111,7 @@ Here is an example git_pillar configuration:
           - pubkey: /path/to/key.pub
           - passphrase: CorrectHorseBatteryStaple
         # HTTPS authentication
-        - master https://other-git-server/pillardata-https.git:
+        - master https://other-git-server.example.com/group/pillardata-https.git:
           - user: git
           - password: CorrectHorseBatteryStaple
 
@@ -398,7 +420,18 @@ import salt.utils.versions
 from salt.exceptions import FileserverConfigError
 from salt.pillar import Pillar
 
-PER_REMOTE_OVERRIDES = ("base", "env", "root", "ssl_verify", "refspecs", "fallback")
+PER_REMOTE_OVERRIDES = (
+    "base",
+    "env",
+    "root",
+    "ssl_verify",
+    "refspecs",
+    "fallback",
+    "proxy",
+    "ref_types",
+    "disable_saltenv_mapping",
+    "depth",
+)
 PER_REMOTE_ONLY = ("name", "mountpoint", "all_saltenvs")
 GLOBAL_ONLY = ("branch",)
 
@@ -437,7 +470,7 @@ def ext_pillar(minion_id, pillar, *repos):  # pylint: disable=unused-argument
     opts["__git_pillar"] = True
     git_pillar = salt.utils.gitfs.GitPillar(
         opts,
-        repos,
+        list(repos),
         per_remote_overrides=PER_REMOTE_OVERRIDES,
         per_remote_only=PER_REMOTE_ONLY,
         global_only=GLOBAL_ONLY,
@@ -463,8 +496,7 @@ def ext_pillar(minion_id, pillar, *repos):  # pylint: disable=unused-argument
         # If pillarenv is set, only grab pillars with that match pillarenv
         if opts["pillarenv"] and env != opts["pillarenv"]:
             log.debug(
-                "env '%s' for pillar dir '%s' does not match "
-                "pillarenv '%s', skipping",
+                "env '%s' for pillar dir '%s' does not match pillarenv '%s', skipping",
                 env,
                 pillar_dir,
                 opts["pillarenv"],
@@ -472,13 +504,13 @@ def ext_pillar(minion_id, pillar, *repos):  # pylint: disable=unused-argument
             continue
         if pillar_dir in git_pillar.pillar_linked_dirs:
             log.debug(
-                "git_pillar is skipping processing on %s as it is a " "mounted repo",
+                "git_pillar is skipping processing on %s as it is a mounted repo",
                 pillar_dir,
             )
             continue
         else:
             log.debug(
-                "git_pillar is processing pillar SLS from %s for pillar " "env '%s'",
+                "git_pillar is processing pillar SLS from %s for pillar env '%s'",
                 pillar_dir,
                 env,
             )

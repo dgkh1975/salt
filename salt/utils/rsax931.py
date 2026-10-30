@@ -2,7 +2,6 @@
 Create and verify ANSI X9.31 RSA signatures using OpenSSL libcrypto
 """
 
-
 import ctypes.util
 import glob
 import os
@@ -24,25 +23,62 @@ def _find_libcrypto():
     Find the path (or return the short name) of libcrypto.
     """
     if sys.platform.startswith("win"):
-        lib = "libeay32"
+        lib = None
+        for path in sys.path:
+            lib = glob.glob(os.path.join(path, "libcrypto*.dll"))
+            lib = lib[0] if lib else None
+            if lib:
+                break
+
     elif salt.utils.platform.is_darwin():
         # will look for several different location on the system,
-        # Search in the following order. salts pkg, homebrew, macports, finnally
-        # system.
+        # Search in the following order:
+        # - salt's pkg install location
+        # - relative to the running python (sys.executable)
+        # - homebrew
+        # - macports
+        # - system libraries
+
         # look in salts pkg install location.
         lib = glob.glob("/opt/salt/lib/libcrypto.dylib")
+
+        # look in location salt is running from
+        # this accounts for running from an unpacked onedir file
+        lib = lib or glob.glob("lib/libcrypto.dylib")
+
+        # Look in the location relative to the python binary
+        # Try to account for this being a venv by resolving the path if it is a
+        # symlink
+        py_bin = sys.executable
+        if os.path.islink(py_bin):
+            py_bin = os.path.realpath(py_bin)
+        target = os.path.dirname(py_bin)
+        if os.path.basename(target) == "bin":
+            target = os.path.dirname(target)
+        lib = lib or glob.glob(f"{target}/lib/libcrypto.dylib")
+
         # Find library symlinks in Homebrew locations.
-        lib = lib or glob.glob("/usr/local/opt/openssl/lib/libcrypto.dylib")
-        lib = lib or glob.glob("/usr/local/opt/openssl@*/lib/libcrypto.dylib")
+        import salt.modules.mac_brew_pkg as mac_brew
+
+        brew_prefix = mac_brew.homebrew_prefix()
+        if brew_prefix is not None:
+            lib = lib or glob.glob(
+                os.path.join(brew_prefix, "opt/openssl/lib/libcrypto.dylib")
+            )
+            lib = lib or glob.glob(
+                os.path.join(brew_prefix, "opt/openssl@*/lib/libcrypto.dylib")
+            )
+
         # look in macports.
         lib = lib or glob.glob("/opt/local/lib/libcrypto.dylib")
         # check if 10.15, regular libcrypto.dylib is just a false pointer.
         if platform.mac_ver()[0].split(".")[:2] == ["10", "15"]:
             lib = lib or glob.glob("/usr/lib/libcrypto.*.dylib")
             lib = list(reversed(sorted(lib)))
-        # last but not least all the other macOS versions should work here.
-        # including Big Sur.
-        lib = lib[0] if lib else "/usr/lib/libcrypto.dylib"
+        elif int(platform.mac_ver()[0].split(".")[0]) < 11:
+            # Fall back on system libcrypto (only works before Big Sur)
+            lib = lib or ["/usr/lib/libcrypto.dylib"]
+        lib = lib[0] if lib else None
     elif getattr(sys, "frozen", False) and salt.utils.platform.is_smartos():
         lib = glob.glob(os.path.join(os.path.dirname(sys.executable), "libcrypto.so*"))
         lib = lib[0] if lib else None

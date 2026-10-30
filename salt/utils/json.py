@@ -1,21 +1,13 @@
-# -*- coding: utf-8 -*-
 """
 Functions to work with JSON
 """
 
-from __future__ import absolute_import, unicode_literals
-
-# Import Python libs
-import json  # future lint: blacklisted-module
+import contextlib
+import json
 import logging
-import sys
 
-# Import Salt libs
 import salt.utils.data
 import salt.utils.stringutils
-
-# Import 3rd-party libs
-from salt.ext import six
 
 log = logging.getLogger(__name__)
 
@@ -33,28 +25,25 @@ def __split(raw):
     return raw.splitlines()
 
 
-def find_json(raw):
-    """
-    Pass in a raw string and load the json when it starts. This allows for a
-    string to start with garbage and end with json but be cleanly loaded
-    """
-    ret = {}
-    lines = __split(raw)
-    for ind, _ in enumerate(lines):
-        try:
-            working = "\n".join(lines[ind:])
-        except UnicodeDecodeError:
-            working = "\n".join(salt.utils.data.decode(lines[ind:]))
+def find_json(s: str):
+    """Pass in a string and load JSON within it.
 
-        try:
-            ret = json.loads(working)  # future lint: blacklisted-function
-        except ValueError:
-            continue
-        if ret:
-            return ret
-    if not ret:
-        # Not json, raise an error
-        raise ValueError
+    The string may contain non-JSON text before and after the JSON document.
+
+    Raises ValueError if no valid JSON was found.
+    """
+    decoder = json.JSONDecoder()
+
+    # We look for the beginning of JSON objects / arrays and let raw_decode() handle
+    # extraneous data at the end.
+    for idx, char in enumerate(s):
+        if char == "{" or char == "[":
+            # JSONDecodeErrors are expected on stray '{'/'[' in the non-JSON part
+            with contextlib.suppress(json.JSONDecodeError):
+                data, _ = decoder.raw_decode(s[idx:])
+                return data
+
+    raise ValueError
 
 
 def import_json():
@@ -97,10 +86,10 @@ def loads(s, **kwargs):
         return json_module.loads(s, **kwargs)
     except TypeError as exc:
         # json.loads cannot load bytestrings in Python < 3.6
-        if six.PY3 and isinstance(s, bytes):
+        if isinstance(s, bytes):
             return json_module.loads(salt.utils.stringutils.to_unicode(s), **kwargs)
         else:
-            six.reraise(*sys.exc_info())
+            raise
 
 
 def dump(obj, fp, **kwargs):
@@ -121,9 +110,7 @@ def dump(obj, fp, **kwargs):
     json_module = kwargs.pop("_json_module", json)
     if "ensure_ascii" not in kwargs:
         kwargs["ensure_ascii"] = False
-    if six.PY2:
-        obj = salt.utils.data.encode(obj)
-    return json_module.dump(obj, fp, **kwargs)  # future lint: blacklisted-function
+    return json_module.dump(obj, fp, **kwargs)
 
 
 def dumps(obj, **kwargs):
@@ -144,6 +131,4 @@ def dumps(obj, **kwargs):
     json_module = kwargs.pop("_json_module", json)
     if "ensure_ascii" not in kwargs:
         kwargs["ensure_ascii"] = False
-    if six.PY2:
-        obj = salt.utils.data.encode(obj)
-    return json_module.dumps(obj, **kwargs)  # future lint: blacklisted-function
+    return json_module.dumps(obj, **kwargs)

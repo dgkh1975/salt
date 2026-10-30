@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 State module for syslog_ng
 ==========================
@@ -44,13 +43,6 @@ You can find more information about syslog-ng's configuration syntax in the
 Syslog-ng Admin guide:
 http://www.balabit.com/sites/default/files/documents/syslog-ng-ose-3.5-guides/en/syslog-ng-ose-v3.5-guide-admin/html-single/index.html#syslog-ng.conf.5
 """
-from __future__ import (
-    absolute_import,
-    generators,
-    print_function,
-    unicode_literals,
-    with_statement,
-)
 
 import logging
 
@@ -94,7 +86,7 @@ def started(
     control=None,
     worker_threads=None,
     *args,
-    **kwargs
+    **kwargs,
 ):
     """
     Ensures, that syslog-ng is started via the given parameters.

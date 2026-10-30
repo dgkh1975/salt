@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 NAPALM ACL
 ==========
@@ -26,9 +25,8 @@ it requires NAPALM_ library to be installed:  ``pip install napalm``.
 Please check Installation_ for complete details.
 
 .. _NAPALM: https://napalm.readthedocs.io
-.. _Installation: https://napalm.readthedocs.io/en/latest/installation.html
+.. _Installation: https://napalm.readthedocs.io/en/latest/installation/index.html
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
 
@@ -38,13 +36,12 @@ from salt.utils.napalm import proxy_napalm_wrap
 
 log = logging.getLogger(__file__)
 
-# Import third party libs
 try:
     # pylint: disable=W0611
     import capirca
     import capirca.aclgen
-    import capirca.lib.policy
     import capirca.lib.aclgenerator
+    import capirca.lib.policy
 
     HAS_CAPIRCA = True
     # pylint: enable=W0611
@@ -74,8 +71,7 @@ def __virtual__():
     else:
         return (
             False,
-            "The netacl (napalm_acl) module cannot be loaded: \
-                Please install capirca and napalm.",
+            "The netacl (napalm_acl) module cannot be loaded. Please install capirca and napalm.",
         )
 
 
@@ -138,7 +134,7 @@ def load_term_config(
     debug=False,
     source_service=None,
     destination_service=None,
-    **term_fields
+    **term_fields,
 ):
     """
     Generate and load the configuration of a policy term.
@@ -454,7 +450,7 @@ def load_term_config(
         revision_date_format=revision_date_format,
         source_service=source_service,
         destination_service=destination_service,
-        **term_fields
+        **term_fields,
     )
     # pylint: disable=undefined-variable
     return __salt__["net.load_config"](
@@ -485,7 +481,7 @@ def load_filter_config(
     test=False,
     commit=True,
     debug=False,
-    **kwargs
+    **kwargs,
 ):  # pylint: disable=unused-argument
     """
     Generate and load the configuration of a policy filter.
@@ -705,7 +701,7 @@ def load_policy_config(
     test=False,
     commit=True,
     debug=False,
-    **kwargs
+    **kwargs,
 ):  # pylint: disable=unused-argument
     """
     Generate and load the configuration of the whole policy.

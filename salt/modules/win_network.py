@@ -7,10 +7,13 @@ import hashlib
 import re
 import socket
 
+import salt.utils.functools
 import salt.utils.network
 import salt.utils.platform
 import salt.utils.validate.net
+import salt.utils.win_pwsh
 from salt._compat import ipaddress
+from salt.exceptions import CommandExecutionError
 from salt.modules.network import (
     calc_net,
     convert_cidr,
@@ -24,7 +27,7 @@ from salt.modules.network import (
     subnets6,
     wol,
 )
-from salt.utils.functools import namespaced_function as _namespaced_function
+from salt.utils.functools import namespaced_function
 
 try:
     import salt.utils.winapi
@@ -38,6 +41,21 @@ try:
     import wmi  # pylint: disable=import-error
 except ImportError:
     HAS_DEPENDENCIES = False
+
+if salt.utils.platform.is_windows() and HAS_DEPENDENCIES:
+
+    wol = namespaced_function(wol, globals())
+    get_hostname = namespaced_function(get_hostname, globals())
+    interface = namespaced_function(interface, globals())
+    interface_ip = namespaced_function(interface_ip, globals())
+    subnets6 = namespaced_function(subnets6, globals())
+    ip_in_subnet = namespaced_function(ip_in_subnet, globals())
+    convert_cidr = namespaced_function(convert_cidr, globals())
+    calc_net = namespaced_function(calc_net, globals())
+    get_fqdn = namespaced_function(get_fqdn, globals())
+    ifacestartswith = namespaced_function(ifacestartswith, globals())
+    iphexval = namespaced_function(iphexval, globals())
+
 
 # Define the module's virtual name
 __virtualname__ = "network"
@@ -53,27 +71,21 @@ def __virtual__():
     if not HAS_DEPENDENCIES:
         return False, "Module win_network: Missing dependencies"
 
-    global wol, get_hostname, interface, interface_ip, subnets6, ip_in_subnet
-    global convert_cidr, calc_net, get_fqdn, ifacestartswith, iphexval
-
-    wol = _namespaced_function(wol, globals())
-    get_hostname = _namespaced_function(get_hostname, globals())
-    interface = _namespaced_function(interface, globals())
-    interface_ip = _namespaced_function(interface_ip, globals())
-    subnets6 = _namespaced_function(subnets6, globals())
-    ip_in_subnet = _namespaced_function(ip_in_subnet, globals())
-    convert_cidr = _namespaced_function(convert_cidr, globals())
-    calc_net = _namespaced_function(calc_net, globals())
-    get_fqdn = _namespaced_function(get_fqdn, globals())
-    ifacestartswith = _namespaced_function(ifacestartswith, globals())
-    iphexval = _namespaced_function(iphexval, globals())
-
     return __virtualname__
 
 
 def ping(host, timeout=False, return_boolean=False):
     """
     Performs a ping to a host
+
+    Args:
+
+        host (str): The host to ping
+
+        timeout (:obj:`bool`, optional): Timeout in seconds.
+            Defaults is ``False``.
+
+        return_boolean (:obj:`bool`, optional): Return boolean.
 
     CLI Example:
 
@@ -161,6 +173,10 @@ def traceroute(host):
     """
     Performs a traceroute to a 3rd party host
 
+    Args:
+
+        host (str): The host to target with traceroute
+
     CLI Example:
 
     .. code-block:: bash
@@ -218,6 +234,10 @@ def nslookup(host):
     """
     Query DNS for information about a domain or ip address
 
+    Args:
+
+        host (str): The domain or ip address to lookup
+
     CLI Example:
 
     .. code-block:: bash
@@ -253,11 +273,17 @@ def get_route(ip):
 
     .. versionadded:: 2016.11.5
 
-    CLI Example::
+    Args:
+
+        ip (str): The to find routing information for
+
+    CLI Example:
+
+    .. code-block:: bash
 
         salt '*' network.get_route 10.10.10.10
     """
-    cmd = "Find-NetRoute -RemoteIPAddress {}".format(ip)
+    cmd = f"Find-NetRoute -RemoteIPAddress {ip}"
     out = __salt__["cmd.run"](cmd, shell="powershell", python_shell=True)
     regexp = re.compile(
         r"^IPAddress\s+:\s(?P<source>[\d\.:]+)?.*"
@@ -281,6 +307,10 @@ def dig(host):
     Performs a DNS lookup with dig
 
     Note: dig must be installed on the Windows minion
+
+    Args:
+
+        host (str): The host to lookup with dig
 
     CLI Example:
 
@@ -328,6 +358,10 @@ def hw_addr(iface):
     """
     Return the hardware address (a.k.a. MAC address) for a given interface
 
+    Args:
+
+        iface (str): The interface name
+
     CLI Example:
 
     .. code-block:: bash
@@ -356,7 +390,14 @@ def subnets():
 
 def in_subnet(cidr):
     """
-    Returns True if host is within specified subnet, otherwise False
+    Determine if a host is within a subnet
+
+    Args:
+
+        cidr (str): The CIDR to check
+
+    Returns:
+        bool: ``True`` if host is within specified subnet, otherwise ``False``
 
     CLI Example:
 
@@ -371,23 +412,33 @@ def ip_addrs(interface=None, include_loopback=False, cidr=None, type=None):
     """
     Returns a list of IPv4 addresses assigned to the host.
 
-    interface
-        Only IP addresses from that interface will be returned.
+    Args:
 
-    include_loopback : False
-        Include loopback 127.0.0.1 IPv4 address.
+        interface (:obj:`str`, optional):
+            Only IP addresses from that interface will be returned.
 
-    cidr
-        Describes subnet using CIDR notation and only IPv4 addresses that belong
-        to this subnet will be returned.
+            Default is ``None``.
 
-      .. versionchanged:: 2019.2.0
+        include_loopback (:obj:`bool`, optional):
+            Include loopback 127.0.0.1 IPv4 address.
 
-    type
-        If option set to 'public' then only public addresses will be returned.
-        Ditto for 'private'.
+            Default is ``False``.
 
-        .. versionchanged:: 2019.2.0
+        cidr (:obj:`str`, optional):
+            Describes subnet using CIDR notation and only IPv4 addresses that belong
+            to this subnet will be returned.
+
+            Default is ``None``.
+
+          .. versionchanged:: 2019.2.0
+
+        type (:obj:`str`, optional):
+            If option set to 'public' then only public addresses will be returned.
+            Ditto for 'private'.
+
+            Default is ``None``.
+
+            .. versionchanged:: 2019.2.0
 
     CLI Example:
 
@@ -418,17 +469,25 @@ def ip_addrs6(interface=None, include_loopback=False, cidr=None):
     """
     Returns a list of IPv6 addresses assigned to the host.
 
-    interface
-        Only IP addresses from that interface will be returned.
+    Args:
 
-    include_loopback : False
-        Include loopback ::1 IPv6 address.
+        interface (:obj:`str`, optional):
+            Only IP addresses from that interface will be returned.
 
-    cidr
-        Describes subnet using CIDR notation and only IPv6 addresses that belong
-        to this subnet will be returned.
+            Default is ``None``.
 
-        .. versionchanged:: 2019.2.0
+        include_loopback (:obj:`bool`, optional):
+            Include loopback ::1 IPv6 address.
+
+            Default is ``False``.
+
+        cidr (:obj:`str`, optional):
+            Describes subnet using CIDR notation and only IPv6 addresses that belong
+            to this subnet will be returned.
+
+            Default is ``None``.
+
+            .. versionchanged:: 2019.2.0
 
     CLI Example:
 
@@ -455,6 +514,15 @@ def connect(host, port=None, **kwargs):
     port from the minion.
 
     .. versionadded:: 2016.3.0
+
+    Args:
+
+        host (str): The host to connect to
+
+        port (:obj:`int`, optional):
+            The port to connect to
+
+            Default is ``None``.
 
     CLI Example:
 
@@ -490,7 +558,7 @@ def connect(host, port=None, **kwargs):
     ):
         address = host
     else:
-        address = "{}".format(salt.utils.network.sanitize_host(host))
+        address = f"{salt.utils.network.sanitize_host(host)}"
 
     # just in case we encounter error on getaddrinfo
     _address = ("unknown",)
@@ -551,6 +619,10 @@ def is_private(ip_addr):
 
     .. versionadded:: 2019.2.0
 
+    Args:
+
+        ip_addr (str): The IP address to check
+
     CLI Example:
 
     .. code-block:: bash
@@ -558,3 +630,172 @@ def is_private(ip_addr):
         salt '*' network.is_private 10.0.0.3
     """
     return ipaddress.ip_address(ip_addr).is_private
+
+
+def _get_neighbors(address_family):
+    """
+    Return the neighbour (ARP/NDP) table for the given address family
+    ("IPv4" or "IPv6") as a list of entry dicts, via Get-NetNeighbor.
+
+    To match what the Unix network module can observe, unresolved entries
+    (no link-layer address, or the all-zero placeholder) and the static
+    multicast/broadcast
+    pseudo-neighbours Windows keeps in its cache are skipped, MAC addresses
+    are normalized to the lowercase colon-separated form, and states are
+    reported in the uppercase NUD vocabulary (REACHABLE, STALE, ...) used
+    by ``ip neigh``.
+    """
+    cmd = (
+        f"Get-NetNeighbor -AddressFamily {address_family} | "
+        "Select-Object IPAddress, LinkLayerAddress, InterfaceAlias, "
+        "@{Name='State'; Expression={$_.State.ToString()}}"
+    )
+    # Use the in-process PowerShell runspace, which avoids spinning up a
+    # powershell.exe subprocess per call. Its runspace requires the PowerShell
+    # SDK (pythonnet), which the standard Salt onedir installer bundles;
+    # PowerShellSession must not be instantiated without it.
+    if not salt.utils.win_pwsh.HAS_PWSH_SDK:
+        raise CommandExecutionError(
+            "The Windows neighbour table requires the in-process PowerShell "
+            "SDK (pythonnet), which the standard Salt installer includes."
+        )
+    with salt.utils.win_pwsh.PowerShellSession() as session:
+        results = session.run_json(cmd)
+
+    if not results:
+        # No neighbours in this address family: run_json returns None
+        results = []
+    elif isinstance(results, dict):
+        # A single neighbour serializes to a bare object rather than a list
+        results = [results]
+
+    entries = []
+    for neighbor in results:
+        mac = neighbor.get("LinkLayerAddress")
+        if not mac or not mac.strip("0-:"):
+            # Unresolved (Unreachable/Incomplete) entries carry either no
+            # link-layer address or the all-zero placeholder 00-00-00-00-00-00.
+            # Linux omits the lladdr for these, so skip both for parity.
+            continue
+        mac = mac.replace("-", ":").lower()
+        # Windows keeps permanent broadcast and multicast pseudo-neighbours in
+        # its cache: the limited broadcast (255.255.255.255), subnet-directed
+        # broadcasts (e.g. 10.0.2.255), IPv4 multicast (224.0.0.0/4) and IPv6
+        # multicast (ff00::/8). Every one of these carries a group link-layer
+        # address -- the low bit of the first MAC octet is set -- whereas a
+        # real host always has a unicast MAC. Linux never stores these in its
+        # neighbour table, so skip them for parity.
+        if int(mac.split(":")[0], 16) & 1:
+            continue
+        state = neighbor.get("State")
+        entries.append(
+            {
+                "ip": neighbor.get("IPAddress"),
+                "mac": mac,
+                "dev": neighbor.get("InterfaceAlias"),
+                "state": state.upper() if state else state,
+            }
+        )
+
+    return entries
+
+
+def arp(expand=None):
+    """
+    Return the arp table from the minion
+
+    expand : None
+        If ``True``, return a list of neighbour entry dicts of the form
+        ``{"ip": ..., "mac": ..., "dev": ..., "state": ...}`` instead of the
+        legacy ``{mac: ip}`` mapping used by the Unix network module. The
+        legacy mapping can only hold one entry per MAC address, so any
+        further IP addresses sharing that MAC are silently dropped from it.
+
+    .. versionadded:: 3008.5
+        The list-of-entries shape enabled by ``expand=True`` will become the
+        default return shape in salt 3011; until then, calling this function
+        without ``expand`` emits a ``DeprecationWarning``, matching the
+        deprecation cycle of the Unix network module.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' network.arp
+        salt '*' network.arp expand=True
+    """
+    expand = salt.utils.network.neigh_expand_warning("network.arp", expand)
+    entries = _get_neighbors("IPv4")
+    if expand:
+        return entries
+    return salt.utils.network.neighs_flatten(entries)
+
+
+def ip_neighs(expand=None):
+    """
+    Return the ip neighbour (arp) table from the minion for IPv4 addresses
+
+    expand : None
+        If ``True``, return a list of neighbour entry dicts of the form
+        ``{"ip": ..., "mac": ..., "dev": ..., "state": ...}`` instead of the
+        legacy ``{mac: ip}`` mapping used by the Unix network module. The
+        legacy mapping can only hold one entry per MAC address, so any
+        further IP addresses sharing that MAC are silently dropped from it.
+
+    .. versionadded:: 3008.5
+        The list-of-entries shape enabled by ``expand=True`` will become the
+        default return shape in salt 3011; until then, calling this function
+        without ``expand`` emits a ``DeprecationWarning``, matching the
+        deprecation cycle of the Unix network module.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' network.ip_neighs
+        salt '*' network.ip_neighs expand=True
+    """
+    expand = salt.utils.network.neigh_expand_warning("network.ip_neighs", expand)
+    entries = _get_neighbors("IPv4")
+    if expand:
+        return entries
+    return salt.utils.network.neighs_flatten(entries)
+
+
+ipneighs = salt.utils.functools.alias_function(ip_neighs, "ipneighs")
+
+
+def ip_neighs6(expand=None):
+    """
+    Return the ip neighbour (NDP) table from the minion for IPv6 addresses
+
+    expand : None
+        If ``True``, return a list of neighbour entry dicts of the form
+        ``{"ip": ..., "mac": ..., "dev": ..., "state": ...}`` instead of the
+        legacy ``{mac: ip}`` mapping used by the Unix network module. The
+        legacy mapping can only hold one entry per MAC address, and IPv6
+        hosts normally hold at least a link-local and a global address on
+        the same MAC, so the legacy mapping loses entries for practically
+        every neighbour; ``expand=True`` is strongly recommended.
+
+    .. versionadded:: 3008.5
+        The list-of-entries shape enabled by ``expand=True`` will become the
+        default return shape in salt 3011; until then, calling this function
+        without ``expand`` emits a ``DeprecationWarning``, matching the
+        deprecation cycle of the Unix network module.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' network.ip_neighs6
+        salt '*' network.ip_neighs6 expand=True
+    """
+    expand = salt.utils.network.neigh_expand_warning("network.ip_neighs6", expand)
+    entries = _get_neighbors("IPv6")
+    if expand:
+        return entries
+    return salt.utils.network.neighs_flatten(entries)
+
+
+ipneighs6 = salt.utils.functools.alias_function(ip_neighs6, "ipneighs6")

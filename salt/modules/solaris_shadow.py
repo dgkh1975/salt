@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Manage the password database on Solaris systems
 
@@ -8,26 +7,18 @@ Manage the password database on Solaris systems
     *'shadow.info' is not available*), see :ref:`here
     <module-provider-override>`.
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
-# Import python libs
+import collections
 import os
 
-# Import salt libs
 import salt.utils.files
+import salt.utils.stringutils
 from salt.exceptions import CommandExecutionError
 
 try:
-    import spwd
-
-    HAS_SPWD = True
+    import pwd
 except ImportError:
-    # SmartOS joyent_20130322T181205Z does not have spwd
-    HAS_SPWD = False
-    try:
-        import pwd
-    except ImportError:
-        pass  # We're most likely on a Windows machine.
+    pass  # We're most likely on a Windows machine.
 
 
 try:
@@ -42,6 +33,26 @@ except ImportError:
 __virtualname__ = "shadow"
 
 
+# The stdlib ``spwd`` module was deprecated in Python 3.11 and removed in
+# Python 3.13, so we can no longer rely on ``spwd.getspnam``/``spwd.struct_spwd``
+# to read ``/etc/shadow``. Emulate the pieces we need by parsing ``/etc/shadow``
+# directly and returning a namedtuple with the same attribute names.
+struct_spwd = collections.namedtuple(
+    "struct_spwd",
+    [
+        "sp_namp",
+        "sp_pwdp",
+        "sp_lstchg",
+        "sp_min",
+        "sp_max",
+        "sp_warn",
+        "sp_inact",
+        "sp_expire",
+        "sp_flag",
+    ],
+)
+
+
 def __virtual__():
     """
     Only work on POSIX-like systems
@@ -50,7 +61,8 @@ def __virtual__():
         return __virtualname__
     return (
         False,
-        "The solaris_shadow execution module failed to load: only available on Solaris systems.",
+        "The solaris_shadow execution module failed to load: only available on Solaris"
+        " systems.",
     )
 
 
@@ -67,9 +79,38 @@ def default_hash():
     return "!"
 
 
-def info(name):
+def _getspnam(name, root=None):
+    """
+    Read ``/etc/shadow`` and return an ``spwd.struct_spwd``-compatible
+    record for ``name``. Replaces ``spwd.getspnam``, which was removed
+    in Python 3.13.
+    """
+    root = "/" if not root else root
+    passwd = os.path.join(root, "etc/shadow")
+    with salt.utils.files.fopen(passwd) as fp_:
+        for line in fp_:
+            line = salt.utils.stringutils.to_unicode(line).rstrip("\n")
+            comps = line.split(":")
+            if comps[0] == name:
+                # Generate a getspnam compatible output
+                for i in range(2, 9):
+                    if i < len(comps):
+                        comps[i] = int(comps[i]) if comps[i] else -1
+                    else:
+                        comps.append(-1)
+                return struct_spwd(*comps[:9])
+    raise KeyError
+
+
+def info(name, root=None):
     """
     Return information for the specified user
+
+    name
+        User to get the information for
+
+    root
+        Directory to chroot into
 
     CLI Example:
 
@@ -77,34 +118,23 @@ def info(name):
 
         salt '*' shadow.info root
     """
-    if HAS_SPWD:
-        try:
-            data = spwd.getspnam(name)
-            ret = {
-                "name": data.sp_nam,
-                "passwd": data.sp_pwd,
-                "lstchg": data.sp_lstchg,
-                "min": data.sp_min,
-                "max": data.sp_max,
-                "warn": data.sp_warn,
-                "inact": data.sp_inact,
-                "expire": data.sp_expire,
-            }
-        except KeyError:
-            ret = {
-                "name": "",
-                "passwd": "",
-                "lstchg": "",
-                "min": "",
-                "max": "",
-                "warn": "",
-                "inact": "",
-                "expire": "",
-            }
-        return ret
+    try:
+        data = _getspnam(name, root=root)
+        return {
+            "name": data.sp_namp,
+            "passwd": data.sp_pwdp,
+            "lstchg": data.sp_lstchg,
+            "min": data.sp_min,
+            "max": data.sp_max,
+            "warn": data.sp_warn,
+            "inact": data.sp_inact,
+            "expire": data.sp_expire,
+        }
+    except (KeyError, OSError):
+        pass
 
-    # SmartOS joyent_20130322T181205Z does not have spwd, but not all is lost
-    # Return what we can know
+    # /etc/shadow was not readable or the user was not found there.
+    # Fall back to what we can learn from pwd + `passwd -s` (SmartOS path).
     ret = {
         "name": "",
         "passwd": "",
@@ -117,7 +147,7 @@ def info(name):
     }
 
     try:
-        data = pwd.getpwnam(name)
+        data = pwd.getpwnam(name)  # pylint: disable=used-before-assignment
         ret.update({"name": name})
     except KeyError:
         return ret
@@ -126,7 +156,7 @@ def info(name):
     s_file = "/etc/shadow"
     if not os.path.isfile(s_file):
         return ret
-    with salt.utils.files.fopen(s_file, "rb") as ifile:
+    with salt.utils.files.fopen(s_file, "r") as ifile:
         for line in ifile:
             comps = line.strip().split(":")
             if comps[0] == name:
@@ -147,7 +177,7 @@ def info(name):
     #  5. Maximum age
     #  6. Warning period
 
-    output = __salt__["cmd.run_all"]("passwd -s {0}".format(name), python_shell=False)
+    output = __salt__["cmd.run_all"](f"passwd -s {name}", python_shell=False)
     if output["retcode"] != 0:
         return ret
 
@@ -186,7 +216,7 @@ def set_maxdays(name, maxdays):
     pre_info = info(name)
     if maxdays == pre_info["max"]:
         return True
-    cmd = "passwd -x {0} {1}".format(maxdays, name)
+    cmd = f"passwd -x {maxdays} {name}"
     __salt__["cmd.run"](cmd, python_shell=False)
     post_info = info(name)
     if post_info["max"] != pre_info["max"]:
@@ -206,7 +236,7 @@ def set_mindays(name, mindays):
     pre_info = info(name)
     if mindays == pre_info["min"]:
         return True
-    cmd = "passwd -n {0} {1}".format(mindays, name)
+    cmd = f"passwd -n {mindays} {name}"
     __salt__["cmd.run"](cmd, python_shell=False)
     post_info = info(name)
     if post_info["min"] != pre_info["min"]:
@@ -268,7 +298,7 @@ def del_password(name):
 
         salt '*' shadow.del_password username
     """
-    cmd = "passwd -d {0}".format(name)
+    cmd = f"passwd -d {name}"
     __salt__["cmd.run"](cmd, python_shell=False, output_loglevel="quiet")
     uinfo = info(name)
     return not uinfo["passwd"]
@@ -291,7 +321,7 @@ def set_password(name, password):
     if not os.path.isfile(s_file):
         return ret
     lines = []
-    with salt.utils.files.fopen(s_file, "rb") as ifile:
+    with salt.utils.files.fopen(s_file, "r") as ifile:
         for line in ifile:
             comps = line.strip().split(":")
             if comps[0] != name:
@@ -299,7 +329,7 @@ def set_password(name, password):
                 continue
             comps[1] = password
             line = ":".join(comps)
-            lines.append("{0}\n".format(line))
+            lines.append(f"{line}\n")
     with salt.utils.files.fopen(s_file, "w+") as ofile:
         lines = [salt.utils.stringutils.to_str(_l) for _l in lines]
         ofile.writelines(lines)
@@ -321,7 +351,7 @@ def set_warndays(name, warndays):
     pre_info = info(name)
     if warndays == pre_info["warn"]:
         return True
-    cmd = "passwd -w {0} {1}".format(warndays, name)
+    cmd = f"passwd -w {warndays} {name}"
     __salt__["cmd.run"](cmd, python_shell=False)
     post_info = info(name)
     if post_info["warn"] != pre_info["warn"]:

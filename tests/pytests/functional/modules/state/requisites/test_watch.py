@@ -1,10 +1,12 @@
 import pytest
+
 import salt.utils.platform
 
 from . import normalize_ret
 
 pytestmark = [
     pytest.mark.windows_whitelisted,
+    pytest.mark.core_test,
 ]
 
 
@@ -25,12 +27,10 @@ def test_watch_in(state, state_tree):
     watch = "test_|-watch_states_|-watch_states_|-succeed_without_changes"
     with pytest.helpers.temp_file("requisite.sls", sls_contents, state_tree):
         ret = state.sls("requisite")
-        assert ret[changes]["__run_num__"] == 0
-        assert (
-            ret[changes]["changes"]["testing"]["new"] == "Something pretended to change"
-        )
-        assert ret[watch]["__run_num__"] == 2
-        assert ret[watch]["comment"] == "Watch statement fired."
+        assert ret[changes].full_return["__run_num__"] == 0
+        assert ret[changes].changes["testing"]["new"] == "Something pretended to change"
+        assert ret[watch].full_return["__run_num__"] == 2
+        assert ret[watch].comment == "Watch statement fired."
 
 
 def test_watch_in_failure(state, state_tree):
@@ -50,14 +50,13 @@ def test_watch_in_failure(state, state_tree):
     watch = "test_|-watch_states_|-watch_states_|-succeed_without_changes"
     with pytest.helpers.temp_file("requisite.sls", sls_contents, state_tree):
         ret = state.sls("requisite")
-        assert ret[fail]["result"] is False
+        assert ret[fail].result is False
         assert (
-            ret[watch]["comment"]
+            ret[watch].comment
             == "One or more requisite failed: requisite.return_changes"
         )
 
 
-@pytest.mark.slow_test
 def test_requisites_watch_any(state, state_tree):
     """
     Call sls file containing several require_in and require.
@@ -114,60 +113,58 @@ def test_requisites_watch_any(state, state_tree):
         cmd_true=cmd_true, cmd_false=cmd_false
     )
     expected_result = {
-        "cmd_|-A_|-{}_|-wait".format(cmd_true): {
+        f"cmd_|-A_|-{cmd_true}_|-wait": {
             "__run_num__": 4,
-            "comment": 'Command "{}" run'.format(cmd_true),
+            "comment": f'Command "{cmd_true}" run',
             "result": True,
             "changes": True,
         },
-        "cmd_|-B_|-{}_|-run".format(cmd_true): {
+        f"cmd_|-B_|-{cmd_true}_|-run": {
             "__run_num__": 0,
-            "comment": 'Command "{}" run'.format(cmd_true),
+            "comment": f'Command "{cmd_true}" run',
             "result": True,
             "changes": True,
         },
-        "cmd_|-C_|-{}_|-run".format(cmd_false): {
+        f"cmd_|-C_|-{cmd_false}_|-run": {
             "__run_num__": 1,
-            "comment": 'Command "{}" run'.format(cmd_false),
+            "comment": f'Command "{cmd_false}" run',
             "result": False,
             "changes": True,
         },
-        "cmd_|-D_|-{}_|-run".format(cmd_true): {
+        f"cmd_|-D_|-{cmd_true}_|-run": {
             "__run_num__": 2,
-            "comment": 'Command "{}" run'.format(cmd_true),
+            "comment": f'Command "{cmd_true}" run',
             "result": True,
             "changes": True,
         },
-        "cmd_|-E_|-{}_|-wait".format(cmd_true): {
+        f"cmd_|-E_|-{cmd_true}_|-wait": {
             "__run_num__": 9,
-            "comment": 'Command "{}" run'.format(cmd_true),
+            "comment": f'Command "{cmd_true}" run',
             "result": True,
             "changes": True,
         },
-        "cmd_|-F_|-{}_|-run".format(cmd_true): {
+        f"cmd_|-F_|-{cmd_true}_|-run": {
             "__run_num__": 5,
-            "comment": 'Command "{}" run'.format(cmd_true),
+            "comment": f'Command "{cmd_true}" run',
             "result": True,
             "changes": True,
         },
-        "cmd_|-G_|-{}_|-run".format(cmd_false): {
+        f"cmd_|-G_|-{cmd_false}_|-run": {
             "__run_num__": 6,
-            "comment": 'Command "{}" run'.format(cmd_false),
+            "comment": f'Command "{cmd_false}" run',
             "result": False,
             "changes": True,
         },
-        "cmd_|-H_|-{}_|-run".format(cmd_false): {
+        f"cmd_|-H_|-{cmd_false}_|-run": {
             "__run_num__": 7,
-            "comment": 'Command "{}" run'.format(cmd_false),
+            "comment": f'Command "{cmd_false}" run',
             "result": False,
             "changes": True,
         },
     }
     with pytest.helpers.temp_file("requisite.sls", sls_contents, state_tree):
         ret = state.sls("requisite")
-        result = normalize_ret(ret)
-        ret = pytest.helpers.state_return(ret)
-        ret.assert_return_non_empty_state_type()
+        result = normalize_ret(ret.raw)
         assert result == expected_result
 
 
@@ -195,7 +192,7 @@ def test_requisites_watch_any_fail(state, state_tree):
     """
     with pytest.helpers.temp_file("requisite.sls", sls_contents, state_tree):
         ret = state.sls("requisite")
-        assert "One or more requisite failed" in ret["cmd_|-A_|-true_|-wait"]["comment"]
+        assert "One or more requisite failed" in ret["cmd_|-A_|-true_|-wait"].comment
 
 
 def test_issue_30820_requisite_in_match_by_name(state, state_tree):
@@ -218,4 +215,66 @@ def test_issue_30820_requisite_in_match_by_name(state, state_tree):
     with pytest.helpers.temp_file("requisite.sls", sls_contents, state_tree):
         ret = state.sls("requisite")
         assert bar_state in ret
-        assert ret[bar_state]["comment"] == 'Command "echo bar" run'
+        assert ret[bar_state].comment == 'Command "echo bar" run'
+
+
+def test_watch_skips_mod_watch_when_normal_run_has_changes(state, state_tree):
+    """
+    By default, if the watcher's normal run already produces changes,
+    ``mod_watch`` is not invoked. This preserves the long-standing Salt
+    behavior that non-idempotent watchers (such as ``cmd.run``, whose
+    ``mod_watch`` re-executes the command) do not run twice per state
+    apply.
+    """
+    sls_contents = """
+    trigger:
+      test.succeed_with_changes
+
+    watcher:
+      test.succeed_with_changes:
+        - watch:
+          - test: trigger
+    """
+    watcher = "test_|-watcher_|-watcher_|-succeed_with_changes"
+    with pytest.helpers.temp_file("requisite.sls", sls_contents, state_tree):
+        ret = state.sls("requisite")
+        # The normal run's own change is present.
+        assert "testing" in ret[watcher].changes
+        # mod_watch did not fire, so no "Requisites with changes" entry and
+        # no "Watch statement fired." comment were appended.
+        assert "Requisites with changes" not in ret[watcher].changes
+        assert "Watch statement fired." not in ret[watcher].comment
+        assert ret[watcher].result is True
+
+
+def test_watch_fires_when_force_mod_watch_is_set(state, state_tree):
+    """
+    A watcher's normal return may set ``force_mod_watch: True`` to signal
+    that its own changes do not subsume the work of ``mod_watch`` (for
+    example, ``docker_container.running`` performing a network reconnect
+    without recreating the container while a watched config file has
+    changed). When the flag is set, ``mod_watch`` must fire in addition to
+    the normal run and its result must be merged in so neither set of
+    changes is lost.
+    """
+    sls_contents = """
+    trigger:
+      test.succeed_with_changes
+
+    watcher:
+      test.succeed_with_changes:
+        - force_mod_watch: True
+        - watch:
+          - test: trigger
+    """
+    watcher = "test_|-watcher_|-watcher_|-succeed_with_changes"
+    with pytest.helpers.temp_file("requisite.sls", sls_contents, state_tree):
+        ret = state.sls("requisite")
+        # The normal run's own change must still be present.
+        assert "testing" in ret[watcher].changes
+        # And mod_watch must also have fired, appending its own change entry
+        # and comment to the result so the watched-state trigger is not lost.
+        assert "Requisites with changes" in ret[watcher].changes
+        assert ret[watcher].changes["Requisites with changes"] == ["test: trigger"]
+        assert "Watch statement fired." in ret[watcher].comment
+        assert ret[watcher].result is True

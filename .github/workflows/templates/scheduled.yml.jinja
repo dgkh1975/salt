@@ -1,0 +1,53 @@
+{# Also gate on repo-level opt-out (`SKIP_SCHEDULED=true`). RUN_SCHEDULED_BUILDS=1
+   is set on the salt-nightlies fork to enable run-nightly.yml, and that same
+   override would otherwise let scheduled.yml re-run on the fork as a duplicate. #}
+<%- set prepare_workflow_if_check = "${{ fromJSON(needs.workflow-requirements.outputs.requirements-met) && vars.SKIP_SCHEDULED != 'true' }}" %>
+<%- set skip_test_coverage_check = "true" %>
+{#- On saltstack/salt-nightlies the mirror workflow force-pushes branches
+    from saltstack/salt. This scheduled workflow already has its own gate
+    via `RUN_SCHEDULED_BUILDS`; ci.yml.jinja's SKIP_CI-based gate would
+    stack on top of that and cause double-skipping. Set our own gate
+    explicitly here. -#}
+<%- set prepare_workflow_if_check = "${{ fromJSON(needs.workflow-requirements.outputs.requirements-met) && vars.SKIP_SCHEDULED != 'true' }}" %>
+<%- extends 'ci.yml.jinja' %>
+
+
+<%- block name %>
+
+name: <{ workflow_name }>
+run-name: "<{ workflow_name }> (branch: ${{ github.ref_name }})"
+
+<%- endblock name %>
+
+
+<%- block on %>
+
+on:
+  schedule:
+    # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#onschedule
+    - cron: '0 */8 * * *'  # Run every 8 hours
+
+<%- endblock %>
+
+<%- block concurrency %>
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: false
+
+<%- endblock %>
+
+
+<%- block permissions %>
+<{- super() }>
+<%- if workflow_slug == "scheduled" %>
+  actions: write  # to trigger branch scheduled builds
+<%- endif %>
+<%- endblock permissions %>
+
+<%- block pre_jobs %>
+
+  <%- include "workflow-requirements-check.yml.jinja" %>
+  <%- include "trigger-branch-workflows.yml.jinja" %>
+
+<%- endblock pre_jobs %>

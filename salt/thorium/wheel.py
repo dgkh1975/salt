@@ -1,17 +1,20 @@
-# -*- coding: utf-8 -*-
 """
-React by calling asynchronous runners
-"""
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
+React by calling asynchronous wheel functions from Thorium.
 
-# import salt libs
+This is useful for master-side maintenance operations such as key management or
+other wheel actions that should only happen after Thorium has observed and
+evaluated a stream of events.
+"""
+
 import salt.wheel
 
 
 def cmd(name, fun=None, arg=(), **kwargs):
     """
-    Execute a runner asynchronous:
+    Execute a wheel function asynchronously.
+
+    Any additional keyword arguments passed to this Thorium state are forwarded
+    to the wheel function.
 
     USAGE:
 
@@ -21,6 +24,13 @@ def cmd(name, fun=None, arg=(), **kwargs):
           wheel.cmd:
             - fun: key.delete
             - match: minion_id
+
+        reject_stale_key:
+          wheel.cmd:
+            - fun: key.reject
+            - match: old-minion
+            - require:
+              - check: important_event
     """
     ret = {"name": name, "changes": {}, "comment": "", "result": True}
     if fun is None:

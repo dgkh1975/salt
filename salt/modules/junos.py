@@ -13,15 +13,14 @@ Refer to :mod:`junos <salt.proxy.junos>` for information on connecting to junos 
 
 """
 
-# Import Python libraries
-
 import copy
 import json
 import logging
 import os
 import re
-import tempfile
 from functools import wraps
+
+import yaml
 
 import salt.utils.args
 import salt.utils.files
@@ -29,12 +28,11 @@ import salt.utils.json
 import salt.utils.path
 import salt.utils.platform
 import salt.utils.stringutils
-import yaml
 
 try:
     from lxml import etree
 except ImportError:
-    from salt._compat import ElementTree as etree
+    import xml.etree.ElementTree as etree
 
 
 # Juniper interface libraries
@@ -114,62 +112,45 @@ class HandleFileCopy:
                 proxy_hash = __salt__["file.get_hash"](local_cache_path)
                 # check if hash is same, else copy newly
                 if master_hash.get("hsum") == proxy_hash:
-                    # kwargs will have values when path is a template
-                    if self._kwargs:
-                        self._cached_file = salt.utils.files.mkstemp()
-                        # local copy is a template, hence need to render
-                        with salt.utils.files.fopen(self._cached_file, "w") as fp:
-                            template_string = __salt__["slsutil.renderer"](
-                                path=local_cache_path,
-                                default_renderer="jinja",
-                                **self._kwargs
-                            )
-                            fp.write(template_string)
-                        return self._cached_file
-                    else:
-                        return local_cache_path
-                # continue for else part
-            if self._kwargs:
-                self._cached_file = salt.utils.files.mkstemp()
-                __salt__["cp.get_template"](
-                    self._file_path, self._cached_file, **self._kwargs
-                )
-            else:
-                self._cached_folder = tempfile.mkdtemp()
-                log.debug(
-                    "Caching file {} at {}".format(self._file_path, self._cached_folder)
-                )
-                self._cached_file = __salt__["cp.get_file"](
-                    self._file_path, self._cached_folder
-                )
+                    self._cached_file = salt.utils.files.mkstemp()
+                    # local copy is a template, hence need to render
+                    with salt.utils.files.fopen(self._cached_file, "w") as fp:
+                        template_string = __salt__["slsutil.renderer"](
+                            path=local_cache_path,
+                            default_renderer="jinja",
+                            **self._kwargs,
+                        )
+                        fp.write(template_string)
+                    return self._cached_file
+
+            # continue for else part
+            self._cached_file = salt.utils.files.mkstemp()
+            __salt__["cp.get_template"](
+                self._file_path, self._cached_file, **self._kwargs
+            )
             if self._cached_file != "":
                 return self._cached_file
         else:
             # check for local location of file
             if __salt__["file.file_exists"](self._file_path):
-                if self._kwargs:
-                    self._cached_file = salt.utils.files.mkstemp()
-                    with salt.utils.files.fopen(self._cached_file, "w") as fp:
-                        template_string = __salt__["slsutil.renderer"](
-                            path=self._file_path,
-                            default_renderer="jinja",
-                            **self._kwargs
-                        )
-                        fp.write(template_string)
-                    return self._cached_file
-                else:
-                    return self._file_path
+                self._cached_file = salt.utils.files.mkstemp()
+                with salt.utils.files.fopen(self._cached_file, "w") as fp:
+                    template_string = __salt__["slsutil.renderer"](
+                        path=self._file_path, default_renderer="jinja", **self._kwargs
+                    )
+                    fp.write(template_string)
+                return self._cached_file
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
         if self._cached_file is not None:
             salt.utils.files.safe_rm(self._cached_file)
-            log.debug("Deleted cached file: {}".format(self._cached_file))
+            log.debug("Deleted cached file: %s", self._cached_file)
         if self._cached_folder is not None:
             __salt__["file.rmdir"](self._cached_folder)
-            log.debug("Deleted cached folder: {}".format(self._cached_folder))
+            log.debug("Deleted cached folder: %s", self._cached_folder)
 
 
-def timeoutDecorator(function):
+def _timeout_decorator(function):
     @wraps(function)
     def wrapper(*args, **kwargs):
         if "dev_timeout" in kwargs or "timeout" in kwargs:
@@ -190,7 +171,7 @@ def timeoutDecorator(function):
     return wrapper
 
 
-def timeoutDecorator_cleankwargs(function):
+def _timeout_decorator_cleankwargs(function):
     @wraps(function)
     def wrapper(*args, **kwargs):
         if "dev_timeout" in kwargs or "timeout" in kwargs:
@@ -245,19 +226,17 @@ def timeoutDecorator_cleankwargs(function):
 def _restart_connection():
     minion_id = __opts__.get("proxyid", "") or __opts__.get("id", "")
     log.info(
-        "Junos exception occurred {} (junos proxy) is down. Restarting.".format(
-            minion_id
-        )
+        "Junos exception occurred %s (junos proxy) is down. Restarting.", minion_id
     )
     __salt__["event.fire_master"](
         {}, "junos/proxy/{}/stop".format(__opts__["proxy"]["host"])
     )
     __proxy__["junos.shutdown"](__opts__)  # safely close connection
     __proxy__["junos.init"](__opts__)  # reopen connection
-    log.debug("Junos exception occurred, restarted {} (junos proxy)!".format(minion_id))
+    log.debug("Junos exception occurred, restarted %s (junos proxy)!", minion_id)
 
 
-@timeoutDecorator_cleankwargs
+@_timeout_decorator_cleankwargs
 def facts_refresh():
     """
     Reload the facts dictionary from the device. Usually only needed if,
@@ -276,7 +255,7 @@ def facts_refresh():
     try:
         conn.facts_refresh()
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Execution failed due to "{}"'.format(exception)
+        ret["message"] = f'Execution failed due to "{exception}"'
         ret["out"] = False
         _restart_connection()
         return ret
@@ -307,14 +286,14 @@ def facts():
         ret["facts"] = __proxy__["junos.get_serialized_facts"]()
         ret["out"] = True
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Could not display facts due to "{}"'.format(exception)
+        ret["message"] = f'Could not display facts due to "{exception}"'
         ret["out"] = False
         _restart_connection()
 
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def rpc(cmd=None, dest=None, **kwargs):
     """
     This function executes the RPC provided as arguments on the junos device.
@@ -383,7 +362,7 @@ def rpc(cmd=None, dest=None, **kwargs):
             try:
                 filter_reply = etree.XML(op["filter"])
             except etree.XMLSyntaxError as ex:
-                ret["message"] = "Invalid filter: {}".format(str(ex))
+                ret["message"] = f"Invalid filter: {ex}"
                 ret["out"] = False
                 return ret
 
@@ -393,7 +372,7 @@ def rpc(cmd=None, dest=None, **kwargs):
         try:
             reply = getattr(conn.rpc, cmd.replace("-", "_"))(filter_reply, options=op)
         except Exception as exception:  # pylint: disable=broad-except
-            ret["message"] = 'RPC execution failed due to "{}"'.format(exception)
+            ret["message"] = f'RPC execution failed due to "{exception}"'
             ret["out"] = False
             _restart_connection()
             return ret
@@ -402,12 +381,12 @@ def rpc(cmd=None, dest=None, **kwargs):
             log.warning('Filter ignored as it is only used with "get-config" rpc')
 
         if "dest" in op:
-            log.warning("dest in op, rpc may reject this for cmd {}".format(cmd))
+            log.warning("dest in op, rpc may reject this for cmd '%s'", cmd)
 
         try:
             reply = getattr(conn.rpc, cmd.replace("-", "_"))({"format": format_}, **op)
         except Exception as exception:  # pylint: disable=broad-except
-            ret["message"] = 'RPC execution failed due to "{}"'.format(exception)
+            ret["message"] = f'RPC execution failed due to "{exception}"'
             ret["out"] = False
             _restart_connection()
             return ret
@@ -432,7 +411,7 @@ def rpc(cmd=None, dest=None, **kwargs):
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def set_hostname(hostname=None, **kwargs):
     """
     Set the device's hostname
@@ -474,7 +453,7 @@ def set_hostname(hostname=None, **kwargs):
 
     # Added to recent versions of JunOs
     # Use text format instead
-    set_string = "set system host-name {}".format(hostname)
+    set_string = f"set system host-name {hostname}"
     try:
         conn.cu.load(set_string, format="set")
     except Exception as exception:  # pylint: disable=broad-except
@@ -488,7 +467,7 @@ def set_hostname(hostname=None, **kwargs):
     try:
         commit_ok = conn.cu.commit_check()
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Could not commit check due to error "{}"'.format(exception)
+        ret["message"] = f'Could not commit check due to error "{exception}"'
         ret["out"] = False
         _restart_connection()
         return ret
@@ -500,10 +479,10 @@ def set_hostname(hostname=None, **kwargs):
             ret["out"] = True
         except Exception as exception:  # pylint: disable=broad-except
             ret["out"] = False
-            ret[
-                "message"
-            ] = 'Successfully loaded host-name but commit failed with "{}"'.format(
-                exception
+            ret["message"] = (
+                'Successfully loaded host-name but commit failed with "{}"'.format(
+                    exception
+                )
             )
             _restart_connection()
             return ret
@@ -514,17 +493,17 @@ def set_hostname(hostname=None, **kwargs):
             conn.cu.rollback()
         except Exception as exception:  # pylint: disable=broad-except
             ret["out"] = False
-            ret[
-                "message"
-            ] = 'Successfully loaded host-name but rollback before exit failed "{}"'.format(
-                exception
+            ret["message"] = (
+                'Successfully loaded host-name but rollback before exit failed "{}"'.format(
+                    exception
+                )
             )
             _restart_connection()
 
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def commit(**kwargs):
     """
     To commit the changes loaded in the candidate configuration.
@@ -581,7 +560,7 @@ def commit(**kwargs):
     try:
         commit_ok = conn.cu.commit_check()
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Could not perform commit check due to "{}"'.format(exception)
+        ret["message"] = f'Could not perform commit check due to "{exception}"'
         ret["out"] = False
         _restart_connection()
         return ret
@@ -600,10 +579,10 @@ def commit(**kwargs):
                 ret["out"] = False
         except Exception as exception:  # pylint: disable=broad-except
             ret["out"] = False
-            ret[
-                "message"
-            ] = 'Commit check succeeded but actual commit failed with "{}"'.format(
-                exception
+            ret["message"] = (
+                'Commit check succeeded but actual commit failed with "{}"'.format(
+                    exception
+                )
             )
             _restart_connection()
     else:
@@ -613,17 +592,17 @@ def commit(**kwargs):
             conn.cu.rollback()
         except Exception as exception:  # pylint: disable=broad-except
             ret["out"] = False
-            ret[
-                "message"
-            ] = 'Pre-commit check failed, and exception during rollback "{}"'.format(
-                exception
+            ret["message"] = (
+                'Pre-commit check failed, and exception during rollback "{}"'.format(
+                    exception
+                )
             )
             _restart_connection()
 
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def rollback(**kwargs):
     """
     Roll back the last committed configuration changes and commit
@@ -674,8 +653,10 @@ def rollback(**kwargs):
         ids_passed = ids_passed + 1
 
     if ids_passed > 1:
-        log.warning("junos.rollback called with more than one possible ID.")
-        log.warning("Use only one of the positional argument, `id`, or `d_id` kwargs")
+        log.warning(
+            "junos.rollback called with more than one possible ID. "
+            "Use only one of the positional argument, `id`, or `d_id` kwargs"
+        )
 
     ret = {}
     conn = __proxy__["junos.conn"]()
@@ -691,7 +672,7 @@ def rollback(**kwargs):
     try:
         ret["out"] = conn.cu.rollback(id_)
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Rollback failed due to "{}"'.format(exception)
+        ret["message"] = f'Rollback failed due to "{exception}"'
         ret["out"] = False
         _restart_connection()
         return ret
@@ -709,14 +690,14 @@ def rollback(**kwargs):
                 fp.write(salt.utils.stringutils.to_str(diff))
         else:
             log.info(
-                "No diff between current configuration and \
-                rollbacked configuration, so no diff file created"
+                "No diff between current configuration and "
+                "rollbacked configuration, so no diff file created"
             )
 
     try:
         commit_ok = conn.cu.commit_check()
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Could not commit check due to "{}"'.format(exception)
+        ret["message"] = f'Could not commit check due to "{exception}"'
         ret["out"] = False
         _restart_connection()
         return ret
@@ -727,10 +708,10 @@ def rollback(**kwargs):
             ret["out"] = True
         except Exception as exception:  # pylint: disable=broad-except
             ret["out"] = False
-            ret[
-                "message"
-            ] = 'Rollback successful but commit failed with error "{}"'.format(
-                exception
+            ret["message"] = (
+                'Rollback successful but commit failed with error "{}"'.format(
+                    exception
+                )
             )
             _restart_connection()
             return ret
@@ -741,7 +722,7 @@ def rollback(**kwargs):
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def diff(**kwargs):
     """
     Returns the difference between the candidate and the current configuration
@@ -775,8 +756,10 @@ def diff(**kwargs):
         id_ = kwargs.pop("id", 0)
         ids_passed = ids_passed + 1
     if ids_passed > 1:
-        log.warning("junos.rollback called with more than one possible ID.")
-        log.warning("Use only one of the positional argument, `id`, or `d_id` kwargs")
+        log.warning(
+            "junos.rollback called with more than one possible ID. "
+            "Use only one of the positional argument, `id`, or `d_id` kwargs"
+        )
 
     if kwargs:
         salt.utils.args.invalid_kwargs(kwargs)
@@ -787,14 +770,14 @@ def diff(**kwargs):
     try:
         ret["message"] = conn.cu.diff(rb_id=id_)
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Could not get diff with error "{}"'.format(exception)
+        ret["message"] = f'Could not get diff with error "{exception}"'
         ret["out"] = False
         _restart_connection()
 
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def ping(dest_ip=None, **kwargs):
     """
     Send a ping RPC to a device
@@ -852,14 +835,14 @@ def ping(dest_ip=None, **kwargs):
     try:
         ret["message"] = jxmlease.parse(etree.tostring(conn.rpc.ping(**op)))
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Execution failed due to "{}"'.format(exception)
+        ret["message"] = f'Execution failed due to "{exception}"'
         ret["out"] = False
         _restart_connection()
 
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def cli(command=None, **kwargs):
     """
     Executes the CLI commands and returns the output in specified format. \
@@ -909,7 +892,7 @@ def cli(command=None, **kwargs):
     try:
         result = conn.cli(command, format_, warning=False)
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Execution failed due to "{}"'.format(exception)
+        ret["message"] = f'Execution failed due to "{exception}"'
         ret["out"] = False
         _restart_connection()
         return ret
@@ -933,7 +916,7 @@ def cli(command=None, **kwargs):
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def shutdown(**kwargs):
     """
     Shut down (power off) or reboot a device running Junos OS. This includes
@@ -1002,14 +985,14 @@ def shutdown(**kwargs):
         ret["message"] = "Successfully powered off/rebooted."
         ret["out"] = True
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Could not poweroff/reboot because "{}"'.format(exception)
+        ret["message"] = f'Could not poweroff/reboot because "{exception}"'
         ret["out"] = False
         _restart_connection()
 
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def install_config(path=None, **kwargs):
     """
     Installs the given configuration file into the candidate configuration.
@@ -1095,9 +1078,9 @@ def install_config(path=None, **kwargs):
     ret["out"] = True
 
     if path is None:
-        ret[
-            "message"
-        ] = "Please provide the salt path where the configuration is present"
+        ret["message"] = (
+            "Please provide the salt path where the configuration is present"
+        )
         ret["out"] = False
         return ret
 
@@ -1156,9 +1139,9 @@ def install_config(path=None, **kwargs):
 
         db_mode = op.pop("mode", "exclusive")
         if write_diff and db_mode in ["dynamic", "ephemeral"]:
-            ret[
-                "message"
-            ] = "Write diff is not supported with dynamic/ephemeral configuration mode"
+            ret["message"] = (
+                "Write diff is not supported with dynamic/ephemeral configuration mode"
+            )
             ret["out"] = False
             return ret
 
@@ -1170,9 +1153,9 @@ def install_config(path=None, **kwargs):
                 try:
                     cu.load(**op)
                 except Exception as exception:  # pylint: disable=broad-except
-                    ret[
-                        "message"
-                    ] = 'Could not load configuration due to : "{}"'.format(exception)
+                    ret["message"] = (
+                        f'Could not load configuration due to : "{exception}"'
+                    )
                     ret["format"] = op["format"]
                     ret["out"] = False
                     _restart_connection()
@@ -1202,10 +1185,10 @@ def install_config(path=None, **kwargs):
                     try:
                         check = cu.commit_check()
                     except Exception as exception:  # pylint: disable=broad-except
-                        ret[
-                            "message"
-                        ] = 'Commit check threw the following exception: "{}"'.format(
-                            exception
+                        ret["message"] = (
+                            'Commit check threw the following exception: "{}"'.format(
+                                exception
+                            )
                         )
                         ret["out"] = False
                         _restart_connection()
@@ -1216,10 +1199,10 @@ def install_config(path=None, **kwargs):
                         cu.commit(**commit_params)
                         ret["message"] = "Successfully loaded and committed!"
                     except Exception as exception:  # pylint: disable=broad-except
-                        ret[
-                            "message"
-                        ] = 'Commit check successful but commit failed with "{}"'.format(
-                            exception
+                        ret["message"] = (
+                            'Commit check successful but commit failed with "{}"'.format(
+                                exception
+                            )
                         )
                         ret["out"] = False
                         _restart_connection()
@@ -1228,14 +1211,16 @@ def install_config(path=None, **kwargs):
                 elif not check:
                     try:
                         cu.rollback()
-                        ret[
-                            "message"
-                        ] = "Loaded configuration but commit check failed, hence rolling back configuration."
+                        ret["message"] = (
+                            "Loaded configuration but commit check failed, hence"
+                            " rolling back configuration."
+                        )
                     except Exception as exception:  # pylint: disable=broad-except
-                        ret[
-                            "message"
-                        ] = 'Loaded configuration but commit check failed, and exception occurred during rolling back configuration "{}"'.format(
-                            exception
+                        ret["message"] = (
+                            "Loaded configuration but commit check failed, and"
+                            ' exception occurred during rolling back configuration "{}"'.format(
+                                exception
+                            )
                         )
                         _restart_connection()
 
@@ -1243,15 +1228,17 @@ def install_config(path=None, **kwargs):
                 else:
                     try:
                         cu.rollback()
-                        ret[
-                            "message"
-                        ] = "Commit check passed, but skipping commit for dry-run and rolling back configuration."
+                        ret["message"] = (
+                            "Commit check passed, but skipping commit for dry-run and"
+                            " rolling back configuration."
+                        )
                         ret["out"] = True
                     except Exception as exception:  # pylint: disable=broad-except
-                        ret[
-                            "message"
-                        ] = 'Commit check passed, but skipping commit for dry-run andi while rolling back configuration exception occurred "{}"'.format(
-                            exception
+                        ret["message"] = (
+                            "Commit check passed, but skipping commit for dry-run and"
+                            ' while rolling back configuration exception occurred "{}"'.format(
+                                exception
+                            )
                         )
                         ret["out"] = False
                         _restart_connection()
@@ -1261,13 +1248,13 @@ def install_config(path=None, **kwargs):
                         with salt.utils.files.fopen(write_diff, "w") as fp:
                             fp.write(salt.utils.stringutils.to_str(config_diff))
                 except Exception as exception:  # pylint: disable=broad-except
-                    ret[
-                        "message"
-                    ] = 'Could not write into diffs_file due to: "{}"'.format(exception)
+                    ret["message"] = (
+                        f"Could not write into diffs_file due to: '{exception}'"
+                    )
                     ret["out"] = False
 
         except ValueError as ex:
-            message = "install_config failed due to: {}".format(str(ex))
+            message = f"install_config failed due to: {ex}"
             log.error(message)
             ret["message"] = message
             ret["out"] = False
@@ -1276,15 +1263,18 @@ def install_config(path=None, **kwargs):
             ret["message"] = ex.message
             ret["out"] = False
         except RpcTimeoutError as ex:
-            message = "install_config failed due to timeout error : {}".format(str(ex))
+            message = f"install_config failed due to timeout error : {ex}"
             log.error(message)
             ret["message"] = message
+            ret["out"] = False
+        except Exception as exc:  # pylint: disable=broad-except
+            ret["message"] = f"install_config failed due to exception: '{exc}'"
             ret["out"] = False
 
         return ret
 
 
-@timeoutDecorator_cleankwargs
+@_timeout_decorator_cleankwargs
 def zeroize():
     """
     Resets the device to default factory settings
@@ -1309,14 +1299,14 @@ def zeroize():
         conn.cli("request system zeroize")
         ret["message"] = "Completed zeroize and rebooted"
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = 'Could not zeroize due to : "{}"'.format(exception)
+        ret["message"] = f'Could not zeroize due to : "{exception}"'
         ret["out"] = False
         _restart_connection()
 
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def install_os(path=None, **kwargs):
     """
     Installs the given image on the device. After the installation is complete
@@ -1406,9 +1396,9 @@ def install_os(path=None, **kwargs):
     no_copy_ = op.get("no_copy", False)
 
     if path is None:
-        ret[
-            "message"
-        ] = "Please provide the salt path where the junos image is present."
+        ret["message"] = (
+            "Please provide the salt path where the junos image is present."
+        )
         ret["out"] = False
         return ret
 
@@ -1439,7 +1429,7 @@ def install_os(path=None, **kwargs):
                     image_path, progress=True, timeout=timeout, **op
                 )
             except Exception as exception:  # pylint: disable=broad-except
-                ret["message"] = 'Installation failed due to: "{}"'.format(exception)
+                ret["message"] = f'Installation failed due to: "{exception}"'
                 ret["out"] = False
                 __proxy__["junos.reboot_clear"]()
                 _restart_connection()
@@ -1450,7 +1440,7 @@ def install_os(path=None, **kwargs):
                 path, progress=True, timeout=timeout, **op
             )
         except Exception as exception:  # pylint: disable=broad-except
-            ret["message"] = 'Installation failed due to: "{}"'.format(exception)
+            ret["message"] = f'Installation failed due to: "{exception}"'
             ret["out"] = False
             __proxy__["junos.reboot_clear"]()
             _restart_connection()
@@ -1460,7 +1450,7 @@ def install_os(path=None, **kwargs):
         ret["out"] = True
         ret["message"] = "Installed the os."
     else:
-        ret["message"] = "Installation failed. Reason: {}".format(install_message)
+        ret["message"] = f"Installation failed. Reason: {install_message}"
         ret["out"] = False
         __proxy__["junos.reboot_clear"]()
         return ret
@@ -1477,10 +1467,10 @@ def install_os(path=None, **kwargs):
             conn.sw.reboot(**reboot_kwargs)
         except Exception as exception:  # pylint: disable=broad-except
             __proxy__["junos.reboot_clear"]()
-            ret[
-                "message"
-            ] = 'Installation successful but reboot failed due to : "{}"'.format(
-                exception
+            ret["message"] = (
+                'Installation successful but reboot failed due to : "{}"'.format(
+                    exception
+                )
             )
             ret["out"] = False
             _restart_connection()
@@ -1493,7 +1483,7 @@ def install_os(path=None, **kwargs):
     return ret
 
 
-@timeoutDecorator_cleankwargs
+@_timeout_decorator_cleankwargs
 def file_copy(src, dest):
     """
     Copies the file from the local device to the junos device
@@ -1527,22 +1517,22 @@ def file_copy(src, dest):
 
     with HandleFileCopy(src) as fp:
         if fp is None:
-            ret["message"] = "Invalid source file path {}".format(src)
+            ret["message"] = f"Invalid source file path {src}"
             ret["out"] = False
             return ret
 
         try:
             with SCP(conn, progress=True) as scp:
                 scp.put(fp, dest)
-            ret["message"] = "Successfully copied file from {} to {}".format(src, dest)
+            ret["message"] = f"Successfully copied file from {src} to {dest}"
         except Exception as exception:  # pylint: disable=broad-except
-            ret["message"] = 'Could not copy file : "{}"'.format(exception)
+            ret["message"] = f'Could not copy file : "{exception}"'
             ret["out"] = False
 
         return ret
 
 
-@timeoutDecorator_cleankwargs
+@_timeout_decorator_cleankwargs
 def lock():
     """
     Attempts an exclusive lock on the candidate configuration. This
@@ -1567,18 +1557,18 @@ def lock():
         conn.cu.lock()
         ret["message"] = "Successfully locked the configuration."
     except RpcTimeoutError as exception:
-        ret["message"] = 'Could not gain lock due to : "{}"'.format(exception)
+        ret["message"] = f'Could not gain lock due to : "{exception}"'
         ret["out"] = False
         _restart_connection()
 
     except LockError as exception:
-        ret["message"] = 'Could not gain lock due to : "{}"'.format(exception)
+        ret["message"] = f'Could not gain lock due to : "{exception}"'
         ret["out"] = False
 
     return ret
 
 
-@timeoutDecorator_cleankwargs
+@_timeout_decorator_cleankwargs
 def unlock():
     """
     Unlocks the candidate configuration.
@@ -1611,7 +1601,7 @@ def unlock():
     return ret
 
 
-@timeoutDecorator
+@_timeout_decorator
 def load(path=None, **kwargs):
     """
     Loads the configuration from the file provided onto the device.
@@ -1676,9 +1666,9 @@ def load(path=None, **kwargs):
     ret["out"] = True
 
     if path is None:
-        ret[
-            "message"
-        ] = "Please provide the salt path where the configuration is present"
+        ret["message"] = (
+            "Please provide the salt path where the configuration is present"
+        )
         ret["out"] = False
         return ret
 
@@ -1759,7 +1749,7 @@ def load(path=None, **kwargs):
         return ret
 
 
-@timeoutDecorator_cleankwargs
+@_timeout_decorator_cleankwargs
 def commit_check():
     """
     Perform a commit check on the configuration
@@ -1777,14 +1767,14 @@ def commit_check():
         conn.cu.commit_check()
         ret["message"] = "Commit check succeeded."
     except Exception as exception:  # pylint: disable=broad-except
-        ret["message"] = "Commit check failed with {}".format(exception)
+        ret["message"] = f"Commit check failed with {exception}"
         ret["out"] = False
         _restart_connection()
 
     return ret
 
 
-@timeoutDecorator_cleankwargs
+@_timeout_decorator_cleankwargs
 def get_table(
     table,
     table_file,
@@ -1854,9 +1844,9 @@ def get_table(
     pyez_tables_path = os.path.dirname(os.path.abspath(tables_dir.__file__))
     try:
         if path is not None:
-            file_path = os.path.join(path, "{}".format(table_file))
+            file_path = os.path.join(path, f"{table_file}")
         else:
-            file_path = os.path.join(pyez_tables_path, "{}".format(table_file))
+            file_path = os.path.join(pyez_tables_path, f"{table_file}")
 
         with HandleFileCopy(file_path) as file_loc:
             if file_loc is None:
@@ -1868,14 +1858,14 @@ def get_table(
             try:
                 with salt.utils.files.fopen(file_loc) as fp:
                     ret["table"] = yaml.load(
-                        fp.read(), Loader=yamlordereddictloader.Loader
+                        fp.read(), Loader=yamlordereddictloader.SafeLoader
                     )
                     globals().update(FactoryLoader().load(ret["table"]))
             except OSError as err:
-                ret[
-                    "message"
-                ] = "Uncaught exception during YAML Load - please report: {}".format(
-                    str(err)
+                ret["message"] = (
+                    "Uncaught exception during YAML Load - please report: {}".format(
+                        str(err)
+                    )
                 )
                 ret["out"] = False
                 return ret
@@ -1883,18 +1873,18 @@ def get_table(
                 data = globals()[table](conn)
                 data.get(**get_kvargs)
             except KeyError as err:
-                ret[
-                    "message"
-                ] = "Uncaught exception during get API call - please report: {}".format(
-                    str(err)
+                ret["message"] = (
+                    "Uncaught exception during get API call - please report: {}".format(
+                        str(err)
+                    )
                 )
                 ret["out"] = False
                 return ret
             except ConnectClosedError:
-                ret[
-                    "message"
-                ] = "Got ConnectClosedError exception. Connection lost with {}".format(
-                    conn
+                ret["message"] = (
+                    "Got ConnectClosedError exception. Connection lost with {}".format(
+                        conn
+                    )
                 )
                 ret["out"] = False
                 _restart_connection()
@@ -1925,14 +1915,15 @@ def get_table(
                     ret["table"][table]["command"] = data.GET_CMD
     except ConnectClosedError:
         ret["message"] = (
-            "Got ConnectClosedError exception. Connection lost "
-            "with {}".format(str(conn))
+            "Got ConnectClosedError exception. Connection lost with {}".format(
+                str(conn)
+            )
         )
         ret["out"] = False
         _restart_connection()
         return ret
     except Exception as err:  # pylint: disable=broad-except
-        ret["message"] = "Uncaught exception - please report: {}".format(str(err))
+        ret["message"] = f"Uncaught exception - please report: {str(err)}"
         ret["out"] = False
         _restart_connection()
         return ret
@@ -1966,15 +1957,15 @@ def _recursive_dict(node):
     return result
 
 
-@timeoutDecorator
+@_timeout_decorator
 def rpc_file_list(path, **kwargs):
     """
     Use the Junos RPC interface to get a list of files and return
     them as a structure dictionary.
 
-    .. versionadded:: Aluminum
+    .. versionadded:: 3003
 
-    CLI Example :
+    CLI Example:
 
     .. code-block:: bash
 
@@ -2059,8 +2050,8 @@ def _make_source_list(dir):
     return dir_list
 
 
-@timeoutDecorator
-def file_compare(file1, file2, **kwargs):
+@_timeout_decorator
+def file_compare(file1, file2, **kwargs):  # pragma: no cover
     """
     Compare two files and return a dictionary indicating if they
     are different.
@@ -2073,9 +2064,9 @@ def file_compare(file1, file2, **kwargs):
     .. note::
         This function only works on Juniper native minions
 
-    .. versionadded:: Aluminum
+    .. versionadded:: 3003
 
-    CLI Example :
+    CLI Example:
 
     .. code-block:: bash
 
@@ -2100,9 +2091,7 @@ def file_compare(file1, file2, **kwargs):
     if not junos_cli:
         return {"success": False, "message": "Cannot find Junos cli command"}
 
-    cliret = __salt__["cmd.run"](
-        "{} file compare files {} {} ".format(junos_cli, file1, file2)
-    )
+    cliret = __salt__["cmd.run"](f"{junos_cli} file compare files {file1} {file2} ")
     clilines = cliret.splitlines()
 
     for r in clilines:
@@ -2121,8 +2110,8 @@ def file_compare(file1, file2, **kwargs):
     return ret
 
 
-@timeoutDecorator
-def fsentry_exists(dir, **kwargs):
+@_timeout_decorator
+def fsentry_exists(dir, **kwargs):  # pragma: no cover
     """
     Returns a dictionary indicating if `dir` refers to a file
     or a non-file (generally a directory) in the file system,
@@ -2131,9 +2120,9 @@ def fsentry_exists(dir, **kwargs):
     .. note::
         This function only works on Juniper native minions
 
-    .. versionadded:: Aluminum
+    .. versionadded:: 3003
 
-    CLI Example :
+    CLI Example:
 
     .. code-block:: bash
 
@@ -2156,7 +2145,7 @@ def fsentry_exists(dir, **kwargs):
     if not junos_cli:
         return {"success": False, "message": "Cannot find Junos cli command"}
 
-    ret = __salt__["cmd.run"]("{} file show {}".format(junos_cli, dir))
+    ret = __salt__["cmd.run"](f"{junos_cli} file show {dir}")
     retlines = ret.splitlines()
     exists = True
     is_dir = False
@@ -2177,7 +2166,7 @@ def _find_routing_engines():
     if not junos_cli:
         return {"success": False, "message": "Cannot find Junos cli command"}
 
-    re_check = __salt__["cmd.run"]("{} show chassis routing-engine".format(junos_cli))
+    re_check = __salt__["cmd.run"](f"{junos_cli} show chassis routing-engine")
     engine_present = True
     engine = {}
 
@@ -2219,7 +2208,7 @@ def _find_routing_engines():
     return engine
 
 
-@timeoutDecorator
+@_timeout_decorator
 def routing_engine(**kwargs):
     """
     Returns a dictionary containing the routing engines on the device and
@@ -2227,9 +2216,9 @@ def routing_engine(**kwargs):
 
     Under the hood parses the result of `show chassis routing-engine`
 
-    .. versionadded:: Aluminum
+    .. versionadded:: 3003
 
-    CLI Example :
+    CLI Example:
 
     .. code-block:: bash
 
@@ -2266,8 +2255,8 @@ def routing_engine(**kwargs):
     return ret
 
 
-@timeoutDecorator
-def dir_copy(source, dest, force=False, **kwargs):
+@_timeout_decorator
+def dir_copy(source, dest, force=False, **kwargs):  # pragma: no cover
     """
     Copy a directory and recursively its contents from source to dest.
 
@@ -2282,7 +2271,7 @@ def dir_copy(source, dest, force=False, **kwargs):
 
     force : This function will not copy identical files unless `force` is `True`
 
-    .. versionadded:: Aluminum
+    .. versionadded:: 3003
 
     CLI Example:
 
@@ -2313,9 +2302,10 @@ def dir_copy(source, dest, force=False, **kwargs):
         return ret
 
     if not (dest.endswith(":") or dest.startswith("/")):
-        ret[
-            "message"
-        ] = "Destination must be a routing engine reference (e.g. re1:) or a fully qualified path."
+        ret["message"] = (
+            "Destination must be a routing engine reference (e.g. re1:) or a fully"
+            " qualified path."
+        )
         ret["success"] = False
         return ret
 
@@ -2344,9 +2334,7 @@ def dir_copy(source, dest, force=False, **kwargs):
         target = dest + d
         status = fsentry_exists(target)
         if not status["exists"]:
-            ret = __salt__["cmd.run"](
-                "{} file make-directory {}".format(junos_cli, target)
-            )
+            ret = __salt__["cmd.run"](f"{junos_cli} file make-directory {target}")
             ret = ret_messages + ret
         else:
             ret_messages = ret_messages + "Directory " + target + " already exists.\n"
@@ -2356,14 +2344,12 @@ def dir_copy(source, dest, force=False, **kwargs):
             comp_result = file_compare(f, target)
 
             if not comp_result["identical"] or force:
-                ret = __salt__["cmd.run"](
-                    "{} file copy {} {}".format(junos_cli, f, target)
-                )
+                ret = __salt__["cmd.run"](f"{junos_cli} file copy {f} {target}")
                 ret = ret_messages + ret
             else:
                 ret_messages = (
                     ret_messages
-                    + "Files {} and {} are identical, not copying.\n".format(f, target)
+                    + f"Files {f} and {target} are identical, not copying.\n"
                 )
 
     return ret_messages

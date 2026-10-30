@@ -1,5 +1,6 @@
 .. _tutorial-gitfs:
 
+
 ==================================
 Git Fileserver Backend Walkthrough
 ==================================
@@ -26,166 +27,141 @@ Branches and tags become Salt fileserver environments.
 Installing Dependencies
 =======================
 
-Both pygit2_ and GitPython_ are supported Python interfaces to git. If
-compatible versions of both are installed, pygit2_ will be preferred. In these
-cases, GitPython_ can be forced using the :conf_master:`gitfs_provider`
-parameter in the master config file.
+Three providers are supported for the Python-to-git interface: pygit2_,
+GitPython_, and ``gitcli`` (added in 3008.0).  If :conf_master:`gitfs_provider`
+is unset, Salt tries each in the order ``pygit2`` → ``gitpython`` → ``gitcli``
+and uses the first one that is available.  Set
+:conf_master:`gitfs_provider` explicitly to override.
+
+.. versionchanged:: 3008.0
+    Added the ``gitcli`` provider.  Before 3008.0, a master with neither
+    pygit2_ nor GitPython_ installed failed to start gitfs with
+    "No suitable gitfs provider module is installed"; 3008.0 masters now
+    fall back to ``gitcli`` (which only needs the system ``git`` binary).
+
+The versions tested in CI and shipped with the Salt onedir packages are:
+
+* pygit2_ ``>= 1.13.1`` (on Python 3.11+, ``pygit2 >= 1.19.2``), built against
+  libgit2_ ``>= 1.5``.
+* GitPython_ ``>= 3.1.50`` together with the system ``git`` binary.
+
+These pins live in ``requirements/base.txt`` and ``requirements/static/ci/``.
+Salt's import-time check still accepts the very old floor of pygit2_ ``0.20.3``
+and GitPython_ ``0.3`` (see ``GITPYTHON_MINVER`` / ``PYGIT2_MINVER`` in
+``salt/utils/gitfs.py``), but only the combinations above are exercised by the
+test suite. Older releases are missing fixes for SSH authentication, refspec
+handling, and credential helpers, and should not be used in production.
 
 .. note::
-    It is recommended to always run the most recent version of any the below
-    dependencies. Certain features of GitFS may not be available without
-    the most recent version of the chosen library.
+    Run the most recent compatible release of whichever provider you choose.
 
 .. _pygit2: https://github.com/libgit2/pygit2
 .. _GitPython: https://github.com/gitpython-developers/GitPython
+.. _libgit2: https://libgit2.org/
+.. _libssh2: https://www.libssh2.org/
 
 pygit2
 ------
 
-The minimum supported version of pygit2_ is 0.20.3. Availability for this
-version of pygit2_ is still limited, though the SaltStack team is working to
-get compatible versions available for as many platforms as possible.
-
-For the Fedora/EPEL versions which have a new enough version packaged, the
-following command would be used to install pygit2_:
+The Salt onedir packages already include a working pygit2_/libgit2_ pair, so on
+a onedir install no extra steps are required. For source installs, install the
+distro packages where available:
 
 .. code-block:: bash
 
-    # yum install python-pygit2
+    # RHEL / Fedora / Alma / Rocky 8+ (EPEL provides libgit2/python3-pygit2)
+    # dnf install python3-pygit2
 
-Provided a valid version is packaged for Debian/Ubuntu (which is not currently
-the case), the package name would be the same, and the following command would
-be used to install it:
+    # Debian 11+ / Ubuntu 22.04+
+    # apt-get install python3-pygit2
+
+If the distro packages are too old, ``pygit2`` can be installed from PyPI.
+``pygit2`` is tightly coupled to libgit2_ — the pygit2_ release notes list the
+exact libgit2_ ABI it links against, and a mismatch produces import errors at
+salt-master start. The simplest recipe on a onedir install is:
 
 .. code-block:: bash
 
-    # apt-get install python-pygit2
+    # apt-get install libgit2-1.5    # or whatever libgit2-N your distro ships
+    # salt-pip install 'pygit2>=1.13.1,<1.18' --no-deps
 
-
-If pygit2_ is not packaged for the platform on which the Master is running, the
-pygit2_ website has installation instructions
-`here <pygit2-install-instructions>`_. Keep in mind however that
-following these instructions will install libgit2_ and pygit2_ without system
-packages. Additionally, keep in mind that :ref:`SSH authentication in pygit2
-<pygit2-authentication-ssh>` requires libssh2_ (*not* libssh) development
-libraries to be present before libgit2_ is built. On some Debian-based distros
-``pkg-config`` is also required to link libgit2_ with libssh2.
+``--no-deps`` keeps ``salt-pip`` from upgrading the bundled cffi.
 
 .. note::
-    If you are receiving the error "Unsupported URL Protocol" in the Salt Master
-    log when making a connection using SSH, review the libssh2 details listed
-    above.
-
-Additionally, version 0.21.0 of pygit2 introduced a dependency on python-cffi_,
-which in turn depends on newer releases of libffi_. Upgrading libffi_ is not
-advisable as several other applications depend on it, so on older LTS linux
-releases pygit2_ 0.20.3 and libgit2_ 0.20.0 is the recommended combination.
+    SSH authentication in pygit2 (see :ref:`pygit2-authentication-ssh`)
+    requires libssh2_ (*not* libssh) to be linked into the libgit2_ build.
+    Distro libgit2 packages already include libssh2 support. If you are
+    rebuilding libgit2 from source and see "Unsupported URL Protocol" errors
+    against ``ssh://`` remotes in the master log, the libgit2 build was made
+    without libssh2 headers.
 
 .. warning::
-    pygit2_ is actively developed and `frequently makes
-    non-backwards-compatible API changes <pygit2-version-policy>`_, even in
-    minor releases. It is not uncommon for pygit2_ upgrades to result in errors
-    in Salt. Please take care when upgrading pygit2_, and pay close attention
-    to the changelog_, keeping an eye out for API changes. Errors can be
-    reported on the `SaltStack issue tracker <saltstack-issue-tracker>`_.
+    pygit2_ is actively developed and `frequently makes non-backwards-compatible
+    API changes`_, even in minor releases.  Pin pygit2_ in production, watch
+    the changelog_ when upgrading, and report breakage on the
+    `SaltStack issue tracker`_.
 
-.. _pygit2-version-policy: http://www.pygit2.org/install.html#version-numbers
-.. _changelog: https://github.com/libgit2/pygit2#changelog
-.. _saltstack-issue-tracker: https://github.com/saltstack/salt/issues
-.. _pygit2-install-instructions: http://www.pygit2.org/install.html
-.. _libgit2: https://libgit2.org/
-.. _libssh2: https://www.libssh2.org/
-.. _python-cffi: https://pypi.org/project/cffi
-.. _libffi: http://sourceware.org/libffi/
-
-
-RedHat Pygit2 Issues
-~~~~~~~~~~~~~~~~~~~~
-
-The release of RedHat/CentOS 7.3 upgraded both ``python-cffi`` and
-``http-parser``, both of which are dependencies for pygit2_/libgit2_. Both
-``pygit2`` and ``libgit2`` packages (which are from the EPEL repository) should
-be upgraded to the most recent versions, at least to ``0.24.2``.
-
-The below errors will show up in the master log if an incompatible
-``python-pygit2`` package is installed:
-
-.. code-block:: text
-
-    2017-02-10 09:07:34,892 [salt.utils.gitfs ][ERROR ][11211] Import pygit2 failed: CompileError: command 'gcc' failed with exit status 1
-    2017-02-10 09:07:34,907 [salt.utils.gitfs ][ERROR ][11211] gitfs is configured but could not be loaded, are pygit2 and libgit2 installed?
-    2017-02-10 09:07:34,907 [salt.utils.gitfs ][CRITICAL][11211] No suitable gitfs provider module is installed.
-    2017-02-10 09:07:34,912 [salt.master ][CRITICAL][11211] Master failed pre flight checks, exiting
-
-The below errors will show up in the master log if an incompatible ``libgit2``
-package is installed:
-
-.. code-block:: text
-
-    2017-02-15 18:04:45,211 [salt.utils.gitfs ][ERROR   ][6211] Error occurred fetching gitfs remote 'https://foo.com/bar.git': No Content-Type header in response
-
-A restart of the ``salt-master`` daemon and gitfs cache directory clean up may
-be required to allow http(s) repositories to continue to be fetched.
-
+.. _frequently makes non-backwards-compatible API changes: https://www.pygit2.org/install.html#version-numbers
+.. _changelog: https://github.com/libgit2/pygit2/blob/master/CHANGELOG.rst
+.. _SaltStack issue tracker: https://github.com/saltstack/salt/issues
 
 GitPython
 ---------
 
-GitPython_ 0.3.0 or newer is required to use GitPython for gitfs. For
-RHEL-based Linux distros, a compatible version is available in EPEL, and can be
-easily installed on the master using yum:
+GitPython_ ``>= 3.1.50`` is recommended, matching ``requirements/base.txt`` and
+the lockfiles under ``requirements/static/ci/``. Install from distro packages
+or from PyPI:
 
 .. code-block:: bash
 
-    # yum install GitPython
+    # RHEL / Fedora
+    # dnf install python3-GitPython
 
-Ubuntu 14.04 LTS and Debian Wheezy (7.x) also have a compatible version packaged:
+    # Debian / Ubuntu
+    # apt-get install python3-git
 
-.. code-block:: bash
+    # Onedir install (any platform)
+    # salt-pip install 'GitPython>=3.1.50'
 
-    # apt-get install python-git
+GitPython_ shells out to the ``git`` CLI, so the system ``git`` binary must
+also be installed. On macOS, install Xcode_ command-line tools or use Homebrew.
 
-GitPython_ requires the ``git`` CLI utility to work. If installed from a system
-package, then git should already be installed, but if installed via pip_ then
-it may still be necessary to install git separately. For MacOS users,
-GitPython_ comes bundled in with the Salt installer, but git must still be
-installed for it to work properly. Git can be installed in several ways,
-including by installing XCode_.
-
-.. _pip: http://www.pip-installer.org/
-.. _XCode: https://developer.apple.com/xcode/
+.. _Xcode: https://developer.apple.com/xcode/
 
 .. warning::
     GitPython advises against the use of its library for long-running processes
-    (such as a salt-master or salt-minion). Please see their warning on potential
-    leaks of system resources:
+    (such as a salt-master). See their warning on potential leaks of system
+    resources:
     https://github.com/gitpython-developers/GitPython#leakage-of-system-resources.
+    The Salt fileserver mitigates this by restarting the fileserver worker on
+    a configurable interval (see :conf_master:`fileserver_interval`).
 
-.. warning::
+gitcli
+------
 
-    Keep in mind that if GitPython has been previously installed on the master
-    using pip (even if it was subsequently uninstalled), then it may still
-    exist in the build cache (typically ``/tmp/pip-build-root/GitPython``) if
-    the cache is not cleared after installation. The package in the build cache
-    will override any requirement specifiers, so if you try upgrading to
-    version 0.3.2.RC1 by running ``pip install 'GitPython==0.3.2.RC1'`` then it
-    will ignore this and simply install the version from the cache directory.
-    Therefore, it may be necessary to delete the GitPython directory from the
-    build cache in order to ensure that the specified version is installed.
+.. versionadded:: 3008.0
 
-.. warning::
+The ``gitcli`` provider shells out to the system ``git`` binary and needs no
+Python library.  The only requirement is ``git`` version 2.3.0 or newer on
+the master (``git --version`` to check).  On most distros this is satisfied
+by the base ``git`` package:
 
-    GitPython_ 2.0.9 and newer is not compatible with Python 2.6. If installing
-    GitPython_ using pip on a machine running Python 2.6, make sure that a
-    version earlier than 2.0.9 is installed. This can be done on the CLI by
-    running ``pip install 'GitPython<2.0.9'``, or in a :py:func:`pip.installed
-    <salt.states.pip_state.installed>` state using the following SLS:
+.. code-block:: bash
 
-    .. code-block:: yaml
+    # yum install git           # RHEL / Fedora / EPEL
+    # apt-get install git       # Debian / Ubuntu
 
-        GitPython:
-          pip.installed:
-            - name: 'GitPython < 2.0.9'
+Operational notes:
+
+* Repositories are cloned as bare repos with ``--depth 1`` by default to keep
+  the on-disk footprint small at scale.  Configure depth per backend via
+  :conf_master:`gitfs_depth`, :conf_master:`git_pillar_depth`, and
+  :conf_master:`winrepo_depth`.
+* ``gitcli`` does not support submodules.  Use pygit2_ or GitPython_ if the
+  remote repo carries submodules you depend on.
+* Authentication is environment-variable based — see the
+  :ref:`gitcli authentication <gitcli-auth>` section below for the supported
+  options and the deliberate gaps.
 
 Simple Configuration
 ====================
@@ -260,10 +236,12 @@ And each repository contains some files:
         edit/vim.sls
         edit/vimrc
         nginx/init.sls
+        shell/init.sls
 
     second.git:
         edit/dev_vimrc
         haproxy/init.sls
+        shell.sls
 
     third:
         haproxy/haproxy.conf
@@ -279,6 +257,12 @@ is executed. For example:
   the :strong:`https://github.com/example/second.git` git repo.
 * A request for the file :strong:`salt://haproxy/haproxy.conf` will be served from the
   :strong:`file:///root/third` repo.
+
+Also a requested state file overrules a directory with an `init.sls`-file.
+For example:
+
+* A request for :strong:`state.apply shell` will be served from the
+  :strong:`https://github.com/example/second.git` git repo.
 
 .. note::
 
@@ -323,6 +307,7 @@ configured gitfs remotes):
 * :conf_master:`gitfs_disable_saltenv_mapping` (new in 2018.3.0)
 * :conf_master:`gitfs_ref_types` (new in 2018.3.0)
 * :conf_master:`gitfs_update_interval` (new in 2018.3.0)
+* :conf_master:`gitfs_proxy` (new in 3008.0)
 
 .. note::
     pygit2 only supports disabling SSL verification in versions 0.23.2 and
@@ -781,11 +766,6 @@ be used:
     qa
     dev
 
-``top.sls`` files from different branches will be merged into one at runtime.
-Since this can lead to overly complex configurations, the recommended setup is
-to have a separate repository, containing only the ``top.sls`` file with just
-one single ``master`` branch.
-
 To map a branch other than ``master`` as the ``base`` environment, use the
 :conf_master:`gitfs_base` parameter.
 
@@ -795,6 +775,112 @@ To map a branch other than ``master`` as the ``base`` environment, use the
 
 The base can also be configured on a :ref:`per-remote basis
 <gitfs-per-remote-config>`.
+
+Use Case: Code Promotion (dev -> qa -> base)
+--------------------------------------------
+
+When running a :ref:`highstate <running-highstate>`, the ``top.sls`` files from
+all of the different branches and tags will be merged into one. This does not
+work well with the use case where changes are tested in development branches
+before being merged upstream towards production, because if the same SLS file
+from multiple environments is part of the :ref:`highstate <running-highstate>`,
+it can result in non-unique state IDs, which will cause an error in the state
+compiler and not allow the :ref:`highstate <running-highstate>` to proceed.
+
+To accomplish this use case, you should do three things:
+
+1. Use ``{{ saltenv }}`` in place of your environment in your **top.sls**. This
+   will let you use the same top file in all branches, because ``{{ saltenv
+   }}`` gets replaced with the effective saltenv of the environment being
+   processed.
+
+2. Set :conf_minion:`top_file_merging_strategy` to ``same`` in the minion
+   configuration. This will keep the ``base`` environment from looking at the
+   **top.sls** from the ``dev`` or ``qa`` branches, etc.
+
+3. Explicitly define your :conf_minion:`saltenv`. (More on this below.)
+
+
+Consider the following example top file and SLS file:
+
+**top.sls**
+
+.. code-block:: yaml
+
+    {{ saltenv }}:
+      '*':
+        - mystuff
+
+**mystuff.sls**
+
+.. code-block:: yaml
+
+    manage_mystuff:
+      pkg.installed:
+        - name: mystuff
+      file.managed:
+        - name: /etc/mystuff.conf
+        - source: salt://mystuff/files/mystuff.conf
+      service.running:
+        - name: mystuffd
+        - enable: True
+        - watch:
+          - file: /etc/mystuff.conf
+
+Imagine for a moment that you need to change your ``mystuff.conf``. So, you go
+to your ``dev`` branch, edit ``mystuff/files/mystuff.conf``, and commit and
+push.
+
+If you have only done the first two steps recommended above, and you run your
+:ref:`highstate <running-highstate>`, you will end up with conflicting IDs:
+
+.. code-block:: text
+
+    myminion:
+        Data failed to compile:
+    ----------
+        Detected conflicting IDs, SLS IDs need to be globally unique.
+        The conflicting ID is 'manage_mystuff' and is found in SLS 'base:mystuff' and SLS 'dev:mystuff'
+    ----------
+        Detected conflicting IDs, SLS IDs need to be globally unique.
+        The conflicting ID is 'manage_mystuff' and is found in SLS 'dev:mystuff' and SLS 'qa:mystuff'
+
+This is because, in the absence of an explicit :conf_minion:`saltenv`, all
+environments' top files are considered. Each environment looks at only its own
+**top.sls**, but because the **mystuff.sls** exists in each branch, they all
+get pulled into the highstate, resulting in these conflicting IDs. This is why
+explicitly setting your :conf_minion:`saltenv` is important for this use case.
+
+There are two ways of explicitly defining the :conf_minion:`saltenv`:
+
+1. Set the :conf_minion:`saltenv` in your minion configuration file. This
+   allows you to isolate which states are run to a specific branch/tag on a
+   given minion. This also works nicely if you have different salt deployments
+   for dev, qa, and prod. Boxes in dev can have :conf_minion:`saltenv` set to
+   ``dev``, boxes in ``qa`` can have the :conf_minion:`saltenv` set to ``qa``,
+   and boxes in prod can have the :conf_minion:`saltenv` set to ``base``.
+
+2. At runtime, you can set the ``saltenv`` like so:
+
+   .. code-block:: bash
+
+       salt myminion state.apply saltenv=dev
+
+   A couple notes about setting the saltenv at runtime:
+
+   - It will take precedence over the :conf_minion:`saltenv` setting from the
+     minion config file, and pairs nicely with cases where you do not have
+     separate salt deployments for dev/qa/prod. You can have a box with
+     :conf_minion:`saltenv` set to ``base``, which you can test your dev
+     changes on by running your ``state.apply`` with ``saltenv=dev``.
+
+   - If you don't set :conf_minion:`saltenv` in the minion config file, you
+     _must_ specify it at runtime to avoid conflicting IDs.
+
+
+If you branched ``qa`` off of ``master``, and ``dev`` off of ``qa``, you can
+merge changes from ``dev`` into ``qa``, and then merge ``qa`` into master to
+promote your changes to from dev to qa to prod.
 
 
 .. _gitfs-whitelist-blacklist:
@@ -939,7 +1025,7 @@ URL using the format ``https://<user>:<password>@<url>``, like so:
     gitfs_remotes:
       - https://git:mypassword@domain.tld/myrepo.git
 
-The other way would be to configure the authentication in ``~/.netrc``:
+The other way would be to configure the authentication in ``/var/lib/salt/.netrc``:
 
 .. code-block:: text
 
@@ -1001,6 +1087,114 @@ to the entry in ``~/.ssh/config``
         StrictHostKeyChecking no
 
 However, this is generally regarded as insecure, and is not recommended.
+
+.. _gitcli-auth:
+
+gitcli
+------
+
+.. versionadded:: 3008.0
+
+The ``gitcli`` provider hands authentication off to the ``git`` binary via
+environment variables.  The full list of supported auth options is:
+
+.. list-table::
+    :header-rows: 1
+    :widths: 20 80
+
+    * - Option
+      - How it is applied
+    * - ``ssl_verify``
+      - When set to ``False``, runs git with ``GIT_SSL_NO_VERIFY=true``.
+    * - ``proxy``
+      - Exported to git as ``http_proxy`` and ``https_proxy``.
+    * - ``privkey``
+      - Wrapped into a ``GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -i
+        <privkey>`` invocation.
+
+The following per-remote auth parameters that work with pygit2_ or GitPython_
+are silently ignored by ``gitcli``:
+
+* ``user`` / ``password`` (HTTPS basic auth) — embed credentials directly in
+  the remote URL (``https://<user>:<password>@host/repo.git``) or use a
+  credential helper configured at the system ``git`` level.
+* ``passphrase`` — ``gitcli`` cannot answer an interactive prompt; use a
+  passphraseless key.
+* ``pubkey`` — not used; only ``privkey`` is honoured.
+* ``insecure_auth`` — has no effect.  Configure HTTP basic auth in the URL.
+
+.. warning::
+    ``gitcli`` runs SSH with ``StrictHostKeyChecking=no`` whenever a
+    ``privkey`` is configured.  Make sure the remote git endpoint is trusted
+    (private hosting, mTLS-fronted, etc.) before relying on it.
+
+.. _gitfs-gitlab:
+
+GitLab
+------
+
+GitLab repositories work with the same ``user``/``password`` and SSH
+mechanics described above, but the credential to use depends on the
+GitLab account type. The Salt master is a service account, so the
+recommended options, in decreasing order of preference, are:
+
+1. **Deploy token** (project- or group-scoped, read-only) — best fit for
+   gitfs and git_pillar. Create one in GitLab under
+   *Settings → Repository → Deploy tokens* with the ``read_repository``
+   scope. The token's username is the value GitLab shows on creation;
+   the token itself is the password:
+
+   .. code-block:: yaml
+
+       gitfs_remotes:
+         - https://gitlab.example.com/group/states.git:
+           - user: salt-deploy-states
+           - password: gldt-XXXXXXXXXXXXXXXXXXXX
+
+2. **Project access token** (project-scoped, configurable role) — useful
+   when the master must push (for example, for the ``winrepo`` runner).
+   Username is the token name; password is the token:
+
+   .. code-block:: yaml
+
+       gitfs_remotes:
+         - https://gitlab.example.com/group/winrepo.git:
+           - user: salt-winrepo
+           - password: glpat-XXXXXXXXXXXXXXXXXXXX
+
+3. **Personal access token** — works, but ties the master's access to a
+   real user. Authenticate as the token owner:
+
+   .. code-block:: yaml
+
+       gitfs_remotes:
+         - https://gitlab.example.com/group/repo.git:
+           - user: my-gitlab-user
+           - password: glpat-XXXXXXXXXXXXXXXXXXXX
+
+4. **Deploy key over SSH** — use a passphraseless key pair, add the
+   public key under *Project → Settings → Repository → Deploy Keys*, and
+   reference the private key:
+
+   .. code-block:: yaml
+
+       gitfs_remotes:
+         - git@gitlab.example.com:group/repo.git:
+           - pubkey: /etc/salt/gitlab_deploy.pub
+           - privkey: /etc/salt/gitlab_deploy
+
+   This works with both pygit2_ and GitPython_. For GitPython_, only
+   passphraseless keys are supported (see the GitPython section above).
+   Add the GitLab host key with
+   ``salt-call --local ssh.set_known_host hostname=gitlab.example.com``
+   first.
+
+.. note::
+    GitLab returns ``401 Unauthorized`` rather than a descriptive error
+    when a deploy/project token has expired or lacks ``read_repository``
+    scope. If gitfs starts logging ``401`` after working previously,
+    re-check the token's expiry and scopes before changing the Salt
+    configuration.
 
 .. _gitfs-ssh-fingerprint:
 

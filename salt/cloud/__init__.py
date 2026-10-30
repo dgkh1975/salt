@@ -9,7 +9,6 @@ import logging
 import multiprocessing
 import os
 import signal
-import sys
 import time
 import traceback
 from itertools import groupby
@@ -17,6 +16,7 @@ from itertools import groupby
 import salt.client
 import salt.config
 import salt.loader
+import salt.minion
 import salt.syspaths
 import salt.utils.args
 import salt.utils.cloud
@@ -36,14 +36,6 @@ from salt.exceptions import (
 )
 from salt.template import compile_template
 
-try:
-    import Cryptodome.Random
-except ImportError:
-    try:
-        import Crypto.Random
-    except ImportError:
-        pass  # pycrypto < 2.1
-
 log = logging.getLogger(__name__)
 
 
@@ -61,17 +53,17 @@ def communicator(func):
             trace = traceback.format_exc()
             queue.put("KEYBOARDINT")
             queue.put("Keyboard interrupt")
-            queue.put("{}\n{}\n".format(ex, trace))
+            queue.put(f"{ex}\n{trace}\n")
         except Exception as ex:  # pylint: disable=broad-except
             trace = traceback.format_exc()
             queue.put("ERROR")
             queue.put("Exception")
-            queue.put("{}\n{}\n".format(ex, trace))
+            queue.put(f"{ex}\n{trace}\n")
         except SystemExit as ex:
             trace = traceback.format_exc()
             queue.put("ERROR")
             queue.put("System exit")
-            queue.put("{}\n{}\n".format(ex, trace))
+            queue.put(f"{ex}\n{trace}\n")
         return ret
 
     return _call
@@ -151,7 +143,7 @@ def enter_mainloop(
             " we bail out".format(target)
         )
         log.error(msg)
-        raise SaltCloudSystemExit("Exception caught\n{}".format(msg))
+        raise SaltCloudSystemExit(f"Exception caught\n{msg}")
     elif mapped_args is not None:
         iterable = [[queue, [arg], kwargs] for arg in mapped_args]
         ret = pool.map(func=target, iterable=iterable)
@@ -162,12 +154,12 @@ def enter_mainloop(
         if test in ["ERROR", "KEYBOARDINT"]:
             type_ = queue.get()
             trace = queue.get()
-            msg = "Caught {}, terminating workers\n".format(type_)
-            msg += "TRACE: {}\n".format(trace)
+            msg = f"Caught {type_}, terminating workers\n"
+            msg += f"TRACE: {trace}\n"
             log.error(msg)
             pool.terminate()
             pool.join()
-            raise SaltCloudSystemExit("Exception caught\n{}".format(msg))
+            raise SaltCloudSystemExit(f"Exception caught\n{msg}")
         elif test in ["END"] or (callback and callback(test)):
             pool.close()
             pool.join()
@@ -200,7 +192,7 @@ class CloudClient:
             for name, profile in pillars.pop("profiles", {}).items():
                 provider = profile["provider"].split(":")[0]
                 driver = next(iter(self.opts["providers"][provider].keys()))
-                profile["provider"] = "{}:{}".format(provider, driver)
+                profile["provider"] = f"{provider}:{driver}"
                 profile["profile"] = name
                 self.opts["profiles"].update({name: profile})
                 self.opts["providers"][provider][driver]["profiles"].update(
@@ -393,7 +385,7 @@ class CloudClient:
         mapper = salt.cloud.Map(self._opts_defaults())
         providers = self.opts["providers"]
         if provider in providers:
-            provider += ":{}".format(next(iter(providers[provider].keys())))
+            provider += f":{next(iter(providers[provider].keys()))}"
         else:
             return False
         if isinstance(names, str):
@@ -434,7 +426,7 @@ class CloudClient:
         mapper = salt.cloud.Map(self._opts_defaults())
         providers = mapper.map_providers_parallel()
         if provider in providers:
-            provider += ":{}".format(next(iter(providers[provider].keys())))
+            provider += f":{next(iter(providers[provider].keys()))}"
         else:
             return False
         if isinstance(names, str):
@@ -519,7 +511,7 @@ class Cloud:
         for alias, drivers in self.opts["providers"].items():
             if len(drivers) > 1:
                 for driver in drivers:
-                    providers.add("{}:{}".format(alias, driver))
+                    providers.add(f"{alias}:{driver}")
                 continue
             providers.add(alias)
         return providers
@@ -561,8 +553,7 @@ class Cloud:
 
         if not providers:
             raise SaltCloudSystemExit(
-                "No cloud providers matched '{}'. "
-                "Available selections: {}".format(
+                "No cloud providers matched '{}'. Available selections: {}".format(
                     lookup, ", ".join(self.get_configured_providers())
                 )
             )
@@ -611,7 +602,7 @@ class Cloud:
         pmap = {}
         for alias, drivers in self.opts["providers"].items():
             for driver, details in drivers.items():
-                fun = "{}.{}".format(driver, query)
+                fun = f"{driver}.{query}"
                 if fun not in self.clouds:
                     log.error("Public cloud provider %s is not available", driver)
                     continue
@@ -626,8 +617,7 @@ class Cloud:
                         pmap[alias][driver] = self.clouds[fun]()
                 except Exception as err:  # pylint: disable=broad-except
                     log.debug(
-                        "Failed to execute '%s()' while querying for "
-                        "running nodes: %s",
+                        "Failed to execute '%s()' while querying for running nodes: %s",
                         fun,
                         err,
                         exc_info_on_loglevel=logging.DEBUG,
@@ -662,11 +652,11 @@ class Cloud:
                 # for minimum information, Otherwise still use query param.
                 if (
                     opts.get("selected_query_option") is None
-                    and "{}.list_nodes_min".format(driver) in self.clouds
+                    and f"{driver}.list_nodes_min" in self.clouds
                 ):
                     this_query = "list_nodes_min"
 
-                fun = "{}.{}".format(driver, this_query)
+                fun = f"{driver}.{this_query}"
                 if fun not in self.clouds:
                     log.error("Public cloud provider %s is not available", driver)
                     continue
@@ -774,7 +764,7 @@ class Cloud:
                 provider_by_driver[name][alias] = data
 
         for driver, providers_data in provider_by_driver.items():
-            fun = "{}.optimize_providers".format(driver)
+            fun = f"{driver}.optimize_providers"
             if fun not in self.clouds:
                 log.debug("The '%s' cloud driver is unable to be optimized.", driver)
 
@@ -804,7 +794,7 @@ class Cloud:
             return data
 
         for alias, driver in lookups:
-            fun = "{}.avail_locations".format(driver)
+            fun = f"{driver}.avail_locations"
             if fun not in self.clouds:
                 # The capability to gather locations is not supported by this
                 # cloud module
@@ -845,7 +835,7 @@ class Cloud:
             return data
 
         for alias, driver in lookups:
-            fun = "{}.avail_images".format(driver)
+            fun = f"{driver}.avail_images"
             if fun not in self.clouds:
                 # The capability to gather images is not supported by this
                 # cloud module
@@ -885,7 +875,7 @@ class Cloud:
             return data
 
         for alias, driver in lookups:
-            fun = "{}.avail_sizes".format(driver)
+            fun = f"{driver}.avail_sizes"
             if fun not in self.clouds:
                 # The capability to gather sizes is not supported by this
                 # cloud module
@@ -990,7 +980,7 @@ class Cloud:
                 pool_size = self.opts["pool_size"]
             else:
                 pool_size = len(parallel_data)
-            log.info("Destroying in parallel mode; " "Cloud pool size: %s", pool_size)
+            log.info("Destroying in parallel mode; Cloud pool size: %s", pool_size)
 
             # kick off the parallel destroy
             output_multip = enter_mainloop(
@@ -1020,7 +1010,7 @@ class Cloud:
         else:
             log.info("Destroying in non-parallel mode.")
             for alias, driver, name in vms_to_destroy:
-                fun = "{}.destroy".format(driver)
+                fun = f"{driver}.destroy"
                 with salt.utils.context.func_globals_inject(
                     self.clouds[fun], __active_provider_name__=":".join([alias, driver])
                 ):
@@ -1053,7 +1043,7 @@ class Cloud:
             key_file = os.path.join(
                 self.opts["pki_dir"], "minions", minion_dict.get("id", name)
             )
-            globbed_key_file = glob.glob("{}.*".format(key_file))
+            globbed_key_file = glob.glob(f"{key_file}.*")
 
             if not os.path.isfile(key_file) and not globbed_key_file:
                 # There's no such key file!? It might have been renamed
@@ -1093,25 +1083,25 @@ class Cloud:
             )
             while True:
                 for idx, filename in enumerate(globbed_key_file):
-                    print(" {}: {}".format(idx, os.path.basename(filename)))
+                    print(f" {idx}: {os.path.basename(filename)}")
                 selection = input("Which minion key should be deleted(number)? ")
                 try:
                     selection = int(selection)
                 except ValueError:
-                    print("'{}' is not a valid selection.".format(selection))
+                    print(f"'{selection}' is not a valid selection.")
 
                 try:
                     filename = os.path.basename(globbed_key_file.pop(selection))
                 except Exception:  # pylint: disable=broad-except
                     continue
 
-                delete = input("Delete '{}'? [Y/n]? ".format(filename))
+                delete = input(f"Delete '{filename}'? [Y/n]? ")
                 if delete == "" or delete.lower().startswith("y"):
                     salt.utils.cloud.remove_key(self.opts["pki_dir"], filename)
-                    print("Deleted '{}'".format(filename))
+                    print(f"Deleted '{filename}'")
                     break
 
-                print("Did not delete '{}'".format(filename))
+                print(f"Did not delete '{filename}'")
                 break
 
         if names and not processed:
@@ -1141,13 +1131,13 @@ class Cloud:
                 if node in names:
                     acts[prov].append(node)
         for prov, names_ in acts.items():
-            fun = "{}.reboot".format(prov)
+            fun = f"{prov}.reboot"
             for name in names_:
                 ret.append({name: self.clouds[fun](name)})
 
         return ret
 
-    def create(self, vm_, local_master=True):
+    def create(self, vm_, local_master=True, sync_sleep=3):
         """
         Create a single VM
         """
@@ -1158,7 +1148,7 @@ class Cloud:
         )
 
         alias, driver = vm_["provider"].split(":")
-        fun = "{}.create".format(driver)
+        fun = f"{driver}.create"
         if fun not in self.clouds:
             log.error(
                 "Creating '%s' using '%s' as the provider "
@@ -1223,28 +1213,47 @@ class Cloud:
 
         try:
             alias, driver = vm_["provider"].split(":")
-            func = "{}.create".format(driver)
+            func = f"{driver}.create"
             with salt.utils.context.func_globals_inject(
                 self.clouds[fun], __active_provider_name__=":".join([alias, driver])
             ):
                 output = self.clouds[func](vm_)
             if output is not False and "sync_after_install" in self.opts:
-                if self.opts["sync_after_install"] not in (
+                if self.opts["sync_after_install"] and self.opts[
+                    "sync_after_install"
+                ] not in (
                     "all",
-                    "modules",
-                    "states",
+                    "beacons",
+                    "clouds",
+                    "engines",
+                    "executors",
                     "grains",
+                    "log",
+                    "matchers",
+                    "modules",
+                    "output",
+                    "pillar",
+                    "proxymodules",
+                    "renderers",
+                    "returners",
+                    "sdb",
+                    "serializers",
+                    "states",
+                    "thorium",
+                    "utils",
                 ):
-                    log.error("Bad option for sync_after_install")
-                    return output
+                    log.warning(
+                        "Bad option for sync_after_install. Defaulting to 'all'"
+                    )
+                    self.opts["sync_after_install"] = "all"
 
                 # A small pause helps the sync work more reliably
-                time.sleep(3)
+                time.sleep(sync_sleep)
 
-                start = int(time.time())
-                while int(time.time()) < start + 60:
+                expiration_time = time.time() + 60
+                while time.time() < expiration_time:
                     # We'll try every <timeout> seconds, up to a minute
-                    mopts_ = salt.config.DEFAULT_MASTER_OPTS
+                    mopts_ = copy.deepcopy(salt.config.DEFAULT_MASTER_OPTS)
                     conf_path = "/".join(self.opts["conf_file"].split("/")[:-1])
                     mopts_.update(
                         salt.config.master_config(os.path.join(conf_path, "master"))
@@ -1258,13 +1267,12 @@ class Cloud:
                         )
                         if ret:
                             log.info(
-                                "Synchronized the following dynamic modules: "
-                                "  {}".format(ret)
+                                "Synchronized the following dynamic modules: %s", ret
                             )
                             break
         except KeyError as exc:
             log.exception(
-                "Failed to create VM %s. Configuration value %s needs " "to be set",
+                "Failed to create VM %s. Configuration value %s needs to be set",
                 vm_["name"],
                 exc,
             )
@@ -1294,12 +1302,12 @@ class Cloud:
         :param dict main: The main cloud config
         :param dict provider: The provider config
         :param dict profile: The profile config
-        :param dict overrides: The vm's config overrides
+        :param dict overrides: a special dict that carries per-node options overrides (see CloudConfig:profile() documentation)
         """
         vm = main.copy()
         vm = salt.utils.dictupdate.update(vm, provider)
         vm = salt.utils.dictupdate.update(vm, profile)
-        vm.update(overrides)
+        vm = salt.utils.dictupdate.update(vm, overrides.get(name, {}))
         vm["name"] = name
         return vm
 
@@ -1328,8 +1336,7 @@ class Cloud:
                 output = self.clouds[fun](**extra_)
         except KeyError as exc:
             log.exception(
-                "Failed to perform %s.%s on %s. "
-                "Configuration value %s needs to be set",
+                "Failed to perform %s.%s on %s. Configuration value %s needs to be set",
                 extra_["provider"],
                 extra_["action"],
                 extra_["name"],
@@ -1343,7 +1350,7 @@ class Cloud:
         handle them
         """
         if profile not in self.opts["profiles"]:
-            msg = "Profile {} is not defined".format(profile)
+            msg = f"Profile {profile} is not defined"
             log.error(msg)
             return {"Error": msg}
 
@@ -1382,7 +1389,7 @@ class Cloud:
             if name in vms:
                 prov = vms[name]["provider"]
                 driv = vms[name]["driver"]
-                msg = "{} already exists under {}:{}".format(name, prov, driv)
+                msg = f"{name} already exists under {prov}:{driv}"
                 log.error(msg)
                 ret[name] = {"Error": msg}
                 continue
@@ -1398,8 +1405,9 @@ class Cloud:
                 process = multiprocessing.Process(target=self.create, args=(vm_,))
                 process.start()
                 ret[name] = {
-                    "Provisioning": "VM being provisioned in parallel. "
-                    "PID: {}".format(process.pid)
+                    "Provisioning": "VM being provisioned in parallel. PID: {}".format(
+                        process.pid
+                    )
                 }
                 continue
 
@@ -1413,7 +1421,8 @@ class Cloud:
                         raise SaltCloudSystemExit("Failed to deploy VM")
                     continue
                 if self.opts.get("show_deploy_args", False) is False:
-                    ret[name].pop("deploy_kwargs", None)
+                    if isinstance(ret[name], dict):
+                        ret[name].pop("deploy_kwargs", None)
             except (SaltCloudSystemExit, SaltCloudConfigError) as exc:
                 if len(names) == 1:
                     raise
@@ -1450,7 +1459,7 @@ class Cloud:
                             vm_name = vm_details["id"]
                         else:
                             log.debug(
-                                "vm:%s in provider:%s is not in name " "list:'%s'",
+                                "vm:%s in provider:%s is not in name list:'%s'",
                                 vm_name,
                                 driver,
                                 names,
@@ -1524,17 +1533,14 @@ class Cloud:
         matches = self.lookup_providers(prov)
         if len(matches) > 1:
             raise SaltCloudSystemExit(
-                "More than one results matched '{}'. Please specify "
-                "one of: {}".format(
+                "More than one results matched '{}'. Please specify one of: {}".format(
                     prov,
-                    ", ".join(
-                        ["{}:{}".format(alias, driver) for (alias, driver) in matches]
-                    ),
+                    ", ".join([f"{alias}:{driver}" for (alias, driver) in matches]),
                 )
             )
 
         alias, driver = matches.pop()
-        fun = "{}.{}".format(driver, func)
+        fun = f"{driver}.{func}"
         if fun not in self.clouds:
             raise SaltCloudSystemExit(
                 "The '{}' cloud provider alias, for the '{}' driver, does "
@@ -1558,7 +1564,7 @@ class Cloud:
         """
         for alias, drivers in self.opts["providers"].copy().items():
             for driver in drivers.copy():
-                fun = "{}.get_configured_provider".format(driver)
+                fun = f"{driver}.get_configured_provider"
                 if fun not in self.clouds:
                     # Mis-configured provider that got removed?
                     log.warning(
@@ -1664,6 +1670,8 @@ class Map(Cloud):
     def delete_map(self, query=None):
         query_map = self.interpolated_map(query=query)
         for alias, drivers in query_map.copy().items():
+            if alias == "Errors":
+                continue
             for driver, vms in drivers.copy().items():
                 for vm_name, vm_details in vms.copy().items():
                     if vm_details == "Absent":
@@ -1716,7 +1724,7 @@ class Map(Cloud):
                     pass
                 elif self.opts.get("map_pillar") not in self.opts.get("maps"):
                     log.error(
-                        "The specified map not found in pillar at " "'cloud:maps:%s'",
+                        "The specified map not found in pillar at 'cloud:maps:%s'",
                         self.opts["map_pillar"],
                     )
                     raise SaltCloudNotFound()
@@ -1785,9 +1793,9 @@ class Map(Cloud):
                             overrides.setdefault("name", name)
                         except AttributeError:
                             log.error(
-                                "Cannot use 'name' as a minion id in a cloud map as it "
-                                "is a reserved word. Please change 'name' to a different "
-                                "minion id reference."
+                                "Cannot use 'name' as a minion id in a cloud map as it"
+                                " is a reserved word. Please change 'name' to a"
+                                " different minion id reference."
                             )
                             return {}
                         entries[name] = overrides
@@ -1881,7 +1889,7 @@ class Map(Cloud):
                     "The required profile, '{}', defined in the map "
                     "does not exist. The defined nodes, {}, will not "
                     "be created.".format(
-                        profile_name, ", ".join("'{}'".format(node) for node in nodes)
+                        profile_name, ", ".join(f"'{node}'" for node in nodes)
                     )
                 )
                 log.error(msg)
@@ -1914,7 +1922,7 @@ class Map(Cloud):
 
                 # Update profile data with the map overrides
                 for setting in ("grains", "master", "minion", "volumes", "requires"):
-                    deprecated = "map_{}".format(setting)
+                    deprecated = f"map_{setting}"
                     if deprecated in overrides:
                         log.warning(
                             "The use of '%s' on the '%s' mapping has "
@@ -1976,8 +1984,7 @@ class Map(Cloud):
                             break
 
                         log.warning(
-                            "'%s' already exists, removing from " "the create map.",
-                            name,
+                            "%r already exists, removing from the create map.", name
                         )
 
                         if "existing" not in ret:
@@ -2112,7 +2119,7 @@ class Map(Cloud):
             out = self.create(master_profile, local_master=local_master)
 
             if not isinstance(out, dict):
-                log.debug("Master creation details is not a dictionary: {}".format(out))
+                log.debug("Master creation details is not a dictionary: %s", out)
 
             elif "Errors" in out:
                 raise SaltCloudSystemExit(
@@ -2136,8 +2143,9 @@ class Map(Cloud):
             )
             if master_host is None:
                 raise SaltCloudSystemExit(
-                    "Host for new master {} was not found, "
-                    "aborting map".format(master_name)
+                    "Host for new master {} was not found, aborting map".format(
+                        master_name
+                    )
                 )
             output[master_name] = out
         except StopIteration:
@@ -2273,8 +2281,6 @@ def create_multiprocessing(parallel_data, queue=None):
     This function will be called from another process when running a map in
     parallel mode. The result from the create is always a json object.
     """
-    salt.utils.crypt.reinit_crypto()
-
     parallel_data["opts"]["output"] = "json"
     cloud = Cloud(parallel_data["opts"])
     try:
@@ -2303,8 +2309,6 @@ def destroy_multiprocessing(parallel_data, queue=None):
     This function will be called from another process when running a map in
     parallel mode. The result from the destroy is always a json object.
     """
-    salt.utils.crypt.reinit_crypto()
-
     parallel_data["opts"]["output"] = "json"
     clouds = salt.loader.clouds(parallel_data["opts"])
 
@@ -2335,8 +2339,6 @@ def run_parallel_map_providers_query(data, queue=None):
     This function will be called from another process when building the
     providers map.
     """
-    salt.utils.crypt.reinit_crypto()
-
     cloud = Cloud(data["opts"])
     try:
         with salt.utils.context.func_globals_inject(

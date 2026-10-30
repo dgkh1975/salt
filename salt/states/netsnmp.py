@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Network SNMP
 ============
@@ -15,19 +14,14 @@ Dependencies
 
 - :mod:`napalm snmp management module (salt.modules.napalm_snmp) <salt.modules.napalm_snmp>`
 
-.. versionadded: 2016.11.0
+.. versionadded:: 2016.11.0
 """
 
-from __future__ import absolute_import, print_function, unicode_literals
-
+import copy
 import logging
 
-# import NAPALM utils
 import salt.utils.json
 import salt.utils.napalm
-
-# salt lib
-from salt.ext import six
 
 log = logging.getLogger(__name__)
 
@@ -67,7 +61,6 @@ def __virtual__():
 
 
 def _ordered_dict_to_dict(config):
-
     """
     Forced the datatype to dict, in case OrderedDict is used.
     """
@@ -76,17 +69,21 @@ def _ordered_dict_to_dict(config):
 
 
 def _expand_config(config, defaults):
-
     """
     Completed the values of the expected config for the edge cases with the default values.
     """
 
-    defaults.update(config)
-    return defaults
+    # ``defaults`` (the state's optional ``defaults`` argument) is ``None`` when
+    # unset, and ``config`` may be too; treat either as an empty mapping rather
+    # than crashing on ``None.update()`` (the netusers twin of #62170). deepcopy
+    # so the nested community detail dicts are not aliased into the caller's
+    # data -- ``_clear_community_details`` mutates them in place downstream.
+    expected = copy.deepcopy(defaults) if defaults else {}
+    expected.update(copy.deepcopy(config) if config else {})
+    return expected
 
 
 def _valid_dict(dic):
-
     """
     Valid dictionary?
     """
@@ -95,16 +92,14 @@ def _valid_dict(dic):
 
 
 def _valid_str(value):
-
     """
     Valid str?
     """
 
-    return isinstance(value, six.string_types) and len(value) > 0
+    return isinstance(value, str) and len(value) > 0
 
 
 def _community_defaults():
-
     """
     Returns the default values of a community.
     """
@@ -113,7 +108,6 @@ def _community_defaults():
 
 
 def _clear_community_details(community_details):
-
     """
     Clears community details.
     """
@@ -121,9 +115,14 @@ def _clear_community_details(community_details):
     for key in ["acl", "mode"]:
         _str_elem(community_details, key)
 
-    _mode = community_details.get["mode"] = community_details.get("mode").lower()
+    # NB: ``community_details.get["mode"]`` was a typo for
+    # ``community_details["mode"]`` -- it subscripted the bound ``.get`` method
+    # and raised ``TypeError`` for every dict-form community. ``mode`` may also
+    # be absent (``_str_elem`` drops an invalid value), so default it.
+    _mode = (community_details.get("mode") or "ro").lower()
+    community_details["mode"] = _mode
 
-    if _mode in _COMMUNITY_MODE_MAP.keys():
+    if _mode in _COMMUNITY_MODE_MAP:
         community_details["mode"] = _COMMUNITY_MODE_MAP.get(_mode)
 
     if community_details["mode"] not in ["ro", "rw"]:
@@ -133,7 +132,6 @@ def _clear_community_details(community_details):
 
 
 def _str_elem(config, key):
-
     """
     Re-adds the value of a specific key in the dict, only in case of valid str value.
     """
@@ -144,7 +142,6 @@ def _str_elem(config, key):
 
 
 def _check_config(config):
-
     """
     Checks the desired config and clears interesting details.
     """
@@ -167,7 +164,7 @@ def _check_config(config):
                 # default mode is read-only
             if _valid_dict(_comm):
                 # list of dicts
-                for _comm_name, _comm_details in six.iteritems(_comm):
+                for _comm_name, _comm_details in _comm.items():
                     if _valid_str(_comm_name):
                         _community_tmp[_comm_name] = _clear_community_details(
                             _comm_details
@@ -175,7 +172,7 @@ def _check_config(config):
     elif _valid_dict(_community):
         # directly as dict of communities
         # recommended way...
-        for _comm_name, _comm_details in six.iteritems(_community):
+        for _comm_name, _comm_details in _community.items():
             if _valid_str(_comm_name):
                 _community_tmp[_comm_name] = _clear_community_details(_comm_details)
     else:
@@ -194,7 +191,6 @@ def _check_config(config):
 
 
 def _retrieve_device_config():
-
     """
     Retrieves the SNMP config from the device.
     """
@@ -203,32 +199,34 @@ def _retrieve_device_config():
 
 
 def _create_diff_action(diff, diff_key, key, value):
-
     """
     DRY to build diff parts (added, removed, updated).
     """
 
-    if diff_key not in diff.keys():
+    if diff_key not in diff:
         diff[diff_key] = {}
     diff[diff_key][key] = value
 
 
 def _create_diff(diff, fun, key, prev, curr):
-
     """
     Builds the diff dictionary.
     """
 
     if not fun(prev):
         _create_diff_action(diff, "added", key, curr)
-    elif fun(prev) and not fun(curr):
-        _create_diff_action(diff, "removed", key, prev)
     elif not fun(curr):
+        _create_diff_action(diff, "removed", key, prev)
+    else:
+        # Both previous and current values are valid and -- since _compute_diff
+        # only calls this when they differ -- not equal: the value changed. The
+        # old ``elif not fun(curr)`` here was unreachable, so a valid->valid
+        # change (e.g. location "A" -> "B") was silently dropped from the diff
+        # and the state reported success without pushing it.
         _create_diff_action(diff, "updated", key, curr)
 
 
 def _compute_diff(existing, expected):
-
     """
     Computes the differences between the existing and the expected SNMP config.
     """
@@ -241,13 +239,17 @@ def _compute_diff(existing, expected):
 
     for key in ["community"]:  # for the moment only onen
         if existing.get(key) != expected.get(key):
+            # NOTE: the whole community mapping is diffed as one opaque value, so
+            # a change lands in "updated" and is applied via snmp.update_config
+            # (add/modify). Removing an individual community from a multi-entry
+            # set is not expressed here and is left for a follow-up that diffs
+            # communities individually.
             _create_diff(diff, _valid_dict, key, existing.get(key), expected.get(key))
 
     return diff
 
 
 def _configure(changes):
-
     """
     Calls the configuration template to apply the configuration changes on the device.
     """
@@ -266,7 +268,7 @@ def _configure(changes):
         _chassis_id = _updated_changes.get("chassis_id", "")
         if key == "removed":
             fun = "remove_config"
-        _ret = __salt__["snmp.{fun}".format(fun=fun)](
+        _ret = __salt__[f"snmp.{fun}"](
             location=_location,
             contact=_contact,
             community=_community,
@@ -286,7 +288,6 @@ def _configure(changes):
 
 
 def managed(name, config=None, defaults=None):
-
     """
     Configures the SNMP on the device as specified in the SLS file.
 

@@ -1,33 +1,25 @@
-# -*- coding: utf-8 -*-
 """
 Provide authentication using simple LDAP binds
 
 :depends:   - ldap Python module
 """
 
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
 import itertools
 import logging
 
-import salt.utils.data
-import salt.utils.stringutils
-
-# Import third party libs
 from jinja2 import Environment
 
-# Import salt libs
+import salt.utils.data
+import salt.utils.stringutils
 from salt.exceptions import CommandExecutionError, SaltInvocationError
-from salt.ext import six
 
 log = logging.getLogger(__name__)
 
 try:
     # pylint: disable=no-name-in-module
     import ldap
-    import ldap.modlist
     import ldap.filter
+    import ldap.modlist
 
     HAS_LDAP = True
     # pylint: enable=no-name-in-module
@@ -62,15 +54,15 @@ def _config(key, mandatory=True, opts=None):
     """
     try:
         if opts:
-            value = opts["auth.ldap.{0}".format(key)]
+            value = opts[f"auth.ldap.{key}"]
         else:
-            value = __opts__["auth.ldap.{0}".format(key)]
+            value = __opts__[f"auth.ldap.{key}"]
     except KeyError:
         try:
-            value = __defopts__["auth.ldap.{0}".format(key)]
+            value = __defopts__[f"auth.ldap.{key}"]
         except KeyError:
             if mandatory:
-                msg = "missing auth.ldap.{0} in master config".format(key)
+                msg = f"missing auth.ldap.{key} in master config"
                 raise SaltInvocationError(msg)
             return False
     return value
@@ -86,7 +78,7 @@ def _render_template(param, username):
     return template.render(variables)
 
 
-class _LDAPConnection(object):
+class _LDAPConnection:
     """
     Setup an LDAP connection.
     """
@@ -128,13 +120,13 @@ class _LDAPConnection(object):
 
         schema = "ldaps" if tls else "ldap"
         if self.uri == "":
-            self.uri = "{0}://{1}:{2}".format(schema, self.server, self.port)
+            self.uri = f"{schema}://{self.server}:{self.port}"
 
         try:
             if no_verify:
                 ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
 
-            self.ldap = ldap.initialize("{0}".format(self.uri))
+            self.ldap = ldap.initialize(f"{self.uri}")
             self.ldap.protocol_version = 3  # ldap.VERSION3
             self.ldap.set_option(ldap.OPT_REFERRALS, 0)  # Needed for AD
 
@@ -148,7 +140,7 @@ class _LDAPConnection(object):
                 self.ldap.simple_bind_s(self.binddn, self.bindpw)
         except Exception as ldap_error:  # pylint: disable=broad-except
             raise CommandExecutionError(
-                "Failed to bind to LDAP server {0} as {1}: {2}".format(
+                "Failed to bind to LDAP server {} as {}: {}".format(
                     self.uri, self.binddn, ldap_error
                 )
             )
@@ -283,7 +275,7 @@ def _bind(username, password, anonymous=False, opts=None):
             # search for the user's DN to be used for the actual authentication
             _ldap = _LDAPConnection(**connargs).ldap
             log.debug(
-                "Running LDAP user dn search with filter:%s, dn:%s, " "scope:%s",
+                "Running LDAP user dn search with filter:%s, dn:%s, scope:%s",
                 paramvalues["filter"],
                 basedn,
                 scope,
@@ -412,15 +404,15 @@ def groups(username, **kwargs):
 
         if _config("activedirectory"):
             try:
-                get_user_dn_search = "(&({0}={1})(objectClass={2}))".format(
+                get_user_dn_search = "(&({}={})(objectClass={}))".format(
                     _config("accountattributename"), username, _config("persontype")
                 )
                 user_dn_results = bind.search_s(
                     _config("basedn"),
                     ldap.SCOPE_SUBTREE,
                     get_user_dn_search,
-                    [str("distinguishedName")],
-                )  # future lint: disable=blacklisted-function
+                    ["distinguishedName"],
+                )
             except Exception as e:  # pylint: disable=broad-except
                 log.error("Exception thrown while looking up user DN in AD: %s", e)
                 return group_list
@@ -429,7 +421,7 @@ def groups(username, **kwargs):
                 return group_list
             # LDAP results are always tuples.  First entry in the tuple is the DN
             dn = ldap.filter.escape_filter_chars(user_dn_results[0][0])
-            ldap_search_string = "(&(member={0})(objectClass={1}))".format(
+            ldap_search_string = "(&(member={})(objectClass={}))".format(
                 dn, _config("groupclass")
             )
             log.debug("Running LDAP group membership search: %s", ldap_search_string)
@@ -440,9 +432,9 @@ def groups(username, **kwargs):
                     ldap_search_string,
                     [
                         salt.utils.stringutils.to_str(_config("accountattributename")),
-                        str("cn"),
+                        "cn",
                     ],
-                )  # future lint: disable=blacklisted-function
+                )
             except Exception as e:  # pylint: disable=broad-except
                 log.error(
                     "Exception thrown while retrieving group membership in AD: %s", e
@@ -464,9 +456,9 @@ def groups(username, **kwargs):
                 [
                     salt.utils.stringutils.to_str(_config("accountattributename")),
                     salt.utils.stringutils.to_str(_config("groupattribute")),
-                    str("cn"),
+                    "cn",
                 ],
-            )  # future lint: disable=blacklisted-function
+            )
 
             for entry, result in search_results:
                 for user in itertools.chain(
@@ -483,15 +475,22 @@ def groups(username, **kwargs):
 
             log.debug("User %s is a member of groups: %s", username, group_list)
 
-            if not auth(username, kwargs["password"]):
+            # Only test user auth on first call for job.
+            # 'show_jid' only exists on first payload so we can use that for the conditional.
+            if "show_jid" in kwargs and not _bind(
+                username,
+                kwargs.get("password"),
+                anonymous=_config("auth_by_group_membership_only", mandatory=False)
+                and _config("anonymous", mandatory=False),
+            ):
                 log.error("LDAP username and password do not match")
                 return []
         else:
             if _config("groupou"):
-                search_base = "ou={0},{1}".format(_config("groupou"), _config("basedn"))
+                search_base = "ou={},{}".format(_config("groupou"), _config("basedn"))
             else:
-                search_base = "{0}".format(_config("basedn"))
-            search_string = "(&({0}={1})(objectClass={2}))".format(
+                search_base = "{}".format(_config("basedn"))
+            search_string = "(&({}={})(objectClass={}))".format(
                 _config("accountattributename"), username, _config("groupclass")
             )
             search_results = bind.search_s(
@@ -500,7 +499,7 @@ def groups(username, **kwargs):
                 search_string,
                 [
                     salt.utils.stringutils.to_str(_config("accountattributename")),
-                    str("cn"),  # future lint: disable=blacklisted-function
+                    "cn",
                     salt.utils.stringutils.to_str(_config("groupattribute")),
                 ],
             )
@@ -569,7 +568,7 @@ def __expand_ldap_entries(entries, opts=None):
         if not isinstance(user_or_group_dict, dict):
             acl_tree.append(user_or_group_dict)
             continue
-        for minion_or_ou, matchers in six.iteritems(user_or_group_dict):
+        for minion_or_ou, matchers in user_or_group_dict.items():
             permissions = matchers
             retrieved_minion_ids = []
             if minion_or_ou.startswith("ldap("):
@@ -578,8 +577,8 @@ def __expand_ldap_entries(entries, opts=None):
                 search_string = "(objectClass=computer)"
                 try:
                     search_results = bind.search_s(
-                        search_base, ldap.SCOPE_SUBTREE, search_string, [str("cn")]
-                    )  # future lint: disable=blacklisted-function
+                        search_base, ldap.SCOPE_SUBTREE, search_string, ["cn"]
+                    )
                     for ldap_match in search_results:
                         try:
                             minion_id = ldap_match[1]["cn"][0].lower()
@@ -622,7 +621,7 @@ def process_acl(auth_list, opts=None):
     """
     ou_names = []
     for item in auth_list:
-        if isinstance(item, six.string_types):
+        if isinstance(item, str):
             continue
         ou_names.extend(
             [

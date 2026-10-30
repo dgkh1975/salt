@@ -1,16 +1,14 @@
-# -*- coding: utf-8 -*-
 """
 Test the salt mine system
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
 import pprint
 import time
 
 import pytest
+
 import salt.utils.platform
 from tests.support.case import ModuleCase, ShellCase
-from tests.support.helpers import slowTest
 from tests.support.runtests import RUNTIME_VARS
 
 
@@ -27,7 +25,7 @@ class MineTest(ModuleCase, ShellCase):
             self.tgt = "*"
         self.wait_for_all_jobs()
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_get(self):
         """
         test mine.get and mine.update
@@ -38,7 +36,7 @@ class MineTest(ModuleCase, ShellCase):
         # mine.update will return True
         self.assertTrue(self.run_function("mine.get", ["minion", "test.ping"]))
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_get_allow_tgt(self):
         """
         test mine.get and mine.update using allow_tgt
@@ -46,18 +44,26 @@ class MineTest(ModuleCase, ShellCase):
         assert self.run_function("mine.update", minion_tgt="minion")
         assert self.run_function("mine.update", minion_tgt="sub_minion")
 
+        # mine.update fires an event and sleeps 0.5s, but the master may need
+        # additional time to process and store the mine data.  Poll until the
+        # data is available so that tests don't race against propagation.
         # sub_minion should be able to view test.arg data
-        sub_min_ret = self.run_call(
-            "mine.get {0} test.arg".format(self.tgt),
-            config_dir=RUNTIME_VARS.TMP_SUB_MINION_CONF_DIR,
-        )
-        assert "            - isn't" in sub_min_ret
+        for _ in range(30):
+            sub_min_ret = self.run_call(
+                f"mine.get {self.tgt} test.arg",
+                config_dir=RUNTIME_VARS.TMP_SUB_MINION_CONF_DIR,
+            )
+            if "            - isn't" in sub_min_ret:
+                break
+            time.sleep(1)
+        else:
+            self.fail("sub_minion was unable to view test.arg data after 30 seconds")
 
         # minion should not be able to view test.arg data
-        min_ret = self.run_call("mine.get {0} test.arg".format(self.tgt))
+        min_ret = self.run_call(f"mine.get {self.tgt} test.arg")
         assert "            - isn't" not in min_ret
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_send_allow_tgt(self):
         """
         test mine.send with allow_tgt set
@@ -70,9 +76,9 @@ class MineTest(ModuleCase, ShellCase):
                 allow_tgt="sub_minion",
                 minion_tgt=minion,
             )
-        min_ret = self.run_call("mine.get {0} {1}".format(self.tgt, mine_name))
+        min_ret = self.run_call(f"mine.get {self.tgt} {mine_name}")
         sub_ret = self.run_call(
-            "mine.get {0} {1}".format(self.tgt, mine_name),
+            f"mine.get {self.tgt} {mine_name}",
             config_dir=RUNTIME_VARS.TMP_SUB_MINION_CONF_DIR,
         )
 
@@ -81,7 +87,7 @@ class MineTest(ModuleCase, ShellCase):
         # ensure we did not get the mine_name mine function for minion
         assert "            - one" not in min_ret
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_send_allow_tgt_compound(self):
         """
         test mine.send with allow_tgt set
@@ -96,9 +102,9 @@ class MineTest(ModuleCase, ShellCase):
                 allow_tgt_type="compound",
                 minion_tgt=minion,
             )
-        min_ret = self.run_call("mine.get {0} {1}".format(self.tgt, mine_name))
+        min_ret = self.run_call(f"mine.get {self.tgt} {mine_name}")
         sub_ret = self.run_call(
-            "mine.get {0} {1}".format(self.tgt, mine_name),
+            f"mine.get {self.tgt} {mine_name}",
             config_dir=RUNTIME_VARS.TMP_SUB_MINION_CONF_DIR,
         )
 
@@ -106,7 +112,7 @@ class MineTest(ModuleCase, ShellCase):
         for ret in [min_ret, sub_ret]:
             assert "            - one" in ret
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_send_allow_tgt_doesnotexist(self):
         """
         test mine.send with allow_tgt set when
@@ -121,9 +127,9 @@ class MineTest(ModuleCase, ShellCase):
                 allow_tgt="doesnotexist",
                 minion_tgt=minion,
             )
-        min_ret = self.run_call("mine.get {0} {1}".format(self.tgt, mine_name))
+        min_ret = self.run_call(f"mine.get {self.tgt} {mine_name}")
         sub_ret = self.run_call(
-            "mine.get {0} {1}".format(self.tgt, mine_name),
+            f"mine.get {self.tgt} {mine_name}",
             config_dir=RUNTIME_VARS.TMP_SUB_MINION_CONF_DIR,
         )
 
@@ -131,17 +137,25 @@ class MineTest(ModuleCase, ShellCase):
         for ret in [sub_ret, min_ret]:
             assert "            - one" not in ret
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_send(self):
         """
         test mine.send
         """
         self.assertFalse(self.run_function("mine.send", ["foo.__spam_and_cheese"]))
         self.assertTrue(
-            self.run_function("mine.send", ["grains.items"], minion_tgt="minion",)
+            self.run_function(
+                "mine.send",
+                ["grains.items"],
+                minion_tgt="minion",
+            )
         )
         self.assertTrue(
-            self.run_function("mine.send", ["grains.items"], minion_tgt="sub_minion",)
+            self.run_function(
+                "mine.send",
+                ["grains.items"],
+                minion_tgt="sub_minion",
+            )
         )
         ret = self.run_function("mine.get", ["sub_minion", "grains.items"])
         self.assertEqual(ret["sub_minion"]["id"], "sub_minion")
@@ -150,7 +164,7 @@ class MineTest(ModuleCase, ShellCase):
         )
         self.assertEqual(ret["minion"]["id"], "minion")
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_mine_flush(self):
         """
         Test mine.flush
@@ -175,7 +189,7 @@ class MineTest(ModuleCase, ShellCase):
         self.assertEqual(ret_flushed.get("minion", None), None)
         self.assertEqual(ret_flushed["sub_minion"]["id"], "sub_minion")
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_mine_delete(self):
         """
         Test mine.delete
@@ -205,9 +219,8 @@ class MineTest(ModuleCase, ShellCase):
                 continue
 
             self.fail(
-                "'minion' was not found as a key of the 'mine.get' 'grains.items' call. Full return: {}".format(
-                    pprint.pformat(ret_grains)
-                )
+                "'minion' was not found as a key of the 'mine.get' 'grains.items' call."
+                " Full return: {}".format(pprint.pformat(ret_grains))
             )
 
         self.assertEqual(

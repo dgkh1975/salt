@@ -1,6 +1,6 @@
 """
 Various functions to be used by windows during start up and to monkey patch
-missing functions in other modules
+missing functions in other modules.
 """
 
 import ctypes
@@ -11,15 +11,21 @@ from salt.exceptions import CommandExecutionError
 
 try:
     import psutil
-    import pywintypes
     import win32api
     import win32net
     import win32security
-    from win32con import HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG
+    from win32con import HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE
+
+    import pywintypes  # isort:skip
 
     HAS_WIN32 = True
 except ImportError:
-    HAS_WIN32 = False
+    try:
+        import psutil
+        from win32 import pywintypes, win32api, win32net, win32security
+        from win32con import HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE
+    except ImportError:
+        HAS_WIN32 = False
 
 
 # Although utils are often directly imported, it is also possible to use the
@@ -65,6 +71,54 @@ def is_admin(name):
     return False
 
 
+def is_elevated():
+    """
+    Check if the current process is running with elevated privileges (admin)
+
+    Returns:
+        bool: True if elevated, False otherwise
+    """
+    if not HAS_WIN32:
+        return False
+
+    try:
+        h_token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32security.TOKEN_QUERY
+        )
+        return bool(
+            win32security.GetTokenInformation(h_token, win32security.TokenElevation)
+        )
+    except pywintypes.error:
+        return False
+
+
+def is_domain_controller():
+    """
+    Detect whether the current machine is a Windows Domain Controller.
+
+    Reads ``HKLM\\SYSTEM\\CurrentControlSet\\Control\\ProductOptions\\ProductType``
+    directly. A value of ``LanmanNT`` indicates a Domain Controller.
+
+    Returns:
+        bool: ``True`` if the machine is a Domain Controller, ``False``
+        otherwise (including on error).
+    """
+    # Direct registry read is used instead of WMI intentionally: this function
+    # is called on every policy write, and a RegQueryValueEx is sub-millisecond
+    # vs. 100ms+ for a WMI/DCOM round-trip. WMI reads from this key internally.
+    try:
+        import salt.utils.win_reg
+
+        result = salt.utils.win_reg.read_value(
+            hive="HKLM",
+            key=r"SYSTEM\CurrentControlSet\Control\ProductOptions",
+            vname="ProductType",
+        )
+        return result.get("vdata") == "LanmanNT"
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
 def get_user_groups(name, sid=False):
     """
     Get the groups to which a user belongs
@@ -84,14 +138,28 @@ def get_user_groups(name, sid=False):
     else:
         try:
             groups = win32net.NetUserGetLocalGroups(None, name)
-        except win32net.error as exc:
+        except (win32net.error, pywintypes.error) as exc:
             # ERROR_ACCESS_DENIED, NERR_DCNotFound, RPC_S_SERVER_UNAVAILABLE
-            if exc.winerror in (5, 1722, 2453):
+            if exc.winerror in (5, 1722, 2453, 1927, 1355):
                 # Try without LG_INCLUDE_INDIRECT flag, because the user might
                 # not have permissions for it or something is wrong with DC
                 groups = win32net.NetUserGetLocalGroups(None, name, 0)
             else:
-                raise
+                # If this fails, try once more but instead with global groups.
+                try:
+                    groups = win32net.NetUserGetGroups(None, name)
+                except win32net.error as exc:
+                    if exc.winerror in (5, 1722, 2453, 1927, 1355):
+                        # Try without LG_INCLUDE_INDIRECT flag, because the user might
+                        # not have permissions for it or something is wrong with DC
+                        groups = win32net.NetUserGetLocalGroups(None, name, 0)
+                except pywintypes.error:
+                    if exc.winerror in (5, 1722, 2453, 1927, 1355):
+                        # Try with LG_INCLUDE_INDIRECT flag, because the user might
+                        # not have permissions for it or something is wrong with DC
+                        groups = win32net.NetUserGetLocalGroups(None, name, 1)
+                    else:
+                        raise
 
     if not sid:
         return groups
@@ -121,7 +189,7 @@ def get_sid_from_name(name):
     try:
         sid = win32security.LookupAccountName(None, name)[0]
     except pywintypes.error as exc:
-        raise CommandExecutionError("User {} not found: {}".format(name, exc))
+        raise CommandExecutionError(f"User {name} not found: {exc}")
 
     return win32security.ConvertSidToStringSid(sid)
 
@@ -152,7 +220,7 @@ def get_current_user(with_domain=True):
         elif not with_domain:
             user_name = win32api.GetUserName()
     except pywintypes.error as exc:
-        raise CommandExecutionError("Failed to get current user: {}".format(exc))
+        raise CommandExecutionError(f"Failed to get current user: {exc}")
 
     if not user_name:
         return False
@@ -170,11 +238,23 @@ def get_sam_name(username):
 
     .. note:: Long computer names are truncated to 15 characters
     """
+    # Some special identity groups require special handling. They do not have
+    # the domain prepended to the name. They should be added here as they are
+    # discovered. Use the SID to be locale agnostic.
+    # Everyone: S-1-1-0
+    special_id_groups = ["S-1-1-0"]
+
     try:
         sid_obj = win32security.LookupAccountName(None, username)[0]
     except pywintypes.error:
         return "\\".join([platform.node()[:15].upper(), username])
+
+    sid = win32security.ConvertSidToStringSid(sid_obj)
     username, domain, _ = win32security.LookupAccountSid(None, sid_obj)
+
+    if sid in special_id_groups:
+        return username
+
     return "\\".join([domain, username])
 
 
@@ -239,7 +319,7 @@ def escape_for_cmd_exe(arg):
     meta_re = re.compile(
         "(" + "|".join(re.escape(char) for char in list(meta_chars)) + ")"
     )
-    meta_map = {char: "^{}".format(char) for char in meta_chars}
+    meta_map = {char: f"^{char}" for char in meta_chars}
 
     def escape_meta_chars(m):
         char = m.group(1)
@@ -285,7 +365,7 @@ def broadcast_setting_change(message="Environment"):
 
     CLI Example:
 
-    ... code-block:: python
+    .. code-block:: python
 
         import salt.utils.win_functions
         salt.utils.win_functions.broadcast_setting_change('Environment')
@@ -389,3 +469,41 @@ def squid_to_guid(squid):
             guid += squid_match.group(index)[::-1]
         guid += "}"
     return guid
+
+
+def shlex_split(string):
+    """
+    Windows version of shlex.split()
+
+    Based on winshlex: https://github.com/jdjebi/winshlex/blob/master/winshlex/lex.py
+    """
+    re_cmd_lex = r""""((?:""|\\["\\]|[^"])*)"?()|(\\\\(?=\\*")|\\")|(&&?|\|\|?|\d?>|[<])|([^\s"&|<>]+)|(\s+)|(.)"""
+    args = []
+    accu = None  # collects pieces of one arg
+    for qs, qss, esc, pipe, word, white, fail in re.findall(re_cmd_lex, string):
+        if word:
+            pass  # most frequent
+        elif esc:
+            word = esc[1]
+        elif white or pipe:
+            if accu is not None:
+                args.append(accu)
+            if pipe:
+                args.append(pipe)
+            accu = None
+            continue
+        elif fail:
+            raise ValueError("invalid or incomplete shell string")
+        elif qs:
+            word = qs.replace('\\"', '"').replace("\\\\", "\\")
+            if platform == 0:
+                word = word.replace('""', '"')
+        else:
+            word = qss  # may be even empty; must be last
+
+        accu = (accu or "") + word
+
+    if accu is not None:
+        args.append(accu)
+
+    return args

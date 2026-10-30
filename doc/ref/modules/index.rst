@@ -34,7 +34,8 @@ following Salt runners are called:
 
 Note that a module's default name is its filename
 (i.e. ``foo.py`` becomes module ``foo``), but that its name can be overridden
-by using a :ref:`__virtual__ function <virtual-modules>`.
+by using a :ref:`__virtual__ function <virtual-modules>`. For best practices on
+naming module files, see :ref:`module-naming-best-practices`.
 
 If a Salt module has errors and cannot be imported, the Salt minion will continue
 to load without issue and the module with errors will simply be omitted.
@@ -92,7 +93,7 @@ included libraries.
 
 
     def is_ok(person):
-        """ Checks whether a person is really a lumberjack """
+        """Checks whether a person is really a lumberjack"""
         return sleep.all_night(person) and work.all_day(person)
 
 Then, create the zip:
@@ -131,7 +132,7 @@ Once placed in :conf_master:`file_roots`, Salt users can distribute and use
     minion1:
       True
 
-.. _`Python package`: https://docs.python.org/2/tutorial/modules.html#packages
+.. _`Python package`: https://docs.python.org/3/tutorial/modules.html#packages
 
 .. _cross-calling-execution-modules:
 
@@ -309,8 +310,13 @@ be unreliable as not all modules will be available at this point in time. The
 are available however.
 
 .. note::
-    Modules which return a string from ``__virtual__`` that is already used by
-    a module that ships with Salt will _override_ the stock module.
+    A custom module fully overrides a stock module only when the custom
+    module's *filename* matches the stock module's filename (for example, a
+    custom ``_modules/test.py`` overrides the stock ``test`` module). A custom
+    module with a different filename that returns an already-used virtual name
+    from ``__virtual__`` does not replace the stock module; instead, it only
+    adds functions that do not already exist under that virtual name, leaving
+    the stock functions in place.
 
 .. _modules-error-info:
 
@@ -329,6 +335,7 @@ the case when the dependency is unavailable.
     """
     Cheese execution (or returner/beacon/etc.) module
     """
+
     try:
         import enzymes
 
@@ -415,6 +422,8 @@ in the minion config file:
 The above example will force the minion to use the :py:mod:`systemd
 <salt.modules.systemd>` module to provide service management, and the
 :py:mod:`aptpkg <salt.modules.aptpkg>` module to provide package management.
+
+For per-state provider overrides, see documentation on :ref:`state providers <state-providers>`.
 
 .. __: https://github.com/saltstack/salt/issues/new
 
@@ -536,8 +545,6 @@ the module using the following field lists:
 
 .. code-block:: text
 
-    :maintainer:    Thomas Hatch <thatch@saltstack.com, Seth House <shouse@saltstack.com>
-    :maturity:      new
     :depends:       python-mysqldb
     :platform:      all
 

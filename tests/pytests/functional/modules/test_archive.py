@@ -1,6 +1,7 @@
 """
 Tests for the archive state
 """
+
 import os
 import pathlib
 import shutil
@@ -9,6 +10,7 @@ import textwrap
 
 import attr
 import pytest
+
 import salt.utils.files
 import salt.utils.path
 import salt.utils.platform
@@ -44,7 +46,7 @@ class Archive:
 
     @src.default
     def _src(self):
-        return self.path / "{}_src_dir".format(self.fmt)
+        return self.path / f"{self.fmt}_src_dir"
 
     @src_file.default
     def _src_file(self):
@@ -52,11 +54,11 @@ class Archive:
 
     @archive.default
     def _archive(self):
-        return self.path / "archive.{}".format(self.fmt)
+        return self.path / f"archive.{self.fmt}"
 
     @dst.default
     def _dst(self):
-        return self.path / "{}_dst_dir".format(self.fmt)
+        return self.path / f"{self.fmt}_dst_dir"
 
     @filename.default
     def _filename(self):
@@ -149,7 +151,7 @@ def archive(modules):
 
 
 def unicode_filename_ids(value):
-    return "unicode_filename={}".format(value)
+    return f"unicode_filename={value}"
 
 
 @pytest.fixture(params=[True, False], ids=unicode_filename_ids)
@@ -157,6 +159,7 @@ def unicode_filename(request):
     return request.param
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.skip_if_binaries_missing("tar")
 def test_tar_pack(archive, unicode_filename):
     """
@@ -168,6 +171,7 @@ def test_tar_pack(archive, unicode_filename):
         arch.assert_artifacts_in_ret(ret)
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.skip_if_binaries_missing("tar")
 def test_tar_unpack(archive, unicode_filename):
     """
@@ -183,6 +187,7 @@ def test_tar_unpack(archive, unicode_filename):
         arch.assert_artifacts_in_ret(ret)
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.skip_if_binaries_missing("tar")
 def test_tar_list(archive, unicode_filename):
     """
@@ -225,24 +230,42 @@ def test_gunzip(archive, unicode_filename):
 
 
 @pytest.mark.skip_if_binaries_missing("zip")
-def test_cmd_zip(archive, unicode_filename):
+def test_cmd_zip(archive, unicode_filename, grains):
     """
     Validate using the cmd_zip function
     """
     with Archive("zip", unicode_filename=unicode_filename) as arch:
         ret = archive.cmd_zip(str(arch.archive), str(arch.src))
         assert isinstance(ret, list)
+        if (
+            "*** buffer overflow detected ***: terminated" in ret
+            and grains["os"] == "Fedora"
+            and int(grains["osmajorrelease"]) >= 37
+        ):
+            pytest.skip(
+                f"Calling the system zip on {grains['os']} {grains['osmajorrelease']} "
+                "is currently failing with a buffer overflow error"
+            )
         arch.assert_artifacts_in_ret(ret)
 
 
 @pytest.mark.skip_if_binaries_missing("zip", "unzip")
-def test_cmd_unzip(archive, unicode_filename):
+def test_cmd_unzip(archive, unicode_filename, grains):
     """
     Validate using the cmd_unzip function
     """
     with Archive("zip", unicode_filename=unicode_filename) as arch:
         ret = archive.cmd_zip(str(arch.archive), str(arch.src))
         assert isinstance(ret, list)
+        if (
+            "*** buffer overflow detected ***: terminated" in ret
+            and grains["os"] == "Fedora"
+            and int(grains["osmajorrelease"]) >= 37
+        ):
+            pytest.skip(
+                f"Calling the system unzip on {grains['os']} {grains['osmajorrelease']} "
+                "is currently failing with a buffer overflow error"
+            )
         arch.assert_artifacts_in_ret(ret)
 
         ret = archive.cmd_unzip(str(arch.archive), str(arch.dst))
@@ -300,3 +323,111 @@ def test_unrar(archive, unicode_filename):
         ret = archive.unrar(str(arch.archive), str(arch.dst))
         assert isinstance(ret, list)
         arch.assert_artifacts_in_ret(ret)
+
+
+@pytest.mark.skip_on_windows
+@pytest.mark.skip_if_binaries_missing("tar")
+def test_tar_list_no_explicit_top_level_directory_member(archive, tmp_path):
+    rel_path = pathlib.Path("archive_top/second_level/file.txt")
+    srcfile = tmp_path / str(rel_path)
+    srcfile.parent.mkdir(parents=True, exist_ok=True)
+    srcfile.write_text("hey there")
+    archive.tar(
+        "-cvzf",
+        str(tmp_path / "tld_test.tar.gz"),
+        sources=str(rel_path.parent),
+        cwd=str(tmp_path),
+    )
+
+    expected = {
+        "dirs": ["archive_top/second_level/"],
+        "files": ["archive_top/second_level/file.txt"],
+        "links": [],
+        "top_level_dirs": ["archive_top/"],
+        "top_level_files": [],
+        "top_level_links": [],
+    }
+    ret = archive.list(
+        str(tmp_path / "tld_test.tar.gz"), archive_format="tar", verbose=True
+    )
+    assert ret == expected
+
+
+@pytest.mark.skip_on_windows
+@pytest.mark.skip_if_binaries_missing("tar")
+def test_tar_list_with_similar_top_level_dirs(archive, tmp_path):
+    rel_paths = (
+        "archive_top/second_level/file.txt",
+        "archives/second_level/file.txt",
+    )
+
+    for rel_path in rel_paths:
+        srcfile = tmp_path / str(pathlib.Path(rel_path))
+        srcfile.parent.mkdir(parents=True, exist_ok=True)
+        srcfile.write_text("hey there")
+
+    archive.tar(
+        "-cvzf",
+        str(tmp_path / "tld_test.tar.gz"),
+        sources=["archive_top", "archives"],
+        cwd=str(tmp_path),
+    )
+
+    expected = {
+        "dirs": [
+            "archive_top/",
+            "archive_top/second_level/",
+            "archives/",
+            "archives/second_level/",
+        ],
+        "files": [
+            "archive_top/second_level/file.txt",
+            "archives/second_level/file.txt",
+        ],
+        "links": [],
+        "top_level_dirs": ["archive_top/", "archives/"],
+        "top_level_files": [],
+        "top_level_links": [],
+    }
+    ret = archive.list(
+        str(tmp_path / "tld_test.tar.gz"), archive_format="tar", verbose=True
+    )
+    assert ret == expected
+
+
+@pytest.mark.skip_on_windows
+def test_tar_list_no_directory_members_only_files_68227(archive, tmp_path):
+    """
+    Regression test for issue 68227.
+
+    Some tar archives (e.g. Oracle's GraalVM JDK distribution) contain only
+    file members and no explicit directory members, even though all files
+    share a common top-level directory prefix. ``archive.list`` should still
+    report that common prefix as the top-level directory so that
+    ``archive.extracted`` can enforce user/group ownership on it.
+    """
+    import io
+    import tarfile
+
+    archive_path = tmp_path / "no_dir_members.tar.gz"
+    # Build the archive directly with tarfile so we can guarantee that no
+    # directory members are written. ``tar -cvzf`` always emits an entry for
+    # the containing directory.
+    with tarfile.open(str(archive_path), "w:gz") as tar:
+        for rel in ("LICENSE.txt", "GRAALVM-README.md", "bin/java"):
+            data = b"x"
+            info = tarfile.TarInfo(name="graalvm-jdk-21.0.8+12.1/" + rel)
+            info.size = len(data)
+            tar.addfile(info, fileobj=io.BytesIO(data))
+
+    # Sanity-check the archive only has file members
+    with tarfile.open(str(archive_path)) as tar:
+        assert not any(m.isdir() for m in tar.getmembers())
+
+    ret = archive.list(str(archive_path), archive_format="tar", verbose=True)
+    assert ret["dirs"] == []
+    assert "graalvm-jdk-21.0.8+12.1/" in ret["top_level_dirs"], (
+        "Expected the common file prefix to be reported as a top-level "
+        "directory so that archive.extracted can enforce ownership on it; "
+        f"got top_level_dirs={ret['top_level_dirs']!r}"
+    )

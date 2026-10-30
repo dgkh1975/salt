@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Configuration of network interfaces
 ===================================
@@ -128,6 +127,11 @@ Ethernet Interface
         - dns:
           - 8.8.8.8
           - 8.8.4.4
+        - channels:
+            rx: 4
+            tx: 4
+            other: 4
+            combined: 4
 
 Ranged Interfaces (RHEL/CentOS Only)
 ************************************
@@ -431,17 +435,31 @@ are a couple examples:
           - 8.8.8.8
           - 8.8.4.4
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
-# Import Python libs
 import difflib
 import logging
 
 import salt.loader
-
-# Import Salt libs
 import salt.utils.network
 import salt.utils.platform
+
+
+def _diff_lines(value):
+    """
+    Normalize ``value`` into a sequence of strings for ``difflib.unified_diff``.
+
+    The ``ip.*`` execution modules return a list of lines for real
+    interfaces (``_read_temp`` calls ``readlines()``), while the unit-test
+    mocks return plain strings. Python 3.14's ``difflib`` rejects bare
+    strings -- *all* callers must pass a sequence of strings -- so this
+    helper splits strings on newlines and lets lists pass through.
+    """
+    if value is None or value is False:
+        return []
+    if isinstance(value, str):
+        return value.splitlines()
+    return value
+
 
 # Set up logging
 log = logging.getLogger(__name__)
@@ -469,7 +487,7 @@ def managed(name, enabled=True, **kwargs):
     type : eth
         Type of interface and configuration
 
-        .. versionchanged:: Sodium?
+        .. versionchanged:: 3002
 
     enabled
         Designates the state of this interface.
@@ -482,7 +500,7 @@ def managed(name, enabled=True, **kwargs):
         "name": name,
         "changes": {},
         "result": True,
-        "comment": "Interface {0} is up to date.".format(name),
+        "comment": f"Interface {name} is up to date.",
     }
     if "test" not in kwargs:
         kwargs["test"] = __opts__.get("test", False)
@@ -513,21 +531,25 @@ def managed(name, enabled=True, **kwargs):
                 pass
             if not old and new:
                 ret["result"] = None
-                ret["comment"] = "Interface {0} is set to be added.".format(name)
+                ret["comment"] = f"Interface {name} is set to be added."
             elif old != new:
-                diff = difflib.unified_diff(old, new, lineterm="")
+                diff = difflib.unified_diff(
+                    _diff_lines(old), _diff_lines(new), lineterm=""
+                )
                 ret["result"] = None
-                ret["comment"] = "Interface {0} is set to be updated:\n{1}".format(
+                ret["comment"] = "Interface {} is set to be updated:\n{}".format(
                     name, "\n".join(diff)
                 )
         else:
             if not old and new:
-                ret["comment"] = "Interface {0} added.".format(name)
+                ret["comment"] = f"Interface {name} added."
                 ret["changes"]["interface"] = "Added network interface."
                 apply_ranged_setting = True
             elif old != new:
-                diff = difflib.unified_diff(old, new, lineterm="")
-                ret["comment"] = "Interface {0} updated.".format(name)
+                diff = difflib.unified_diff(
+                    _diff_lines(old), _diff_lines(new), lineterm=""
+                )
+                ret["comment"] = f"Interface {name} updated."
                 ret["changes"]["interface"] = "\n".join(diff)
                 apply_ranged_setting = True
     except AttributeError as error:
@@ -548,24 +570,29 @@ def managed(name, enabled=True, **kwargs):
             if kwargs["test"]:
                 if not old and new:
                     ret["result"] = None
-                    ret["comment"] = "Bond interface {0} is set to be added.".format(
+                    ret["comment"] = "Bond interface {} is set to be added.".format(
                         name
                     )
                 elif old != new:
-                    diff = difflib.unified_diff(old, new, lineterm="")
+                    diff = difflib.unified_diff(
+                        _diff_lines(old), _diff_lines(new), lineterm=""
+                    )
                     ret["result"] = None
                     ret["comment"] = (
-                        "Bond interface {0} is set to be "
-                        "updated:\n{1}".format(name, "\n".join(diff))
+                        "Bond interface {} is set to be updated:\n{}".format(
+                            name, "\n".join(diff)
+                        )
                     )
             else:
                 if not old and new:
-                    ret["comment"] = "Bond interface {0} added.".format(name)
-                    ret["changes"]["bond"] = "Added bond {0}.".format(name)
+                    ret["comment"] = f"Bond interface {name} added."
+                    ret["changes"]["bond"] = f"Added bond {name}."
                     apply_ranged_setting = True
                 elif old != new:
-                    diff = difflib.unified_diff(old, new, lineterm="")
-                    ret["comment"] = "Bond interface {0} updated.".format(name)
+                    diff = difflib.unified_diff(
+                        _diff_lines(old), _diff_lines(new), lineterm=""
+                    )
+                    ret["comment"] = f"Bond interface {name} updated."
                     ret["changes"]["bond"] = "\n".join(diff)
                     apply_ranged_setting = True
         except AttributeError as error:
@@ -627,15 +654,15 @@ def managed(name, enabled=True, **kwargs):
                         __salt__["ip.up"](name, iface_type)
                         ret["changes"][
                             "status"
-                        ] = "Interface {0} restart to validate".format(name)
+                        ] = f"Interface {name} restart to validate"
                 else:
                     __salt__["ip.up"](name, iface_type)
-                    ret["changes"]["status"] = "Interface {0} is up".format(name)
+                    ret["changes"]["status"] = f"Interface {name} is up"
         else:
             if "noifupdown" not in kwargs:
                 if interface_status:
                     __salt__["ip.down"](name, iface_type)
-                    ret["changes"]["status"] = "Interface {0} down".format(name)
+                    ret["changes"]["status"] = f"Interface {name} down"
     except Exception as error:  # pylint: disable=broad-except
         ret["result"] = False
         ret["comment"] = str(error)
@@ -647,27 +674,33 @@ def managed(name, enabled=True, **kwargs):
         if "slaves" in kwargs and kwargs["slaves"]:
             # Check that there are new slaves for this master
             present_slaves = __salt__["cmd.run"](
-                ["cat", "/sys/class/net/{0}/bonding/slaves".format(name)]
+                ["cat", f"/sys/class/net/{name}/bonding/slaves"]
             ).split()
-            desired_slaves = kwargs["slaves"].split()
+            if isinstance(kwargs["slaves"], list):
+                desired_slaves = kwargs["slaves"]
+            else:
+                desired_slaves = kwargs["slaves"].split()
             missing_slaves = set(desired_slaves) - set(present_slaves)
 
             # Enslave only slaves missing in master
             if missing_slaves:
-                ifenslave_path = __salt__["cmd.run"](["which", "ifenslave"]).strip()
-                if ifenslave_path:
-                    log.info(
-                        "Adding slaves '%s' to the master %s",
-                        " ".join(missing_slaves),
-                        name,
+                if __grains__["os_family"] != "Suse":
+                    ifenslave_path = __salt__["cmd.run"](["which", "ifenslave"]).strip()
+                    if ifenslave_path:
+                        log.info(
+                            "Adding slaves '%s' to the master %s",
+                            " ".join(missing_slaves),
+                            name,
+                        )
+                        cmd = [ifenslave_path, name] + list(missing_slaves)
+                        __salt__["cmd.run"](cmd, python_shell=False)
+                    else:
+                        log.error("Command 'ifenslave' not found")
+                    ret["changes"]["enslave"] = (
+                        "Added slaves '{}' to master '{}'".format(
+                            " ".join(missing_slaves), name
+                        )
                     )
-                    cmd = [ifenslave_path, name] + list(missing_slaves)
-                    __salt__["cmd.run"](cmd, python_shell=False)
-                else:
-                    log.error("Command 'ifenslave' not found")
-                ret["changes"]["enslave"] = "Added slaves '{0}' to master '{1}'".format(
-                    " ".join(missing_slaves), name
-                )
             else:
                 log.info(
                     "All slaves '%s' are already added to the master %s"
@@ -699,7 +732,7 @@ def routes(name, **kwargs):
         "name": name,
         "changes": {},
         "result": True,
-        "comment": "Interface {0} routes are up to date.".format(name),
+        "comment": f"Interface {name} routes are up to date.",
     }
     apply_routes = False
     if "test" not in kwargs:
@@ -714,28 +747,27 @@ def routes(name, **kwargs):
                 return ret
             if not old and new:
                 ret["result"] = None
-                ret["comment"] = "Interface {0} routes are set to be added.".format(
-                    name
-                )
+                ret["comment"] = f"Interface {name} routes are set to be added."
                 return ret
             elif old != new:
-                diff = difflib.unified_diff(old, new, lineterm="")
+                diff = difflib.unified_diff(
+                    _diff_lines(old), _diff_lines(new), lineterm=""
+                )
                 ret["result"] = None
                 ret["comment"] = (
-                    "Interface {0} routes are set to be "
-                    "updated:\n{1}".format(name, "\n".join(diff))
+                    "Interface {} routes are set to be updated:\n{}".format(
+                        name, "\n".join(diff)
+                    )
                 )
                 return ret
         if not old and new:
             apply_routes = True
-            ret["comment"] = "Interface {0} routes added.".format(name)
-            ret["changes"]["network_routes"] = "Added interface {0} routes.".format(
-                name
-            )
+            ret["comment"] = f"Interface {name} routes added."
+            ret["changes"]["network_routes"] = f"Added interface {name} routes."
         elif old != new:
-            diff = difflib.unified_diff(old, new, lineterm="")
+            diff = difflib.unified_diff(_diff_lines(old), _diff_lines(new), lineterm="")
             apply_routes = True
-            ret["comment"] = "Interface {0} routes updated.".format(name)
+            ret["comment"] = f"Interface {name} routes updated."
             ret["changes"]["network_routes"] = "\n".join(diff)
     except AttributeError as error:
         ret["result"] = False
@@ -785,18 +817,21 @@ def system(name, **kwargs):
                 ret["comment"] = "Global network settings are set to be added."
                 return ret
             elif old != new:
-                diff = difflib.unified_diff(old, new, lineterm="")
+                diff = difflib.unified_diff(
+                    _diff_lines(old), _diff_lines(new), lineterm=""
+                )
                 ret["result"] = None
                 ret["comment"] = (
-                    "Global network settings are set to be "
-                    "updated:\n{0}".format("\n".join(diff))
+                    "Global network settings are set to be updated:\n{}".format(
+                        "\n".join(diff)
+                    )
                 )
                 return ret
         if not old and new:
             apply_net_settings = True
             ret["changes"]["network_settings"] = "Added global network settings."
         elif old != new:
-            diff = difflib.unified_diff(old, new, lineterm="")
+            diff = difflib.unified_diff(_diff_lines(old), _diff_lines(new), lineterm="")
             apply_net_settings = True
             ret["changes"]["network_settings"] = "\n".join(diff)
     except AttributeError as error:

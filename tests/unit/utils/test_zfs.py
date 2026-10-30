@@ -9,9 +9,9 @@ Tests for the zfs utils library
 .. versionadded:: 2018.3.1
 """
 
+from collections import OrderedDict
 
 import salt.utils.zfs as zfs
-from salt.utils.odict import OrderedDict
 from tests.support.mock import MagicMock, patch
 from tests.support.unit import TestCase
 from tests.support.zfs import ZFSMockData
@@ -717,7 +717,8 @@ class ZfsUtilsTestCase(TestCase):
                                 filesystem_properties=my_props,
                                 target="mypool/dataset",
                             ),
-                            "/sbin/zfs create -p -o compression=lz4 -o quota=1073741824 mypool/dataset",
+                            "/sbin/zfs create -p -o compression=lz4 -o quota=1073741824"
+                            " mypool/dataset",
                         )
 
     def test_zfs_command_fs_props_with_space(self):
@@ -744,7 +745,8 @@ class ZfsUtilsTestCase(TestCase):
                                 filesystem_properties=my_props,
                                 target="my pool/jorge's dataset",
                             ),
-                            '/sbin/zfs create -o compression=lz4 -o quota=4404019 "my pool/jorge\'s dataset"',
+                            '/sbin/zfs create -o compression=lz4 -o quota=4404019 "my'
+                            " pool/jorge's dataset\"",
                         )
 
     # NOTE: testing zpool_command
@@ -879,7 +881,8 @@ class ZfsUtilsTestCase(TestCase):
                                 filesystem_properties=fs_props,
                                 target="my pool",
                             ),
-                            '/sbin/zpool create -O quota=107374182400 -o comment="jorge\'s comment has a space" "my pool"',
+                            "/sbin/zpool create -O quota=107374182400 -o"
+                            ' comment="jorge\'s comment has a space" "my pool"',
                         )
 
     def test_zpool_command_property(self):
@@ -969,7 +972,8 @@ class ZfsUtilsTestCase(TestCase):
                         res["stderr"] = ""
                         res["stdout"] = ""
                         self.assertEqual(
-                            zfs.parse_command_result(res), OrderedDict(),
+                            zfs.parse_command_result(res),
+                            OrderedDict(),
                         )
 
     def test_parse_command_result_fail(self):
@@ -1014,7 +1018,8 @@ class ZfsUtilsTestCase(TestCase):
                         res["stderr"] = ""
                         res["stdout"] = ""
                         self.assertEqual(
-                            zfs.parse_command_result(res), OrderedDict(),
+                            zfs.parse_command_result(res),
+                            OrderedDict(),
                         )
 
     def test_parse_command_result_fail_message(self):

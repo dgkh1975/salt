@@ -1,24 +1,15 @@
-# -*- coding: utf-8 -*-
 """
 URL utils
 """
 
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
 import re
 import sys
+from urllib.parse import quote, urlparse, urlunparse, urlunsplit
 
 import salt.utils.data
 import salt.utils.path
 import salt.utils.platform
 import salt.utils.versions
-
-# Import salt libs
-from salt.ext.six.moves.urllib.parse import (  # pylint: disable=import-error,no-name-in-module
-    urlparse,
-    urlunparse,
-)
 
 
 def parse(url):
@@ -39,6 +30,13 @@ def parse(url):
     else:
         path, saltenv = resource, None
 
+    # Treat an empty authority (``salt:///foo``) the same as ``salt://foo``.
+    # Per RFC 3986 ``scheme:///path`` is a valid form, and historically Salt
+    # accepted it; without this normalization the surplus leading slashes
+    # propagate to the master fileserver which rejects absolute paths in
+    # ``find_file`` (CVE-2024-22231 / CVE-2024-22232 hardening).
+    path = path.lstrip("/")
+
     if salt.utils.platform.is_windows():
         path = salt.utils.path.sanitize_win_path(path)
 
@@ -49,13 +47,12 @@ def create(path, saltenv=None):
     """
     join `path` and `saltenv` into a 'salt://' URL.
     """
+    path = path.replace("\\", "/")
     if salt.utils.platform.is_windows():
         path = salt.utils.path.sanitize_win_path(path)
     path = salt.utils.data.decode(path)
-
-    query = "saltenv={0}".format(saltenv) if saltenv else ""
-    url = salt.utils.data.decode(urlunparse(("file", "", path, "", query, "")))
-    return "salt://{0}".format(url[len("file:///") :])
+    query = f"saltenv={saltenv}" if saltenv else ""
+    return f'salt://{salt.utils.data.decode(urlunsplit(("", "", path, query, "")))}'
 
 
 def is_escaped(url):
@@ -87,13 +84,13 @@ def escape(url):
         if url.startswith("|"):
             return url
         else:
-            return "|{0}".format(url)
+            return f"|{url}"
     elif scheme == "salt":
         path, saltenv = parse(url)
         if path.startswith("|"):
             return create(path, saltenv)
         else:
-            return create("|{0}".format(path), saltenv)
+            return create(f"|{path}", saltenv)
     else:
         return url
 
@@ -164,12 +161,16 @@ def add_http_basic_auth(url, user=None, password=None, https_only=False):
         urltuple = urlparse(url)
         if https_only and urltuple.scheme != "https":
             raise ValueError("Basic Auth only supported for HTTPS")
+        # Percent-encode the userinfo so reserved characters (e.g. "/", "@",
+        # ":") in the user or password do not corrupt the resulting URL.
         if password is None:
-            netloc = "{0}@{1}".format(user, urltuple.netloc)
+            netloc = f"{quote(user, safe='')}@{urltuple.netloc}"
             urltuple = urltuple._replace(netloc=netloc)
             return urlunparse(urltuple)
         else:
-            netloc = "{0}:{1}@{2}".format(user, password, urltuple.netloc)
+            netloc = (
+                f"{quote(user, safe='')}:{quote(password, safe='')}@{urltuple.netloc}"
+            )
             urltuple = urltuple._replace(netloc=netloc)
             return urlunparse(urltuple)
 

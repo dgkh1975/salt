@@ -7,8 +7,11 @@ Salt Table of Contents
 .. toctree::
     :maxdepth: 2
 
+    topics/about_salt_project
     topics/index
     topics/salt_system_architecture
+    topics/contributing-guide
+    topics/maintenance-policy
     topics/installation/index
     topics/configuration/index
     topics/using_salt
@@ -17,14 +20,18 @@ Salt Table of Contents
     topics/return_codes/index
     topics/utils/index
     topics/event/index
+    topics/tracing/index
+    topics/metrics/index
     topics/orchestrate/index
     topics/solaris/index
     topics/ssh/index
     topics/thorium/index
     topics/cloud/index
     topics/proxyminion/index
+    topics/resources/index
     topics/network_automation/index
     topics/virt/index
+    topics/packaging/index
     ref/cli/index
     ref/pillar/index
     ref/tops/index
@@ -32,6 +39,7 @@ Salt Table of Contents
     topics/api
     topics/topology/index
     topics/cache/index
+    topics/performance/index
     topics/slots/index
     topics/windows/index
     topics/development/index

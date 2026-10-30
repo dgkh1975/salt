@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Oracle DataBase connection module
 
@@ -32,12 +31,10 @@ Oracle DataBase connection module
             <db>:
               uri: .....
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
 import os
 
-from salt.ext import six
 from salt.utils.decorators import depends
 
 log = logging.getLogger(__name__)
@@ -62,7 +59,7 @@ def __virtual__():
         return __virtualname__
     return (
         False,
-        "The oracle execution module not loaded: python oracle library not found.",
+        "oracle execution module not loaded: python oracle library not found.",
     )
 
 
@@ -85,7 +82,7 @@ def _unicode_output(cursor, name, default_type, size, precision, scale):
         cx_Oracle.FIXED_CHAR,
         cx_Oracle.CLOB,
     ):
-        return cursor.var(six.text_type, size, cursor.arraysize)
+        return cursor.var(str, size, cursor.arraysize)
 
 
 def _connect(uri):
@@ -162,7 +159,9 @@ def show_dbs(*dbs):
         log.debug("get dbs from pillar: %s", dbs)
         result = {}
         for db in dbs:
-            result[db] = __salt__["pillar.get"]("oracle:dbs:" + db)
+            # run_query() connects with the uri from this data, so the
+            # credentials must not be masked
+            result[db] = __salt__["pillar.get"]("oracle:dbs:" + db, unmask=True)
         return result
     else:
         pillar_dbs = __salt__["pillar.get"]("oracle:dbs")
@@ -183,9 +182,12 @@ def version(*dbs):
         salt '*' oracle.version my_db
     """
     pillar_dbs = __salt__["pillar.get"]("oracle:dbs")
-    get_version = lambda x: [
-        r[0] for r in run_query(x, "select banner from v$version order by banner")
-    ]
+
+    def get_version(x):
+        return [
+            r[0] for r in run_query(x, "select banner from v$version order by banner")
+        ]
+
     result = {}
     if dbs:
         log.debug("get db versions for: %s", dbs)
@@ -210,7 +212,7 @@ def client_version():
 
         salt '*' oracle.client_version
     """
-    return ".".join((six.text_type(x) for x in cx_Oracle.clientversion()))
+    return ".".join(str(x) for x in cx_Oracle.clientversion())
 
 
 def show_pillar(item=None):

@@ -3,16 +3,17 @@ Module for returning various status data about a minion.
 These data can be useful for compiling into stats later.
 """
 
-
 import collections
 import copy
 import datetime
 import fnmatch
+import itertools
 import logging
 import os
 import re
 import time
 
+import salt.channel
 import salt.config
 import salt.minion
 import salt.utils.event
@@ -21,13 +22,12 @@ import salt.utils.network
 import salt.utils.path
 import salt.utils.platform
 import salt.utils.stringutils
+import salt.utils.timeutil
 from salt.exceptions import CommandExecutionError
-from salt.ext.six.moves import range, zip
 
 log = logging.getLogger(__file__)
 
 __virtualname__ = "status"
-__opts__ = {}
 
 # Don't shadow built-in's.
 __func_alias__ = {"time_": "time"}
@@ -70,21 +70,21 @@ def _get_boot_time_aix():
     case $t in *-*) d=${t%%-*}; t=${t#*-};; esac
     case $t in *:*:*) h=${t%%:*}; t=${t#*:};; esac
     s=$((d*86400 + h*3600 + ${t%%:*}*60 + ${t#*:}))
-
-    t is 7-20:46:46
     """
-    boot_secs = 0
     res = __salt__["cmd.run_all"]("ps -o etime= -p 1")
     if res["retcode"] > 0:
         raise CommandExecutionError("Unable to find boot_time for pid 1.")
     bt_time = res["stdout"]
-    days = bt_time.split("-")
-    hms = days[1].split(":")
+    match = re.match(r"\s*(?:(\d+)-)?(?:(\d\d):)?(\d\d):(\d\d)\s*", bt_time)
+    if not match:
+        raise CommandExecutionError("Unexpected time format.")
+
+    groups = match.groups(default="00")
     boot_secs = (
-        _number(days[0]) * 86400
-        + _number(hms[0]) * 3600
-        + _number(hms[1]) * 60
-        + _number(hms[2])
+        _number(groups[0]) * 86400
+        + _number(groups[1]) * 3600
+        + _number(groups[2]) * 60
+        + _number(groups[3])
     )
     return boot_secs
 
@@ -178,11 +178,19 @@ def custom():
     ret = {}
     conf = __salt__["config.dot_vals"]("status")
     for key, val in conf.items():
-        func = "{}()".format(key.split(".")[1])
-        vals = eval(func)  # pylint: disable=W0123
-
-        for item in val:
-            ret[item] = vals[item]
+        func = ".".join(key.split(".")[:-1])
+        vals = {}
+        if func != "status.custom":
+            try:
+                vals = __salt__[func]()
+                for item in val:
+                    try:
+                        ret[item] = vals[item]
+                    except KeyError:
+                        log.warning("val %s not in return of %s", item, func)
+                        ret[item] = "UNKNOWN"
+            except KeyError:
+                log.warning("custom status %s isn't loaded", func)
 
     return ret
 
@@ -214,9 +222,7 @@ def uptime():
     if salt.utils.platform.is_linux():
         ut_path = "/proc/uptime"
         if not os.path.exists(ut_path):
-            raise CommandExecutionError(
-                "File {ut_path} was not found.".format(ut_path=ut_path)
-            )
+            raise CommandExecutionError(f"File {ut_path} was not found.")
         with salt.utils.files.fopen(ut_path) as rfh:
             seconds = int(float(rfh.read().split()[0]))
     elif salt.utils.platform.is_sunos():
@@ -238,7 +244,10 @@ def uptime():
             raise CommandExecutionError("Cannot find kern.boottime system parameter")
         data = bt_data.split("{")[-1].split("}")[0].strip().replace(" ", "")
         uptime = {
-            k: int(v,) for k, v in [p.strip().split("=") for p in data.split(",")]
+            k: int(
+                v,
+            )
+            for k, v in [p.strip().split("=") for p in data.split(",")]
         }
         seconds = int(curr_seconds - uptime["sec"])
     elif salt.utils.platform.is_aix():
@@ -247,8 +256,8 @@ def uptime():
         return __salt__["cmd.run"]("uptime")
 
     # Setup datetime and timedelta objects
-    boot_time = datetime.datetime.utcfromtimestamp(curr_seconds - seconds)
-    curr_time = datetime.datetime.utcfromtimestamp(curr_seconds)
+    boot_time = salt.utils.timeutil.utcfromtimestamp(curr_seconds - seconds)
+    curr_time = salt.utils.timeutil.utcfromtimestamp(curr_seconds)
     up_time = curr_time - boot_time
 
     # Construct return information
@@ -257,7 +266,7 @@ def uptime():
         "since_iso": boot_time.isoformat(),
         "since_t": int(curr_seconds - seconds),
         "days": up_time.days,
-        "time": "{}:{}".format(up_time.seconds // 3600, up_time.seconds % 3600 // 60),
+        "time": f"{up_time.seconds // 3600}:{up_time.seconds % 3600 // 60}",
     }
 
     if salt.utils.path.which("who"):
@@ -408,8 +417,8 @@ def cpustats():
                 ret["mpstat"].append({})
                 ret["mpstat"][procn]["system"] = {}
                 cpu_comps = comps[1].split()
-                for i in range(0, len(cpu_comps)):
-                    cpu_vals = cpu_comps[i].split("=")
+                for comp in cpu_comps:
+                    cpu_vals = comp.split("=")
                     ret["mpstat"][procn]["system"][cpu_vals[0]] = cpu_vals[1]
 
             if line.startswith("cpu"):
@@ -550,20 +559,20 @@ def meminfo():
                 ret["svmon"].append({})
                 comps = line.split()
                 ret["svmon"][procn][comps[0]] = {}
-                for i in range(0, len(fields)):
-                    if len(comps) > i + 1:
-                        ret["svmon"][procn][comps[0]][fields[i]] = comps[i + 1]
+                for idx, field in enumerate(fields):
+                    if len(comps) > idx + 1:
+                        ret["svmon"][procn][comps[0]][field] = comps[idx + 1]
                 continue
 
             if line.startswith("pg space") or line.startswith("in use"):
                 procn = len(ret["svmon"])
                 ret["svmon"].append({})
                 comps = line.split()
-                pg_space = "{} {}".format(comps[0], comps[1])
+                pg_space = f"{comps[0]} {comps[1]}"
                 ret["svmon"][procn][pg_space] = {}
-                for i in range(0, len(fields)):
-                    if len(comps) > i + 2:
-                        ret["svmon"][procn][pg_space][fields[i]] = comps[i + 2]
+                for idx, field in enumerate(fields):
+                    if len(comps) > idx + 2:
+                        ret["svmon"][procn][pg_space][field] = comps[idx + 2]
                 continue
 
             if line.startswith("PageSize"):
@@ -576,9 +585,9 @@ def meminfo():
                 ret["svmon"].append({})
                 comps = line.split()
                 ret["svmon"][procn][comps[0]] = {}
-                for i in range(0, len(fields)):
-                    if len(comps) > i:
-                        ret["svmon"][procn][comps[0]][fields[i]] = comps[i]
+                for idx, field in enumerate(fields):
+                    if len(comps) > idx:
+                        ret["svmon"][procn][comps[0]][field] = comps[idx]
                 continue
 
         for line in __salt__["cmd.run"]("vmstat -v").splitlines():
@@ -750,7 +759,7 @@ def cpuinfo():
                 ret["psrinfo"][procn]["family"] = _number(line[4])
                 ret["psrinfo"][procn]["model"] = _number(line[6])
                 ret["psrinfo"][procn]["step"] = _number(line[8])
-                ret["psrinfo"][procn]["clock"] = "{} {}".format(line[10], line[11][:-1])
+                ret["psrinfo"][procn]["clock"] = f"{line[10]} {line[11][:-1]}"
         return ret
 
     def aix_cpuinfo():
@@ -955,9 +964,9 @@ def diskstats():
                 ret[disk_name][procn][disk_mode] = {}
             else:
                 comps = line.split()
-                for i in range(0, len(fields)):
-                    if len(comps) > i:
-                        ret[disk_name][procn][disk_mode][fields[i]] = comps[i]
+                for idx, field in enumerate(fields):
+                    if len(comps) > idx:
+                        ret[disk_name][procn][disk_mode][field] = comps[idx]
 
         return ret
 
@@ -1042,11 +1051,16 @@ def diskusage(*args):
     # query the filesystems disk usage
     ret = {}
     for path in selected:
-        fsstats = os.statvfs(path)
-        blksz = fsstats.f_bsize
-        available = fsstats.f_bavail * blksz
-        total = fsstats.f_blocks * blksz
-        ret[path] = {"available": available, "total": total}
+        if os.path.exists(path):
+            try:
+                fsstats = os.statvfs(path)
+                blksz = fsstats.f_bsize
+                available = fsstats.f_bavail * blksz
+                total = fsstats.f_blocks * blksz
+                ret[path] = {"available": available, "total": total}
+            except OSError as exc:
+                log.warning("Cannot get stats from '%s': %s", path, exc)
+                ret[path] = {"available": None, "total": None}
     return ret
 
 
@@ -1351,7 +1365,10 @@ def netdev():
         """
         freebsd specific implementation of netdev
         """
-        _dict_tree = lambda: collections.defaultdict(_dict_tree)
+
+        def _dict_tree():
+            return collections.defaultdict(_dict_tree)
+
         ret = _dict_tree()
         netstat = __salt__["cmd.run"]("netstat -i -n -4 -b -d").splitlines()
         netstat += __salt__["cmd.run"]("netstat -i -n -6 -b -d").splitlines()[1:]
@@ -1368,13 +1385,15 @@ def netdev():
         """
         ret = {}
         ##NOTE: we cannot use hwaddr_interfaces here, so we grab both ip4 and ip6
-        for dev in __grains__["ip4_interfaces"].keys() + __grains__["ip6_interfaces"]:
+        for dev in itertools.chain(
+            __grains__["ip4_interfaces"].keys(), __grains__["ip6_interfaces"].keys()
+        ):
             # fetch device info
             netstat_ipv4 = __salt__["cmd.run"](
-                "netstat -i -I {dev} -n -f inet".format(dev=dev)
+                f"netstat -i -I {dev} -n -f inet"
             ).splitlines()
             netstat_ipv6 = __salt__["cmd.run"](
-                "netstat -i -I {dev} -n -f inet6".format(dev=dev)
+                f"netstat -i -I {dev} -n -f inet6"
             ).splitlines()
 
             # prepare data
@@ -1385,24 +1404,20 @@ def netdev():
 
             # add data
             ret[dev] = {}
-            for i in range(len(netstat_ipv4[0]) - 1):
-                if netstat_ipv4[0][i] == "Name":
+            for val in netstat_ipv4[0][:-1]:
+                if val == "Name":
                     continue
-                if netstat_ipv4[0][i] in ["Address", "Net/Dest"]:
-                    ret[dev][
-                        "IPv4 {field}".format(field=netstat_ipv4[0][i])
-                    ] = netstat_ipv4[1][i]
+                if val in ["Address", "Net/Dest"]:
+                    ret[dev][f"IPv4 {val}"] = val
                 else:
-                    ret[dev][netstat_ipv4[0][i]] = _number(netstat_ipv4[1][i])
-            for i in range(len(netstat_ipv6[0]) - 1):
-                if netstat_ipv6[0][i] == "Name":
+                    ret[dev][val] = _number(val)
+            for val in netstat_ipv6[0][:-1]:
+                if val == "Name":
                     continue
-                if netstat_ipv6[0][i] in ["Address", "Net/Dest"]:
-                    ret[dev][
-                        "IPv6 {field}".format(field=netstat_ipv6[0][i])
-                    ] = netstat_ipv6[1][i]
+                if val in ["Address", "Net/Dest"]:
+                    ret[dev][f"IPv6 {val}"] = val
                 else:
-                    ret[dev][netstat_ipv6[0][i]] = _number(netstat_ipv6[1][i])
+                    ret[dev][val] = _number(val)
 
         return ret
 
@@ -1413,23 +1428,23 @@ def netdev():
         ret = {}
         fields = []
         procn = None
-        for dev in (
-            __grains__["ip4_interfaces"].keys() + __grains__["ip6_interfaces"].keys()
+        for dev in itertools.chain(
+            __grains__["ip4_interfaces"].keys(), __grains__["ip6_interfaces"].keys()
         ):
             # fetch device info
-            # root@la68pp002_pub:/opt/salt/lib/python2.7/site-packages/salt/modules# netstat -i -n -I en0 -f inet6
+            # root@la68pp002_pub:# netstat -i -n -I en0 -f inet
             # Name  Mtu   Network     Address            Ipkts Ierrs    Opkts Oerrs  Coll
             # en0   1500  link#3      e2.eb.32.42.84.c 10029668     0   446490     0     0
             # en0   1500  172.29.128  172.29.149.95    10029668     0   446490     0     0
-            # root@la68pp002_pub:/opt/salt/lib/python2.7/site-packages/salt/modules# netstat -i -n -I en0 -f inet6
+            # root@la68pp002_pub:# netstat -i -n -I en0 -f inet6
             # Name  Mtu   Network     Address            Ipkts Ierrs    Opkts Oerrs  Coll
             # en0   1500  link#3      e2.eb.32.42.84.c 10029731     0   446499     0     0
 
             netstat_ipv4 = __salt__["cmd.run"](
-                "netstat -i -n -I {dev} -f inet".format(dev=dev)
+                f"netstat -i -n -I {dev} -f inet"
             ).splitlines()
             netstat_ipv6 = __salt__["cmd.run"](
-                "netstat -i -n -I {dev} -f inet6".format(dev=dev)
+                f"netstat -i -n -I {dev} -f inet6"
             ).splitlines()
 
             # add data
@@ -1748,7 +1763,7 @@ def ping_master(master):
     load = {"cmd": "ping"}
 
     result = False
-    with salt.transport.client.ReqChannel.factory(opts, crypt="clear") as channel:
+    with salt.channel.client.ReqChannel.factory(opts, crypt="clear") as channel:
         try:
             payload = channel.send(load, tries=0, timeout=timeout)
             result = True
@@ -1778,6 +1793,8 @@ def proxy_reconnect(proxy_name, opts=None):
 
     CLI Example:
 
+    .. code-block:: bash
+
         salt '*' status.proxy_reconnect rest_sample
     """
 
@@ -1791,15 +1808,16 @@ def proxy_reconnect(proxy_name, opts=None):
     if proxy_keepalive_fn not in __proxy__:
         return False  # fail
 
-    if __proxy__[proxy_name + ".get_reboot_active"]():
+    chk_reboot_active_key = proxy_name + ".get_reboot_active"
+    if chk_reboot_active_key in __proxy__ and __proxy__[chk_reboot_active_key]():
         # if rebooting or shutting down, don't run proxy_reconnect
         # it interferes with the connection and disrupts the shutdown/reboot
         # especially
         minion_id = opts.get("proxyid", "") or opts.get("id", "")
         log.info(
-            "{} ({} proxy) is rebooting or shutting down. Don't probe connection.".format(
-                minion_id, proxy_name
-            )
+            "%s (%s proxy) is rebooting or shutting down. Don't probe connection.",
+            minion_id,
+            proxy_name,
         )
         return True
 

@@ -1,21 +1,23 @@
-# -*- coding: utf-8 -*-
 """
 Modules used to control the master itself
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
+import logging
 from collections.abc import Mapping
 
+import salt.channel.client
 import salt.client.mixins
 import salt.config
 import salt.loader
-import salt.transport.client
 import salt.utils.error
-import salt.utils.zeromq
+import salt.utils.network
+import salt.utils.resource_warnings
+
+log = logging.getLogger(__name__)
 
 
 class WheelClient(
-    salt.client.mixins.SyncClientMixin, salt.client.mixins.AsyncClientMixin, object
+    salt.client.mixins.SyncClientMixin, salt.client.mixins.AsyncClientMixin
 ):
     """
     An interface to Salt's wheel modules
@@ -41,10 +43,65 @@ class WheelClient(
     client = "wheel"
     tag_prefix = "wheel"
 
-    def __init__(self, opts=None):
+    def __init__(self, opts, context=None):
+        salt.client.mixins.SyncClientMixin.__init__(self, opts, context=context)
+        salt.client.mixins.AsyncClientMixin.__init__(self, opts, context=context)
         self.opts = opts
-        self.context = {}
+        self.context = context or {}
+        self.event = None
+        self.salt_user = salt.utils.user.get_specific_user()
+        self.event = salt.utils.event.get_event(
+            "master", self.opts["sock_dir"], opts=self.opts, listen=False
+        )
         self.functions = salt.loader.wheels(opts, context=self.context)
+
+    def destroy(self):
+        if self.event is not None:
+            self.event.destroy()
+            self.event = None
+        if hasattr(self, "functions") and self.functions is not None:
+            if hasattr(self.functions, "destroy"):
+                self.functions.destroy()
+            self.functions = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.destroy()
+
+    # pylint: disable=W1701
+    def __del__(self):
+        # LTS safety-net: keep the pre-``0c3f53d9172`` GC-time
+        # ``destroy()`` fallback so callers that never wrapped the
+        # client in a context manager do not silently leak the
+        # underlying event socket, but also emit a
+        # ``warn_until_close`` so the missing-``destroy()`` shows up in
+        # normal Salt logs (Python filters ``ResourceWarning`` by
+        # default).  The companion change on ``master`` drops the
+        # fallback and requires callers to be explicit.
+        try:
+            unclosed = getattr(self, "event", None) is not None
+        except Exception:  # pylint: disable=broad-except
+            return
+        if not unclosed:
+            return
+        try:
+            salt.utils.resource_warnings.warn_until_close(
+                f"unclosed {type(self).__name__} {self!r}; call "
+                f"``destroy()`` or use as a context manager",
+                source=self,
+                log=log,
+            )
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            self.destroy()
+        except Exception:  # pylint: disable=broad-except
+            # Finalizer must never raise.
+            pass
+
+    # pylint: enable=W1701
 
     # TODO: remove/deprecate
     def call_func(self, fun, **kwargs):
@@ -69,10 +126,13 @@ class WheelClient(
         interface = self.opts["interface"]
         if interface == "0.0.0.0":
             interface = "127.0.0.1"
+        if interface == "::":
+            interface = "::1"
         master_uri = "tcp://{}:{}".format(
-            salt.utils.zeromq.ip_bracket(interface), str(self.opts["ret_port"]),
+            salt.utils.network.ip_bracket(interface),
+            str(self.opts["ret_port"]),
         )
-        with salt.transport.client.ReqChannel.factory(
+        with salt.channel.client.ReqChannel.factory(
             self.opts, crypt="clear", master_uri=master_uri, usage="master_call"
         ) as channel:
             ret = channel.send(load)
@@ -123,8 +183,8 @@ class WheelClient(
             })
             {'jid': '20131219224744416681', 'tag': 'salt/wheel/20131219224744416681'}
         """
-        fun = low.pop("fun")
-        return self.asynchronous(fun, low)
+        fun = low.get("fun")
+        return self.asynchronous(fun, low, local=False)
 
     def cmd(
         self,
@@ -143,9 +203,7 @@ class WheelClient(
             >>> wheel.cmd('key.finger', ['jerry'])
             {'minions': {'jerry': '5d:f6:79:43:5e:d4:42:3f:57:b8:45:a8:7e:a4:6e:ca'}}
         """
-        return super(WheelClient, self).cmd(
-            fun, arg, pub_data, kwarg, print_event, full_return
-        )
+        return super().cmd(fun, arg, pub_data, kwarg, print_event, full_return)
 
 
 Wheel = WheelClient  # for backward-compat

@@ -1,9 +1,12 @@
 """
 Send events covering service status
 """
+
 import logging
 import os
 import time
+
+import salt.utils.beacons
 
 log = logging.getLogger(__name__)
 
@@ -18,22 +21,25 @@ def validate(config):
     """
     # Configuration for service beacon should be a list of dicts
     if not isinstance(config, list):
-        return False, ("Configuration for service beacon must be a list.")
+        return False, "Configuration for service beacon must be a list."
     else:
-        _config = {}
-        list(map(_config.update, config))
+        config = salt.utils.beacons.list_to_dict(config)
 
-        if "services" not in _config:
-            return False, ("Configuration for service beacon requires services.")
+        if "services" not in config:
+            return False, "Configuration for service beacon requires services."
         else:
-            for config_item in _config["services"]:
-                if not isinstance(_config["services"][config_item], dict):
+            if not isinstance(config["services"], dict):
+                return (
+                    False,
+                    "Services configuration item for service beacon must "
+                    "be a dictionary.",
+                )
+            for config_item in config["services"]:
+                if not isinstance(config["services"][config_item], dict):
                     return (
                         False,
-                        (
-                            "Configuration for service beacon must "
-                            "be a list of dictionaries."
-                        ),
+                        "Configuration for service beacon must "
+                        "be a list of dictionaries.",
                     )
 
     return True, "Valid beacon configuration"
@@ -70,6 +76,12 @@ def beacon(config):
     event when the minion is reload. Applicable only when `onchangeonly` is True.
     The default is True.
 
+    `is_running_state`: This boolean parameter controls when the beacon will
+    fire based on the service's running state. If `is_running_state` is set to
+    `True`, the beacon will fire only when the service is running. If
+    `is_running_state` is set to `False`, the beacon will fire only when the
+    service is not running.
+
     `uncleanshutdown`: If `uncleanshutdown` is present it should point to the
     location of a pid file for the service.  Most services will not clean up
     this pid file if they are shutdown uncleanly (e.g. via `kill -9`) or if they
@@ -101,13 +113,12 @@ def beacon(config):
                   uncleanshutdown: /run/nginx.pid
     """
     ret = []
-    _config = {}
-    list(map(_config.update, config))
+    config = salt.utils.beacons.list_to_dict(config)
 
-    for service in _config.get("services", {}):
+    for service in config.get("services", {}):
         ret_dict = {}
 
-        service_config = _config["services"][service]
+        service_config = config["services"][service]
 
         ret_dict[service] = {"running": __salt__["service.status"](service)}
         ret_dict["service_name"] = service
@@ -136,13 +147,22 @@ def beacon(config):
             ret_dict[service]["uncleanshutdown"] = (
                 True if os.path.exists(filename) else False
             )
+
+        # If is_running_state does not match the current running state, skip it
+        if (
+            "is_running_state" in service_config
+            and isinstance(service_config["is_running_state"], bool)
+            and service_config["is_running_state"] != ret_dict[service]["running"]
+        ):
+            continue
+
         if "onchangeonly" in service_config and service_config["onchangeonly"] is True:
             if service not in LAST_STATUS:
                 LAST_STATUS[service] = ret_dict[service]
+                if not service_config["emitatstartup"]:
+                    continue
                 if service_config["delay"] > 0:
                     LAST_STATUS[service]["time"] = currtime
-                elif not service_config["emitatstartup"]:
-                    continue
                 else:
                     ret.append(ret_dict)
 

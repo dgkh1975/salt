@@ -17,8 +17,10 @@ import os.path
 import shutil
 import tempfile
 
+import salt.payload
 import salt.utils.atomicfile
 import salt.utils.files
+import salt.utils.path
 from salt.exceptions import SaltCacheError
 
 log = logging.getLogger(__name__)
@@ -44,27 +46,55 @@ def store(bank, key, data, cachedir):
     """
     Store information in a file.
     """
-    base = os.path.join(cachedir, os.path.normpath(bank))
+    base = salt.utils.path.join(cachedir, os.path.normpath(bank))
     try:
         os.makedirs(base)
     except OSError as exc:
         if exc.errno != errno.EEXIST:
             raise SaltCacheError(
-                "The cache directory, {}, could not be created: {}".format(base, exc)
+                f"The cache directory, {base}, could not be created: {exc}"
             )
 
-    outfile = os.path.join(base, "{}.p".format(key))
+    outfile = salt.utils.path.join(base, f"{key}.p")
+    # A ``key`` may legitimately contain path separators (e.g. the pillar
+    # cache uses ``<minion_id>:<pillarenv>`` as its key, and ``pillarenv``
+    # may itself contain ``/`` when pillar_roots use hierarchical names).
+    # In that case ``outfile`` lands in a subdirectory that may not exist
+    # yet -- create it so the atomic rename below can succeed. See
+    # issue #69741.
+    outdir = os.path.dirname(outfile)
+    if outdir and outdir != base:
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except OSError as exc:
+            raise SaltCacheError(
+                f"The cache directory, {outdir}, could not be created: {exc}"
+            )
+
     tmpfh, tmpfname = tempfile.mkstemp(dir=base)
     os.close(tmpfh)
     try:
         with salt.utils.files.fopen(tmpfname, "w+b") as fh_:
-            __context__["serial"].dump(data, fh_)
+            salt.payload.dump(data, fh_)
         # On Windows, os.rename will fail if the destination file exists.
         salt.utils.atomicfile.atomic_rename(tmpfname, outfile)
     except OSError as exc:
         raise SaltCacheError(
-            "There was an error writing the cache file, {}: {}".format(base, exc)
+            f"There was an error writing the cache file, {base}: {exc}"
         )
+    finally:
+        # ``atomic_rename`` moves ``tmpfname`` to ``outfile`` on success, so
+        # the tmp file is only left behind when the write or rename failed.
+        # Not cleaning this up caused the pillar cache to accumulate
+        # millions of leaked ``tmp*`` files (issue #69741).
+        if os.path.exists(tmpfname):
+            try:
+                os.remove(tmpfname)
+            except OSError:
+                log.debug(
+                    "Could not remove leftover localfs cache tmp file %s",
+                    tmpfname,
+                )
 
 
 def fetch(bank, key, cachedir):
@@ -72,10 +102,11 @@ def fetch(bank, key, cachedir):
     Fetch information from a file.
     """
     inkey = False
-    key_file = os.path.join(cachedir, os.path.normpath(bank), "{}.p".format(key))
+    key_file = salt.utils.path.join(cachedir, os.path.normpath(bank), f"{key}.p")
     if not os.path.isfile(key_file):
+        log.debug('Cache file "%s" does not exist', key_file)
         # The bank includes the full filename, and the key is inside the file
-        key_file = os.path.join(cachedir, os.path.normpath(bank) + ".p")
+        key_file = salt.utils.path.join(cachedir, os.path.normpath(bank) + ".p")
         inkey = True
 
     if not os.path.isfile(key_file):
@@ -84,12 +115,12 @@ def fetch(bank, key, cachedir):
     try:
         with salt.utils.files.fopen(key_file, "rb") as fh_:
             if inkey:
-                return __context__["serial"].load(fh_)[key]
+                return salt.payload.load(fh_)[key]
             else:
-                return __context__["serial"].load(fh_)
+                return salt.payload.load(fh_)
     except OSError as exc:
         raise SaltCacheError(
-            'There was an error reading the cache file "{}": {}'.format(key_file, exc)
+            f'There was an error reading the cache file "{key_file}": {exc}'
         )
 
 
@@ -97,7 +128,7 @@ def updated(bank, key, cachedir):
     """
     Return the epoch of the mtime for this cache file
     """
-    key_file = os.path.join(cachedir, os.path.normpath(bank), "{}.p".format(key))
+    key_file = salt.utils.path.join(cachedir, os.path.normpath(bank), f"{key}.p")
     if not os.path.isfile(key_file):
         log.warning('Cache file "%s" does not exist', key_file)
         return None
@@ -105,7 +136,7 @@ def updated(bank, key, cachedir):
         return int(os.path.getmtime(key_file))
     except OSError as exc:
         raise SaltCacheError(
-            'There was an error reading the mtime for "{}": {}'.format(key_file, exc)
+            f'There was an error reading the mtime for "{key_file}": {exc}'
         )
 
 
@@ -118,17 +149,17 @@ def flush(bank, key=None, cachedir=None):
 
     try:
         if key is None:
-            target = os.path.join(cachedir, os.path.normpath(bank))
+            target = salt.utils.path.join(cachedir, os.path.normpath(bank))
             if not os.path.isdir(target):
                 return False
             shutil.rmtree(target)
         else:
-            target = os.path.join(cachedir, os.path.normpath(bank), "{}.p".format(key))
+            target = salt.utils.path.join(cachedir, os.path.normpath(bank), f"{key}.p")
             if not os.path.isfile(target):
                 return False
             os.remove(target)
     except OSError as exc:
-        raise SaltCacheError('There was an error removing "{}": {}'.format(target, exc))
+        raise SaltCacheError(f'There was an error removing "{target}": {exc}')
     return True
 
 
@@ -136,19 +167,17 @@ def list_(bank, cachedir):
     """
     Return an iterable object containing all entries stored in the specified bank.
     """
-    base = os.path.join(cachedir, os.path.normpath(bank))
+    base = salt.utils.path.join(cachedir, os.path.normpath(bank))
     if not os.path.isdir(base):
         return []
     try:
         items = os.listdir(base)
     except OSError as exc:
-        raise SaltCacheError(
-            'There was an error accessing directory "{}": {}'.format(base, exc)
-        )
+        raise SaltCacheError(f'There was an error accessing directory "{base}": {exc}')
     ret = []
     for item in items:
         if item.endswith(".p"):
-            ret.append(item.rstrip(item[-2:]))
+            ret.append(item[:-2])
         else:
             ret.append(item)
     return ret
@@ -159,8 +188,8 @@ def contains(bank, key, cachedir):
     Checks if the specified bank contains the specified key.
     """
     if key is None:
-        base = os.path.join(cachedir, os.path.normpath(bank))
+        base = salt.utils.path.join(cachedir, os.path.normpath(bank))
         return os.path.isdir(base)
     else:
-        keyfile = os.path.join(cachedir, os.path.normpath(bank), "{}.p".format(key))
+        keyfile = salt.utils.path.join(cachedir, os.path.normpath(bank), f"{key}.p")
         return os.path.isfile(keyfile)

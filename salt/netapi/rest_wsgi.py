@@ -1,4 +1,3 @@
-# encoding: utf-8
 """
 A minimalist REST API for Salt
 ==============================
@@ -66,6 +65,7 @@ Usage examples
 ==============
 
 .. http:post:: /
+    :noindex:
 
     **Example request** for a basic ``test.ping``::
 
@@ -121,13 +121,11 @@ Usage examples
 :status 401: authentication required
 
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
 import errno
 import logging
 import os
 
-# Import salt libs
 import salt
 import salt.netapi
 import salt.utils.json
@@ -164,7 +162,7 @@ class HTTPError(Exception):
 
     def __init__(self, code, message):
         self.code = code
-        Exception.__init__(self, "{0}: {1}".format(code, message))
+        Exception.__init__(self, f"{code}: {message}")
 
 
 def mkdir_p(path):
@@ -239,9 +237,7 @@ def dispatch(environ):
     method = environ["REQUEST_METHOD"].upper()
 
     if method == "GET":
-        return (
-            "They found me. I don't know how, but they found me. " "Run for it, Marty!"
-        )
+        return "They found me. I don't know how, but they found me. Run for it, Marty!"
     elif method == "POST":
         data = get_json(environ)
         return run_chunk(environ, data)
@@ -291,7 +287,7 @@ def application(environ, start_response):
         ret = salt.utils.json.dumps({"return": resp})
     except TypeError as exc:
         code = 500
-        ret = str(exc)  # future lint: disable=blacklisted-function
+        ret = str(exc)
 
     # Return the response
     start_response(H[code], get_headers(ret, {"Content-Type": "application/json"}))

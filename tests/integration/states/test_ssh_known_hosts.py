@@ -1,29 +1,21 @@
-# -*- coding: utf-8 -*-
 """
 Test the ssh_known_hosts states
 """
 
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
 import os
 import shutil
-import sys
 
-# Import 3rd-party libs
-from salt.ext import six
+import pytest
 
-# Import Salt Testing libs
 from tests.support.case import ModuleCase
-from tests.support.helpers import skip_if_binaries_missing, slowTest
 from tests.support.mixins import SaltReturnAssertsMixin
 from tests.support.runtests import RUNTIME_VARS
 
-GITHUB_FINGERPRINT = "9d:38:5b:83:a9:17:52:92:56:1a:5e:c4:d4:81:8e:0a:ca:51:a2:64:f1:74:20:11:2e:f8:8a:c3:a1:39:49:8f"
-GITHUB_IP = "192.30.253.113"
+GITHUB_FINGERPRINT = "b8:d8:95:ce:d9:2c:0a:c0:e1:71:cd:2e:f5:ef:01:ba:34:17:55:4a:4a:64:80:d3:31:cc:c2:be:3d:ed:0f:6b"
+GITHUB_IP = "140.82.121.4"
 
 
-@skip_if_binaries_missing(["ssh", "ssh-keygen"], check_all=True)
+@pytest.mark.skip_if_binaries_missing("ssh", "ssh-keygen", check_all=True)
 class SSHKnownHostsStateTest(ModuleCase, SaltReturnAssertsMixin):
     """
     Validate the ssh state
@@ -36,9 +28,9 @@ class SSHKnownHostsStateTest(ModuleCase, SaltReturnAssertsMixin):
     def tearDown(self):
         if os.path.isfile(self.known_hosts):
             os.remove(self.known_hosts)
-        super(SSHKnownHostsStateTest, self).tearDown()
+        super().tearDown()
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_present(self):
         """
         ssh_known_hosts.present
@@ -46,6 +38,7 @@ class SSHKnownHostsStateTest(ModuleCase, SaltReturnAssertsMixin):
         kwargs = {
             "name": "github.com",
             "user": "root",
+            "enc": "ssh-rsa",
             "fingerprint": GITHUB_FINGERPRINT,
             "config": self.known_hosts,
         }
@@ -57,12 +50,9 @@ class SSHKnownHostsStateTest(ModuleCase, SaltReturnAssertsMixin):
         ret = self.run_state("ssh_known_hosts.present", **kwargs)
         try:
             self.assertSaltTrueReturn(ret)
-        except AssertionError as err:
-            try:
-                self.assertInSaltComment("Unable to receive remote host key", ret)
-                self.skipTest("Unable to receive remote host key")
-            except AssertionError:
-                six.reraise(*sys.exc_info())
+        except AssertionError:
+            self.assertInSaltComment("Unable to receive remote host key", ret)
+            self.skipTest("Unable to receive remote host key")
 
         self.assertSaltStateChangesEqual(
             ret, GITHUB_FINGERPRINT, keys=("new", 0, "fingerprint")
@@ -83,12 +73,9 @@ class SSHKnownHostsStateTest(ModuleCase, SaltReturnAssertsMixin):
             self.assertSaltStateChangesEqual(
                 ret, GITHUB_FINGERPRINT, keys=("new", 0, "fingerprint")
             )
-        except AssertionError as err:
-            try:
-                self.assertInSaltComment("Unable to receive remote host key", ret)
-                self.skipTest("Unable to receive remote host key")
-            except AssertionError:
-                six.reraise(*sys.exc_info())
+        except AssertionError:
+            self.assertInSaltComment("Unable to receive remote host key", ret)
+            self.skipTest("Unable to receive remote host key")
 
         # record for every host must be available
         ret = self.run_function(
@@ -99,30 +86,38 @@ class SSHKnownHostsStateTest(ModuleCase, SaltReturnAssertsMixin):
         try:
             self.assertNotIn(ret, ("", None))
         except AssertionError:
-            raise AssertionError("Salt return '{0}' is in ('', None).".format(ret))
+            raise AssertionError(f"Salt return '{ret}' is in ('', None).")
         ret = self.run_function(
             "ssh.get_known_host_entries", ["root", GITHUB_IP], config=self.known_hosts
         )[0]
         try:
             self.assertNotIn(ret, ("", None, {}))
         except AssertionError:
-            raise AssertionError(
-                "Salt return '{0}' is in ('', None,".format(ret) + " {})"
-            )
+            raise AssertionError(f"Salt return '{ret}' is in ('', None," + " {})")
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_present_fail(self):
         # save something wrong
+        kwargs = {
+            "name": "github.com",
+            "user": "root",
+            "enc": "ssh-rsa",
+            "fingerprint": "aa:bb:cc:dd",
+            "config": self.known_hosts,
+        }
+        ret = self.run_state("ssh_known_hosts.present", **kwargs)
+        self.assertSaltFalseReturn(ret)
+        # Missing user.
+        kwargs["user"] = "baduser"
+        kwargs["fingerprint"] = GITHUB_FINGERPRINT
+        del kwargs["config"]
         ret = self.run_state(
             "ssh_known_hosts.present",
-            name="github.com",
-            user="root",
-            fingerprint="aa:bb:cc:dd",
-            config=self.known_hosts,
+            **kwargs,
         )
         self.assertSaltFalseReturn(ret)
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_absent(self):
         """
         ssh_known_hosts.absent
@@ -130,9 +125,7 @@ class SSHKnownHostsStateTest(ModuleCase, SaltReturnAssertsMixin):
         known_hosts = os.path.join(RUNTIME_VARS.FILES, "ssh", "known_hosts")
         shutil.copyfile(known_hosts, self.known_hosts)
         if not os.path.isfile(self.known_hosts):
-            self.skipTest(
-                "Unable to copy {0} to {1}".format(known_hosts, self.known_hosts)
-            )
+            self.skipTest(f"Unable to copy {known_hosts} to {self.known_hosts}")
 
         kwargs = {"name": "github.com", "user": "root", "config": self.known_hosts}
         # test first

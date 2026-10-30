@@ -1,6 +1,7 @@
 """
 Classes for working with Windows Update Agent
 """
+
 import logging
 import subprocess
 
@@ -10,8 +11,8 @@ import salt.utils.winapi
 from salt.exceptions import CommandExecutionError
 
 try:
-    import win32com.client
     import pywintypes
+    import win32com.client
 
     HAS_PYWIN32 = True
 except ImportError:
@@ -386,7 +387,7 @@ class WindowsUpdateAgent:
             wua.refresh()
         """
         # https://msdn.microsoft.com/en-us/library/windows/desktop/aa386526(v=vs.85).aspx
-        search_string = "Type='Software' or " "Type='Driver'"
+        search_string = "Type='Software' or Type='Driver'"
 
         # Create searcher object
         searcher = self._session.CreateUpdateSearcher()
@@ -398,14 +399,14 @@ class WindowsUpdateAgent:
             results = searcher.Search(search_string)
             if results.Updates.Count == 0:
                 log.debug("No Updates found for:\n\t\t%s", search_string)
-                return "No Updates found: {}".format(search_string)
+                return f"No Updates found: {search_string}"
         except pywintypes.com_error as error:
             # Something happened, raise an error
             hr, msg, exc, arg = error.args  # pylint: disable=W0633
             try:
                 failure_code = self.fail_codes[exc[5]]
             except KeyError:
-                failure_code = "Unknown Failure: {}".format(error)
+                failure_code = f"Unknown Failure: {error}"
 
             log.error("Search Failed: %s\n\t\t%s", failure_code, search_string)
             raise CommandExecutionError(failure_code)
@@ -527,14 +528,18 @@ class WindowsUpdateAgent:
         found = updates.updates
 
         for update in self._updates:
+            # Some update objects seem to be empty or undefined. Those will be
+            # exposed here if they are missing these attributes
+            try:
+                if salt.utils.data.is_true(update.IsHidden) and skip_hidden:
+                    continue
 
-            if salt.utils.data.is_true(update.IsHidden) and skip_hidden:
-                continue
+                if salt.utils.data.is_true(update.IsInstalled) and skip_installed:
+                    continue
 
-            if salt.utils.data.is_true(update.IsInstalled) and skip_installed:
-                continue
-
-            if salt.utils.data.is_true(update.IsMandatory) and skip_mandatory:
+                if salt.utils.data.is_true(update.IsMandatory) and skip_mandatory:
+                    continue
+            except AttributeError:
                 continue
 
             # Windows 10 build 2004 introduced some problems with the
@@ -719,7 +724,7 @@ class WindowsUpdateAgent:
                 try:
                     failure_code = self.fail_codes[exc[5]]
                 except KeyError:
-                    failure_code = "Unknown Failure: {}".format(error)
+                    failure_code = f"Unknown Failure: {error}"
 
                 log.error("Download Failed: %s", failure_code)
                 raise CommandExecutionError(failure_code)
@@ -828,7 +833,7 @@ class WindowsUpdateAgent:
                 try:
                     failure_code = self.fail_codes[exc[5]]
                 except KeyError:
-                    failure_code = "Unknown Failure: {}".format(error)
+                    failure_code = f"Unknown Failure: {error}"
 
                 log.error("Install Failed: %s", failure_code)
                 raise CommandExecutionError(failure_code)
@@ -962,7 +967,7 @@ class WindowsUpdateAgent:
                 try:
                     failure_code = self.fail_codes[exc[5]]
                 except KeyError:
-                    failure_code = "Unknown Failure: {}".format(error)
+                    failure_code = f"Unknown Failure: {error}"
 
                 # If "Uninstall Not Allowed" error, try using DISM
                 if exc[5] == -2145124312:
@@ -992,7 +997,7 @@ class WindowsUpdateAgent:
                                             "dism",
                                             "/Online",
                                             "/Remove-Package",
-                                            "/PackageName:{}".format(pkg),
+                                            f"/PackageName:{pkg}",
                                             "/Quiet",
                                             "/NoRestart",
                                         ]
@@ -1004,7 +1009,7 @@ class WindowsUpdateAgent:
                         log.debug("Command: %s", " ".join(cmd))
                         log.debug("Error: %s", exc)
                         raise CommandExecutionError(
-                            "Uninstall using DISM failed: {}".format(exc)
+                            f"Uninstall using DISM failed: {exc}"
                         )
 
                     # DISM Uninstall Completed Successfully
@@ -1042,7 +1047,8 @@ class WindowsUpdateAgent:
                                     )
                                 except AttributeError:
                                     log.debug(
-                                        "Windows Update: Error reading InstallationBehavior COM Object"
+                                        "Windows Update: Error reading"
+                                        " InstallationBehavior COM Object"
                                     )
                                     requires_reboot = 2
                                 ret["Updates"][uid]["RebootBehavior"] = REBOOT_BEHAVIOR[
@@ -1116,9 +1122,7 @@ class WindowsUpdateAgent:
 
         try:
             log.debug(cmd)
-            p = subprocess.Popen(
-                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             return p.communicate()
 
         except OSError as exc:
@@ -1151,6 +1155,6 @@ def needs_reboot():
             obj_sys = win32com.client.Dispatch("Microsoft.Update.SystemInfo")
         except pywintypes.com_error as exc:
             _, msg, _, _ = exc.args
-            log.debug("Failed to create AutoUpdate object: %s", msg)
+            log.debug("Failed to create SystemInfo object: %s", msg)
             return False
         return salt.utils.data.is_true(obj_sys.RebootRequired)

@@ -1,170 +1,174 @@
-.. raw:: html
+.. image:: https://img.shields.io/github/license/saltstack/salt
+   :alt: Salt Project License: Apache v2.0
+   :target: https://github.com/saltstack/salt/blob/master/LICENSE
 
-    <p align="center">
-        <a href="https://github.com/saltstack/salt/blob/master/LICENSE" alt="License Apache 2.0">
-            <img src="https://img.shields.io/github/license/saltstack/salt" /></a>
-        <a href="https://pypi.org/project/salt">
-            <img src="https://img.shields.io/pypi/dm/salt?label=pypi%20downloads"
-                alt="commits since last release"></a>
-        <a href="https://coveralls.io/github/saltstack/salt">
-            <img src="https://img.shields.io/coveralls/github/saltstack/salt"
-                alt="coverage"></a>
-        <a href="https://lgtm.com/projects/g/saltstack/salt/context:python">
-            <img src="https://img.shields.io/lgtm/grade/python/github/saltstack/salt"
-                alt="Code quality: python"/></a>
-        </br>
-        <a href="https://saltstackcommunity.herokuapp.com/">
-            <img src="https://img.shields.io/badge/slack-@saltstackcommunity-blue.svg?logo=slack"
-                alt="chat on Slack"></a>
-        <a href="https://www.twitch.tv/saltstackinc">
-            <img src="https://img.shields.io/twitch/status/saltstackinc"
-                alt="Watch on Twitch"></a>
-        <a href="https://www.reddit.com/r/saltstack/">
-            <img src="https://img.shields.io/reddit/subreddit-subscribers/saltstack?style=social"
-                alt="chat on reddit"></a>
-        <a href="https://twitter.com/intent/follow?screen_name=saltstack">
-            <img src="https://img.shields.io/twitter/follow/saltstack?style=social&logo=twitter"
-                alt="follow on Twitter"></a>
-    </p>
+.. image:: https://img.shields.io/pypi/dm/salt?label=pypi%20downloads
+   :alt: PyPi Package Downloads
+   :target: https://pypi.org/project/salt
 
-    <!-- PROJECT LOGO -->
-    <br />
-    <p align="center">
-    <a href="https://saltstack.com">
-        <img src="doc/_static/salt-oss-logo.png" alt="Salt Logo" width="300">
-    </a>
-    <p align="center">
-        <a href="https://repo.saltstack.com/">
-            <img src="https://img.shields.io/github/v/release/saltstack/salt"
-                alt="Latest release version"></a>
-        </br>
-        <b>Salt</b> is the world’s fastest, most intelligent and scalable automation engine.
-        <br />
-        <a href="https://docs.saltstack.com/en/latest/"><strong>Explore the docs »</strong></a>
-        <br />
-        <a href="https://www.saltstack.com/try-salt-open/">Demo Salt For Free Online</a>
-        ·
-        <a href="https://github.com/saltstack/salt/issues/new?assignees=&labels=Bug&template=bug_report.md&title=%5BBUG%5D">Report Bug</a>
-        ·
-        <a href="https://github.com/saltstack/salt/issues/new?assignees=&labels=Feature&template=feature_request.md&title=%5BFEATURE+REQUEST%5D">Request Feature</a>
-    </p>
-    </p>
+.. image:: https://img.shields.io/badge/discord-SaltProject-blue.svg?logo=discord
+   :alt: Salt Project Discord Community
+   :target: https://discord.com/invite/J7b7EscrAs
 
+.. image:: https://img.shields.io/reddit/subreddit-subscribers/saltstack?style=social
+   :alt: Salt Project subreddit
+   :target: https://www.reddit.com/r/saltstack/
+
+.. image:: https://img.shields.io/twitter/follow/Salt_Project_OS?style=social&logo=twitter
+   :alt: Follow SaltStack on Twitter
+   :target: https://twitter.com/intent/follow?screen_name=Salt_Project_OS
+
+.. figure:: https://gitlab.com/saltstack/open/salt-branding-guide/-/raw/master/logos/SaltProject_altlogo_teal.png?inline=true
+   :scale: 80 %
+   :width: 1000px
+   :height: 356px
+   :align: center
+   :alt: Salt Project Logo
+
+* `Latest Salt Documentation`_
+* `Open an issue`_ (bug report, feature request, etc.)
+
+.. note::
+   When using ``salt-cloud -p`` with a profile, pass only the VM name on the
+   command line. Specify VM attributes (memory, cpu, vcpu, etc.) in the profile
+   configuration, not as command-line arguments.
+
+*Salt is the world's fastest, most intelligent and scalable automation*
+*engine.*
 
 About Salt
 ==========
+Built on Python, Salt is an event-driven automation tool and framework to
+deploy, configure, and manage complex IT systems. Use Salt to automate common
+infrastructure administration tasks and ensure that all the components of your
+infrastructure are operating in a consistent desired state.
 
-Built on python, Salt uses simple and human-readable YAML combined with
-event-driven automation to deploy and configure complex IT systems. In addition
-to powering SaltStack’s powerful enterprise product suite, Salt can be found
+Salt has many possible uses, including configuration management, which involves:
+
+* Managing operating system deployment and configuration.
+* Installing and configuring software applications and services.
+* Managing servers, virtual machines, containers, databases, web servers,
+  network devices, and more.
+* Ensuring consistent configuration and preventing configuration drift.
+
+Salt is ideal for configuration management because it is pluggable,
+customizable, and plays well with many existing technologies. Salt enables you
+to deploy and manage applications that use any tech stack running on nearly any
+`operating system <https://docs.saltproject.io/salt/install-guide/en/latest/topics/salt-supported-operating-systems.html>`_,
+including different types of network devices such as switches and routers from a
+variety of vendors.
+
+In addition to configuration management Salt can also:
+
+* Automate and orchestrate routine IT processes, such as common required tasks
+  for scheduled server downtimes or upgrading operating systems or applications.
+* Create self-aware, self-healing systems that can automatically respond to
+  outages, common administration problems, or other important events.
+
+
+About our sponsors
+==================
+
+Salt powers VMware by Broadcom's `VMware Salt`_
+(previously Aria Automation Config / vRealize Automation SaltStack Config / SaltStack Enterprise), and can be found
 under the hood of products from Juniper, Cisco, Cloudflare, Nutanix, SUSE, and
 Tieto, to name a few.
 
-About SaltStack
-===============
+The original sponsor of our community, SaltStack, was acquired by VMware in 2020.
+`VMware was later acquired by Broadcom in 2023 <https://investors.broadcom.com/news-releases/news-release-details/broadcom-completes-acquisition-vmware>`__.
+The Salt Project remains an open source ecosystem that Broadcom supports and
+contributes to. Broadcom ensures the code integrity and quality of the Salt
+modules by acting as the official sponsor and manager of the Salt project. Many
+of the core Salt Project contributors are also Broadcom employees. This team
+carefully reviews and enhances the Salt modules to ensure speed, quality, and
+security.
 
-SaltStack develops award-winning software used by IT and security operations
-teams to help modern business more efficiently secure and maintain all aspects
-of their digital infrastructure. But we’re not like other legacy systems
-management or security software tools. Our software is unique in providing
-intelligent, event-driven automation for efficient control of complex business
-systems at any scale.
+Download and install Salt
+=========================
+Salt is tested and packaged to run on CentOS, Debian, RHEL, Ubuntu, MacOS,
+Windows, and more. Download Salt and get started now. See
+`supported operating systems <https://docs.saltproject.io/salt/install-guide/en/latest/topics/salt-supported-operating-systems.html>`_
+for more information.
 
-We help enterprise IT organizations orchestrate and automate difficult IT tasks
-with speed and flexibility to ultimately deliver continuous security compliance,
-vulnerability remediation, and real IT security.
+To download and install Salt, see:
 
-Whether you need help automating the work of ITOps, DevOps, NetOps, or SecOps
-functions, SaltStack software is the answer. In addition to open source
-software, such as Salt, we offer
-`SaltStack Enterprise <https://www.saltstack.com/products/saltstack-enterprise/>`_
-and
-`SaltStack SecOps <https://www.saltstack.com/products/secops/>`_ products to
-manage and secure your digital business operations.
+* `The Salt install guide <https://docs.saltproject.io/salt/install-guide/en/latest/index.html>`_
+    * `Salt Project Repository: Linux (RPM) <https://packages.broadcom.com/artifactory/saltproject-rpm>`__ - Where Salt ``rpm`` packages are officially stored and distributed.
+    * `Salt Project Repository: Linux (DEB) <https://packages.broadcom.com/artifactory/saltproject-deb>`__ - Where Salt ``deb`` packages are officially stored and distributed.
+    * `Salt Project Repository: GENERIC <https://packages.broadcom.com/artifactory/saltproject-generic>`__ - Where Salt Windows, macOS, etc. (non-rpm, non-deb) packages are officially stored and distributed.
 
-Download Salt
-=============
+Technical support
+=================
+Report bugs or problems using Salt by opening an issue: `<https://github.com/saltstack/salt/issues>`_
 
-Salt is tested and packaged to run on CentOS, Debian, RHEL, Ubuntu,
-Windows. Download Salt and get started now.
+To join our community forum where you can exchange ideas, best practices,
+discuss technical support questions, and talk to project maintainers, join our
+Discord server: `Salt Project Community Discord`_
 
-* `<https://repo.saltstack.com/>`_
-* `Installation Instructions <https://docs.saltstack.com/en/latest/topics/installation/index.html>`_
 
-SaltStack Documentation
-=======================
 
-Installation instructions, getting started guides, in-depth API
-documentation, and contributing to Salt.
+Salt Project documentation
+==========================
+Installation instructions, tutorials, in-depth API and module documentation:
 
-* `Getting Started with Salt <https://docs.saltstack.com/en/getstarted/>`_
-* `Latest Salt Documentation <https://docs.saltstack.com/en/latest/>`_
-* `Salt’s Contributor Guide <https://docs.saltstack.com/en/latest/topics/development/contributing.html>`_
+* `The Salt install guide <https://docs.saltproject.io/salt/install-guide/en/latest/index.html>`_
+* `The Salt user guide <https://docs.saltproject.io/salt/user-guide/en/latest/>`_
+* `Latest Salt documentation`_
+* `Salt's contributing guide <https://docs.saltproject.io/en/master/topics/development/contributing.html>`_
 
-Security Advisories
+
+Security advisories
 ===================
-
-In 2020, SaltStack created a
-`**Security Announcements** <https://www.saltstack.com/security-announcements/>`_
-landing page. SaltStack recommends subscribing to the
-`SaltStack Security RSS feed <http://www.saltstack.com/feed/?post_type=security>`_
+Keep an eye on the Salt Project
+`Security Announcements <https://saltproject.io/security-announcements/>`_
+landing page. Salt Project recommends subscribing to the
+`Salt Project Security RSS feed <https://saltproject.io/security-announcements/index.xml>`_
 to receive notification when new information is available regarding security
 announcements.
 
 Other channels to receive security announcements include the
 `Salt Community mailing list <https://groups.google.com/forum/#!forum/salt-users>`_
-and the
-`Salt Community Slack Channel <https://saltstackcommunity.herokuapp.com/>`_.
+and the `Salt Project Community Discord`_.
 
-Responsibly Reporting Security Vulnerabilities
+
+Responsibly reporting security vulnerabilities
 ++++++++++++++++++++++++++++++++++++++++++++++
-
 When reporting security vulnerabilities for Salt or other SaltStack projects,
-refer to the
-`SECURITY.md <https://github.com/saltstack/salt/blob/master/SECURITY.md>`_ file
-found in this repository.
+refer to the `SECURITY.md`_ file found in this repository.
 
-Engage SaltStack and The Community
-==================================
+
+Join our community
+==================
+Salt is built by the Salt Project community, which includes more than 3,000
+contributors working in roles just like yours. This well-known and trusted
+community works together to improve the underlying technology and extend Salt by
+creating a variety of execution and state modules to accomplish the most common
+tasks or solve the most important problems that people in your role are likely
+to face.
+
+If you want to help extend Salt or solve a problem with Salt, you can join our
+community and contribute today.
 
 Please be sure to review our
 `Code of Conduct <https://github.com/saltstack/salt/blob/master/CODE_OF_CONDUCT.md>`_.
 Also, check out some of our community resources including:
 
-* `SaltStack Community Wiki <https://github.com/saltstack/community/wiki>`_
-* `SaltStack Community Slack <https://saltstackcommunity.herokuapp.com/>`_
-* `SaltStack: IRC on Freenode <https://webchat.freenode.net/#salt>`_
-* `SaltStack YouTube channel <https://www.youtube.com/user/SaltStack>`_
-* `SaltStackInc Twitch channel <https://www.twitch.tv/saltstackinc>`_
+* `Salt Project Community Discord`_
+* `Salt Project YouTube channel <https://www.youtube.com/channel/UCpveTIucFx9ljGelW63-BWg>`_
+* `Salt Project Community Notes and Wiki <https://github.com/saltstack/community/>`_
 
 There are lots of ways to get involved in our community. Every month, there are
 around a dozen opportunities to meet with other contributors and the Salt Core
 team and collaborate in real time. The best way to keep track is by subscribing
-to the 
-`Salt Community Events Calendar <https://calendar.google.com/calendar/embed?src=saltstack.com_md73c3ufcs2eqbsmmnike4em80%40group.calendar.google.com&ctz=America%2FNew_York>`_.
-If you have additional questions, email us at core@saltstack.com or reach out
-directly to the Community Manager, Cassandra Faris via Slack. We’d be glad to
-have you join our community!
+to the **Salt Project Community Events Calendar** on the main
+`<https://saltproject.io>`_ website.
 
-SaltStack Training
-++++++++++++++++++
-
-Get access to proprietary
-`SaltStack education offerings <https://www.saltstack.com/products/saltstack-training/>`_
-through instructor-led training offered on-site, virtually or at SaltStack
-headquarters in Salt Lake City. SaltStack Enterprise training helps increase the
-value and effectiveness of SaltStack software for any customer and is a
-prerequisite for coveted **SaltStack Certified Administrator (SSCA)** and 
-**SaltStack Certified Engineer (SSCE)** certifications.
-
-SaltStack training is also available through several
-`SaltStack professional services <https://www.saltstack.com/products/saltstack-services/>`_
-offerings.
+If you have additional questions, email us at saltproject.pdl@broadcom.com or reach out
+directly to the Community Discord. We'd be glad to have you join our community!
 
 License
 =======
-
-SaltStack is licensed by the SaltStack Team under the Apache 2.0 license. Please
+Salt is licensed under the Apache 2.0 license. Please
 see the
 `LICENSE file <https://github.com/saltstack/salt/blob/master/LICENSE>`_ for the
 full text of the Apache license, followed by a full summary of the licensing
@@ -172,3 +176,9 @@ used by external modules.
 
 A complete list of attributions and dependencies can be found here:
 `salt/DEPENDENCIES.md <https://github.com/saltstack/salt/blob/master/DEPENDENCIES.md>`_
+
+.. _Salt Project Community Discord: https://discord.com/invite/J7b7EscrAs
+.. _VMware Salt: https://techdocs.broadcom.com/us/en/vmware-cis/other/vmware-salt/8-18.html
+.. _Latest Salt Documentation: https://docs.saltproject.io/en/latest/
+.. _Open an issue: https://github.com/saltstack/salt/issues/new/choose
+.. _SECURITY.md: https://github.com/saltstack/salt/blob/master/SECURITY.md

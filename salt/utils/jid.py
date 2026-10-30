@@ -16,7 +16,7 @@ def _utc_now():
     """
     Helper method so tests do not have to patch the built-in method.
     """
-    return datetime.datetime.utcnow()
+    return datetime.datetime.now(tz=datetime.timezone.utc)
 
 
 def gen_jid(opts):
@@ -27,11 +27,11 @@ def gen_jid(opts):
 
     jid_dt = _utc_now()
     if not opts.get("unique_jid", False):
-        return "{:%Y%m%d%H%M%S%f}".format(jid_dt)
+        return f"{jid_dt:%Y%m%d%H%M%S%f}"
     if LAST_JID_DATETIME and LAST_JID_DATETIME >= jid_dt:
         jid_dt = LAST_JID_DATETIME + datetime.timedelta(microseconds=1)
     LAST_JID_DATETIME = jid_dt
-    return "{:%Y%m%d%H%M%S%f}_{}".format(jid_dt, os.getpid())
+    return f"{jid_dt:%Y%m%d%H%M%S%f}_{os.getpid()}"
 
 
 def is_jid(jid):
@@ -85,10 +85,22 @@ def format_job_instance(job):
 
     if "metadata" in job:
         ret["Metadata"] = job.get("metadata", {})
+    elif "kwargs" in job and "metadata" in job["kwargs"]:
+        ret["Metadata"] = job["kwargs"].get("metadata", {})
     else:
-        if "kwargs" in job:
-            if "metadata" in job["kwargs"]:
-                ret["Metadata"] = job["kwargs"].get("metadata", {})
+        # When ``metadata`` is passed as a keyword argument on the CLI
+        # (e.g. ``salt '*' state.apply foo metadata='{...}'``) it is
+        # carried inside ``arg`` as a ``__kwarg__: True`` dict rather
+        # than at the top of the job payload. Surface it as ``Metadata``
+        # so ``jobs.list_jobs search_metadata=...`` can match it.
+        for arg in job.get("arg", []) or []:
+            if (
+                isinstance(arg, dict)
+                and arg.get("__kwarg__") is True
+                and "metadata" in arg
+            ):
+                ret["Metadata"] = arg.get("metadata", {})
+                break
     return ret
 
 

@@ -56,7 +56,21 @@ SYS_TMP_DIR = os.path.abspath(
         else "/tmp"
     )
 )
-TMP = os.path.join(SYS_TMP_DIR, "salt-tests-tmpdir")
+# Isolate by effective user (POSIX) or username (Windows) so a root-owned
+# ``salt-tests-tmpdir`` from an earlier sudo run cannot break non-root minions
+# (e.g. ``salt-cp`` writing under ``RUNTIME_VARS.TMP``).
+if sys.platform.startswith("win"):
+    _tmp_disambig = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        os.environ.get("USERNAME") or "tests",
+    )
+else:
+    try:
+        _tmp_disambig = str(os.geteuid())
+    except AttributeError:
+        _tmp_disambig = "0"
+TMP = os.path.join(SYS_TMP_DIR, f"salt-tests-tmpdir-{_tmp_disambig}")
 TMP_ROOT_DIR = os.path.join(TMP, "rootdir")
 FILES = os.path.join(INTEGRATION_TEST_DIR, "files")
 BASE_FILES = os.path.join(INTEGRATION_TEST_DIR, "files", "file", "base")
@@ -72,7 +86,6 @@ TMP_CONF_DIR = TMP_MINION_CONF_DIR = os.path.join(TMP, "config")
 TMP_SUB_MINION_CONF_DIR = os.path.join(TMP_CONF_DIR, "sub-minion")
 TMP_SYNDIC_MINION_CONF_DIR = os.path.join(TMP_CONF_DIR, "syndic-minion")
 TMP_SYNDIC_MASTER_CONF_DIR = os.path.join(TMP_CONF_DIR, "syndic-master")
-TMP_PROXY_CONF_DIR = TMP_CONF_DIR
 TMP_SSH_CONF_DIR = TMP_MINION_CONF_DIR
 CONF_DIR = os.path.join(INTEGRATION_TEST_DIR, "files", "conf")
 PILLAR_DIR = os.path.join(FILES, "pillar")

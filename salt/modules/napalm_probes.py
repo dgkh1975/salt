@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 NAPALM Probes
 =============
@@ -22,12 +21,8 @@ Dependencies
 .. versionadded:: 2016.11.0
 """
 
-from __future__ import absolute_import, print_function, unicode_literals
-
-# Import python lib
 import logging
 
-# import NAPALM utils
 import salt.utils.napalm
 from salt.utils.napalm import proxy_napalm_wrap
 
@@ -65,7 +60,6 @@ def __virtual__():
 
 @proxy_napalm_wrap
 def config(**kwargs):  # pylint: disable=unused-argument
-
     """
     Returns the configuration of the RPM probes.
 
@@ -108,12 +102,10 @@ def config(**kwargs):  # pylint: disable=unused-argument
 
 @proxy_napalm_wrap
 def results(**kwargs):  # pylint: disable=unused-argument
-
     """
     Provides the results of the measurements of the RPM/SLA probes.
 
     :return a dictionary with the results of the probes.
-
 
     CLI Example:
 
@@ -276,7 +268,6 @@ def set_probes(
 def delete_probes(
     probes, test=False, commit=True, **kwargs
 ):  # pylint: disable=unused-argument
-
     """
     Removes RPM/SLA probes from the network device.
     Calls the configuration template 'delete_probes' from the NAPALM library,
@@ -333,7 +324,6 @@ def delete_probes(
 def schedule_probes(
     probes, test=False, commit=True, **kwargs
 ):  # pylint: disable=unused-argument
-
     """
     Will schedule the probes. On Cisco devices, it is not enough to define the
     probes, it is also necessary to schedule them.

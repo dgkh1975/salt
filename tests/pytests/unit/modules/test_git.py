@@ -1,0 +1,375 @@
+"""
+    :codeauthor: Erik Johnson <erik@saltstack.com>
+"""
+
+import copy
+import logging
+import os
+import subprocess
+
+import pytest
+
+import salt.modules.git as git_mod  # Don't potentially shadow GitPython
+from salt.utils.versions import Version
+from tests.support.mock import MagicMock, Mock, patch
+
+log = logging.getLogger(__name__)
+
+
+@pytest.fixture(scope="module")
+def worktree_root():
+    return "/tmp/salt-tests-tmpdir/main"
+
+
+@pytest.fixture(scope="module")
+def worktree_info(worktree_root):
+    worktree_info = {
+        worktree_root: {
+            "HEAD": "119f025073875a938f2456f5ffd7d04e79e5a427",
+            "branch": "refs/heads/master",
+            "stale": False,
+        },
+        "/tmp/salt-tests-tmpdir/worktree1": {
+            "HEAD": "d8d19cf75d7cc3bdc598dc2d472881d26b51a6bf",
+            "branch": "refs/heads/worktree1",
+            "stale": False,
+        },
+        "/tmp/salt-tests-tmpdir/worktree2": {
+            "HEAD": "56332ca504aa8b37bb62b54272d52b1d6d832629",
+            "branch": "refs/heads/worktree2",
+            "stale": True,
+        },
+        "/tmp/salt-tests-tmpdir/worktree3": {
+            "HEAD": "e148ea2d521313579f661373fbb93a48a5a6d40d",
+            "branch": "detached",
+            "tags": ["v1.1"],
+            "stale": False,
+        },
+        "/tmp/salt-tests-tmpdir/worktree4": {
+            "HEAD": "6bbac64d3ad5582b3147088a708952df185db020",
+            "branch": "detached",
+            "stale": True,
+        },
+    }
+
+    return worktree_info
+
+
+def _git_version():
+    git_version = subprocess.Popen(
+        ["git", "--version"],
+        shell=False,
+        close_fds=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).communicate()[0]
+    if not git_version:
+        log.error("Git not installed")
+        return False
+    log.debug("Detected git version %s", git_version)
+    return Version(git_version.split()[-1])
+
+
+@pytest.fixture
+def configure_loader_modules():
+    return {git_mod: {"__utils__": {"ssh.key_is_encrypted": Mock(return_value=False)}}}
+
+
+def test_list_worktrees(worktree_info, worktree_root):
+    """
+    This tests git.list_worktrees
+    """
+
+    def _build_worktree_output(path):
+        """
+        Build 'git worktree list' output for a given path
+        """
+        return "worktree {}\nHEAD {}\n{}\n".format(
+            path,
+            worktree_info[path]["HEAD"],
+            (
+                "branch {}".format(worktree_info[path]["branch"])
+                if worktree_info[path]["branch"] != "detached"
+                else "detached"
+            ),
+        )
+
+    # Build dict for _cmd_run_side_effect below. Start with the output from
+    # 'git worktree list'.
+    _cmd_run_values = {
+        "git worktree list --porcelain": "\n".join(
+            [_build_worktree_output(x) for x in worktree_info]
+        ),
+        "git --version": "git version 2.7.0",
+    }
+    # Add 'git tag --points-at' output for detached HEAD worktrees with
+    # tags pointing at HEAD.
+    for path in worktree_info:
+        if worktree_info[path]["branch"] != "detached":
+            continue
+        key = "git tag --points-at " + worktree_info[path]["HEAD"]
+        _cmd_run_values[key] = "\n".join(worktree_info[path].get("tags", []))
+
+    def _cmd_run_side_effect(key, **kwargs):
+        # Not using dict.get() here because we want to know if
+        # _cmd_run_values doesn't account for all uses of cmd.run_all.
+        return {
+            "stdout": _cmd_run_values[" ".join(key)],
+            "stderr": "",
+            "retcode": 0,
+            "pid": 12345,
+        }
+
+    def _isdir_side_effect(key):
+        # os.path.isdir() would return True on a non-stale worktree
+        return not worktree_info[key].get("stale", False)
+
+    # Build return dict for comparison
+    worktree_ret = copy.deepcopy(worktree_info)
+    for key in worktree_ret:
+        ptr = worktree_ret.get(key)
+        ptr["detached"] = ptr["branch"] == "detached"
+        ptr["branch"] = (
+            None if ptr["detached"] else ptr["branch"].replace("refs/heads/", "", 1)
+        )
+
+    cmd_run_mock = MagicMock(side_effect=_cmd_run_side_effect)
+    isdir_mock = MagicMock(side_effect=_isdir_side_effect)
+    with patch.dict(git_mod.__salt__, {"cmd.run_all": cmd_run_mock}):
+        with patch.object(os.path, "isdir", isdir_mock):
+            # Test all=True. Include all return data.
+            assert (
+                git_mod.list_worktrees(worktree_root, all=True, stale=False)
+                == worktree_ret
+            )
+            # Test all=False and stale=False. Exclude stale worktrees from
+            # return data.
+            assert git_mod.list_worktrees(worktree_root, all=False, stale=False) == {
+                x: worktree_ret[x]
+                for x in worktree_info
+                if not worktree_info[x].get("stale", False)
+            }
+            # Test stale=True. Exclude non-stale worktrees from return
+            # data.
+            assert git_mod.list_worktrees(worktree_root, all=False, stale=True) == {
+                x: worktree_ret[x]
+                for x in worktree_info
+                if worktree_info[x].get("stale", False)
+            }
+
+
+def test__git_run_tmp_wrapper():
+    """
+    When an identity file is specified, make sure we don't attempt to
+    remove a temp wrapper that wasn't created. Windows doesn't use temp
+    wrappers, and *NIX won't unless no username was specified and the path
+    is not executable.
+    """
+    file_remove_mock = Mock()
+    mock_true = Mock(return_value=True)
+    mock_false = Mock(return_value=False)
+    cmd_mock = MagicMock(return_value={"retcode": 0, "stdout": "", "stderr": ""})
+    with patch.dict(
+        git_mod.__salt__,
+        {
+            "file.file_exists": mock_true,
+            "file.remove": file_remove_mock,
+            "cmd.run_all": cmd_mock,
+            "ssh.key_is_encrypted": mock_false,
+        },
+    ):
+
+        # Non-windows
+        with patch("salt.utils.platform.is_windows", mock_false), patch.object(
+            git_mod, "_path_is_executable_others", mock_true
+        ):
+
+            # Command doesn't really matter here since we're mocking
+            git_mod._git_run(
+                ["git", "rev-parse", "HEAD"],
+                cwd="/some/path",
+                user=None,
+                identity="/root/.ssh/id_rsa",
+            )
+
+            file_remove_mock.assert_not_called()
+
+        file_remove_mock.reset_mock()
+        with patch("salt.utils.platform.is_windows", mock_true), patch.object(
+            git_mod, "_find_ssh_exe", MagicMock(return_value=r"C:\Git\ssh.exe")
+        ):
+            # Command doesn't really matter here since we're mocking
+            git_mod._git_run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=r"C:\some\path",
+                user=None,
+                identity=r"C:\ssh\id_rsa",
+            )
+
+            file_remove_mock.assert_not_called()
+
+
+def _make_git_run_capture():
+    """
+    Return a mock suitable for patching ``salt.modules.git._git_run`` that
+    records the command list it was called with and returns a successful
+    result. Mirrors the structure of the dict that ``_git_run`` returns so
+    that ``git.tag`` can index ``["stdout"]`` without raising.
+    """
+    return MagicMock(return_value={"retcode": 0, "stdout": "", "stderr": ""})
+
+
+def test_tag_passes_message_as_annotated_tag(tmp_path):
+    """
+    Regression test for #69298.
+
+    ``git.tag`` documents the ``message`` argument as creating an annotated
+    tag with that message, but the implementation never forwarded it to the
+    underlying ``git tag`` invocation. This test asserts the assembled
+    command contains ``-a -m <message>`` when ``message`` is provided.
+    """
+    git_run_mock = _make_git_run_capture()
+    with patch.object(git_mod, "_git_run", git_run_mock), patch.object(
+        git_mod, "_expand_path", lambda cwd, user: str(cwd)
+    ):
+        git_mod.tag(str(tmp_path), "v1.2", message="Version 1.2")
+
+    assert git_run_mock.call_count == 1
+    command = git_run_mock.call_args.args[0]
+    # The command must be: ['git', 'tag', '-a', '-m', 'Version 1.2', 'v1.2', 'HEAD']
+    assert "-a" in command, f"expected '-a' in command, got {command!r}"
+    assert "-m" in command, f"expected '-m' in command, got {command!r}"
+    m_index = command.index("-m")
+    assert (
+        command[m_index + 1] == "Version 1.2"
+    ), f"expected message argument after '-m', got {command!r}"
+    # -a / -m must come before the tag name and ref so git parses them as
+    # options rather than as positional arguments.
+    assert command.index("-a") < command.index("v1.2")
+    assert command.index("-m") < command.index("v1.2")
+
+
+def test_tag_without_message_creates_lightweight_tag(tmp_path):
+    """
+    Regression test for #69298.
+
+    When ``message`` is not supplied, ``git.tag`` must continue to produce a
+    lightweight tag (no ``-a`` / ``-m`` arguments).
+    """
+    git_run_mock = _make_git_run_capture()
+    with patch.object(git_mod, "_git_run", git_run_mock), patch.object(
+        git_mod, "_expand_path", lambda cwd, user: str(cwd)
+    ):
+        git_mod.tag(str(tmp_path), "v1.2")
+
+    command = git_run_mock.call_args.args[0]
+    assert "-a" not in command, f"unexpected '-a' in command, got {command!r}"
+    assert "-m" not in command, f"unexpected '-m' in command, got {command!r}"
+
+
+def test_tag_rejects_message_in_opts(tmp_path):
+    """
+    Regression guard for #69298.
+
+    ``git.tag`` must continue to refuse ``-m`` / ``--message`` smuggled in via
+    the ``opts`` argument, since the message must be supplied through the
+    dedicated ``message`` parameter.
+    """
+    git_run_mock = _make_git_run_capture()
+    with patch.object(git_mod, "_git_run", git_run_mock), patch.object(
+        git_mod, "_expand_path", lambda cwd, user: str(cwd)
+    ):
+        with pytest.raises(
+            git_mod.SaltInvocationError, match="Tag messages must be passed"
+        ):
+            git_mod.tag(str(tmp_path), "v1.2", opts="-m 'sneaky'")
+
+    git_run_mock.assert_not_called()
+
+
+def test_is_worktree_probe_ignores_retcode():
+    """
+    Regression guard for #51157.
+
+    ``git.is_worktree`` probes ``cwd`` with ``git rev-parse --show-toplevel``
+    and expects that command to fail (retcode 128) when ``cwd`` is not a git
+    repository. That expected failure must be run with ``ignore_retcode=True``
+    so the noisy ERROR-level logging is suppressed while still returning False.
+    """
+    cmd_run_mock = MagicMock(
+        return_value={
+            "stdout": "",
+            "stderr": (
+                "fatal: not a git repository (or any of the parent "
+                "directories): .git"
+            ),
+            "retcode": 128,
+            "pid": 12345,
+        }
+    )
+    with patch.dict(git_mod.__salt__, {"cmd.run_all": cmd_run_mock}), patch.object(
+        git_mod, "_expand_path", lambda cwd, user: str(cwd)
+    ):
+        assert git_mod.is_worktree("/not/a/repo") is False
+
+    cmd_run_mock.assert_called_once()
+    assert cmd_run_mock.call_args.kwargs.get("ignore_retcode") is True
+
+
+def test_get_toplevel_forwards_ignore_retcode_51157():
+    """
+    Regression test for #51157.
+
+    ``_get_toplevel`` must accept ``ignore_retcode`` and forward it to
+    ``cmd.run_all`` so that an expected rev-parse failure is not logged at
+    ERROR level. This calls the helper directly with ``ignore_retcode=True``,
+    which is exactly what its production caller ``is_worktree`` passes when
+    probing a path that may not be a git repository.
+    """
+    cmd_run_mock = MagicMock(
+        return_value={
+            "stdout": "/some/repo",
+            "stderr": "",
+            "retcode": 0,
+            "pid": 12345,
+        }
+    )
+    with patch.dict(git_mod.__salt__, {"cmd.run_all": cmd_run_mock}):
+        # ignore_retcode=True is the decisive flag; is_worktree passes it
+        # because the probe is expected to fail on non-repo paths.
+        result = git_mod._get_toplevel("/some/repo", ignore_retcode=True)
+
+    assert result == "/some/repo"
+    cmd_run_mock.assert_called_once()
+    assert cmd_run_mock.call_args.kwargs.get("ignore_retcode") is True
+
+
+def test_get_toplevel_default_stays_loud_51157():
+    """
+    Overcorrection guard for #51157.
+
+    Only the ``is_worktree`` probe opts in to ``ignore_retcode``. Other
+    production callers such as ``list_worktrees`` invoke ``_get_toplevel``
+    without it, and a genuine rev-parse failure there must NOT be silenced
+    by this fix: ``cmd.run_all`` must still receive ``ignore_retcode=False``
+    (so the failure is logged) and ``_git_run`` must still raise
+    ``CommandExecutionError``. This test passes both with and without the
+    fix applied; it guards against the default flipping to True.
+    """
+    cmd_run_mock = MagicMock(
+        return_value={
+            "stdout": "",
+            "stderr": (
+                "fatal: not a git repository (or any of the parent "
+                "directories): .git"
+            ),
+            "retcode": 128,
+            "pid": 12345,
+        }
+    )
+    with patch.dict(git_mod.__salt__, {"cmd.run_all": cmd_run_mock}):
+        with pytest.raises(git_mod.CommandExecutionError):
+            git_mod._get_toplevel("/some/repo")
+
+    cmd_run_mock.assert_called_once()
+    assert cmd_run_mock.call_args.kwargs.get("ignore_retcode") is False

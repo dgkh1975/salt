@@ -58,7 +58,6 @@ def list_(saltenv="base", test=None):
     with salt.utils.event.get_event(
         "master",
         __opts__["sock_dir"],
-        __opts__["transport"],
         opts=__opts__,
         listen=True,
     ) as sevent:
@@ -68,7 +67,7 @@ def list_(saltenv="base", test=None):
         __jid_event__.fire_event({"key": master_key}, "salt/reactors/manage/list")
 
         results = sevent.get_event(wait=30, tag="salt/reactors/manage/list-results")
-        reactors = results["reactors"]
+        reactors = results.get("reactors")
         return reactors
 
 
@@ -91,7 +90,6 @@ def add(event, reactors, saltenv="base", test=None):
     with salt.utils.event.get_event(
         "master",
         __opts__["sock_dir"],
-        __opts__["transport"],
         opts=__opts__,
         listen=True,
     ) as sevent:
@@ -104,7 +102,7 @@ def add(event, reactors, saltenv="base", test=None):
         )
 
         res = sevent.get_event(wait=30, tag="salt/reactors/manage/add-complete")
-        return res["result"]
+        return res.get("result")
 
 
 def delete(event, saltenv="base", test=None):
@@ -123,7 +121,6 @@ def delete(event, saltenv="base", test=None):
     with salt.utils.event.get_event(
         "master",
         __opts__["sock_dir"],
-        __opts__["transport"],
         opts=__opts__,
         listen=True,
     ) as sevent:
@@ -135,7 +132,7 @@ def delete(event, saltenv="base", test=None):
         )
 
         res = sevent.get_event(wait=30, tag="salt/reactors/manage/delete-complete")
-        return res["result"]
+        return res.get("result")
 
 
 def is_leader():
@@ -154,7 +151,6 @@ def is_leader():
     with salt.utils.event.get_event(
         "master",
         __opts__["sock_dir"],
-        __opts__["transport"],
         opts=__opts__,
         listen=True,
     ) as sevent:
@@ -183,7 +179,6 @@ def set_leader(value=True):
     with salt.utils.event.get_event(
         "master",
         __opts__["sock_dir"],
-        __opts__["transport"],
         opts=__opts__,
         listen=True,
     ) as sevent:

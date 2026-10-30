@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 """
 For running command line executables with a timeout
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
 import shlex
 import subprocess
@@ -10,10 +8,11 @@ import threading
 
 import salt.exceptions
 import salt.utils.data
-from salt.ext import six
+import salt.utils.platform
+import salt.utils.stringutils
 
 
-class TimedProc(object):
+class TimedProc:
     """
     Create a TimedProc object, calls subprocess.Popen with passed args and **kwargs
     """
@@ -35,9 +34,8 @@ class TimedProc(object):
             if not self.stdin_raw_newlines:
                 # Translate a newline submitted as '\n' on the CLI to an actual
                 # newline character.
-                self.stdin = salt.utils.stringutils.to_bytes(
-                    self.stdin.replace("\\n", "\n")
-                )
+                self.stdin = self.stdin.replace("\\n", "\n")
+            self.stdin = salt.utils.stringutils.to_bytes(self.stdin)
             kwargs["stdin"] = subprocess.PIPE
 
         if not self.with_communicate:
@@ -46,7 +44,7 @@ class TimedProc(object):
 
         if self.timeout and not isinstance(self.timeout, (int, float)):
             raise salt.exceptions.TimedProcTimeoutError(
-                "Error: timeout {0} must be a number".format(self.timeout)
+                f"Error: timeout {self.timeout} must be a number"
             )
         if kwargs.get("shell", False):
             args = salt.utils.data.decode(args, to_str=True)
@@ -55,32 +53,23 @@ class TimedProc(object):
             self.process = subprocess.Popen(args, **kwargs)
         except (AttributeError, TypeError):
             if not kwargs.get("shell", False):
+                use_posix = not salt.utils.platform.is_windows()
                 if not isinstance(args, (list, tuple)):
                     try:
-                        args = shlex.split(args)
+                        args = shlex.split(args, posix=use_posix)
                     except AttributeError:
-                        args = shlex.split(six.text_type(args))
+                        args = shlex.split(str(args), posix=use_posix)
                 str_args = []
                 for arg in args:
-                    if not isinstance(arg, six.string_types):
-                        str_args.append(six.text_type(arg))
+                    if not isinstance(arg, str):
+                        str_args.append(str(arg))
                     else:
                         str_args.append(arg)
                 args = str_args
             else:
-                if not isinstance(args, (list, tuple, six.string_types)):
+                if not isinstance(args, (list, tuple, str)):
                     # Handle corner case where someone does a 'cmd.run 3'
-                    args = six.text_type(args)
-            # Ensure that environment variables are strings
-            for key, val in six.iteritems(kwargs.get("env", {})):
-                if not isinstance(val, six.string_types):
-                    kwargs["env"][key] = six.text_type(val)
-                if not isinstance(key, six.string_types):
-                    kwargs["env"][six.text_type(key)] = kwargs["env"].pop(key)
-            if six.PY2 and "env" in kwargs:
-                # Ensure no unicode in custom env dict, as it can cause
-                # problems with subprocess.
-                kwargs["env"] = salt.utils.data.encode_dict(kwargs["env"])
+                    args = str(args)
             args = salt.utils.data.decode(args)
             self.process = subprocess.Popen(args, **kwargs)
         self.command = args
@@ -103,18 +92,14 @@ class TimedProc(object):
             rt = threading.Thread(target=receive)
             rt.start()
             rt.join(self.timeout)
-            if rt.isAlive():
+            if rt.is_alive():
                 # Subprocess cleanup (best effort)
                 self.process.kill()
-
-                def terminate():
-                    if rt.isAlive():
-                        self.process.terminate()
-
-                threading.Timer(10, terminate).start()
+                self.process.wait()
                 raise salt.exceptions.TimedProcTimeoutError(
-                    "{0} : Timed out after {1} seconds".format(
-                        self.command, six.text_type(self.timeout),
+                    "{} : Timed out after {} seconds".format(
+                        self.command,
+                        str(self.timeout),
                     )
                 )
         return self.process.returncode

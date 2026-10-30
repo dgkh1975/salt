@@ -2,33 +2,43 @@
 Use pycrypto to generate random passwords on the fly.
 """
 
-# Import python libraries
-
 import logging
 import random
 import re
 import string
 
+import salt.utils.platform
 import salt.utils.stringutils
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 
+get_random_bytes = None
 try:
+    from M2Crypto.Rand import rand_bytes as get_random_bytes
+except ImportError:
     try:
-        from M2Crypto.Rand import rand_bytes as get_random_bytes
+        from Cryptodome.Random import get_random_bytes
     except ImportError:
         try:
-            from Cryptodome.Random import get_random_bytes  # pylint: disable=E0611
+            from Crypto.Random import get_random_bytes  # nosec
         except ImportError:
-            from Crypto.Random import get_random_bytes  # pylint: disable=E0611
-    HAS_RANDOM = True
-except ImportError:
-    HAS_RANDOM = False
+            pass
+if get_random_bytes is None:
+    import secrets
+
+    def get_random_bytes(n):
+        return secrets.token_bytes(n)
+
+
+HAS_RANDOM = True
 
 try:
-    import crypt
+    import crypt  # pylint: disable=deprecated-module
 
-    HAS_CRYPT = True
-except ImportError:
+    # We need to ensure if the right `crypt` is loaded,
+    # as LazyLoader can load `salt.utils.crypt` instead of `crypt`
+    # if there is Python has no `crypt` (was removed in 3.11).
+    HAS_CRYPT = hasattr(crypt, "methods")
+except (ImportError, PermissionError):
     HAS_CRYPT = False
 
 try:
@@ -41,28 +51,61 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 
-def secure_password(length=20, use_random=True):
+def secure_password(
+    length=20,
+    use_random=True,
+    chars=None,
+    lowercase=True,
+    uppercase=True,
+    digits=True,
+    punctuation=True,
+    whitespace=False,
+    printable=False,
+):
     """
     Generate a secure password.
     """
+    chars = chars or ""
+    if printable:
+        # as printable includes all other string character classes
+        # the other checks can be skipped
+        chars = string.printable
+    if not chars:
+        if lowercase:
+            chars += string.ascii_lowercase
+        if uppercase:
+            chars += string.ascii_uppercase
+        if digits:
+            chars += string.digits
+        if punctuation:
+            chars += string.punctuation
+        if whitespace:
+            chars += string.whitespace
     try:
         length = int(length)
         pw = ""
         while len(pw) < length:
             if HAS_RANDOM and use_random:
+                encoding = None
+                if salt.utils.platform.is_windows():
+                    encoding = "UTF-8"
                 while True:
                     try:
-                        char = salt.utils.stringutils.to_str(get_random_bytes(1))
+                        char = salt.utils.stringutils.to_str(
+                            get_random_bytes(1), encoding=encoding
+                        )
                         break
                     except UnicodeDecodeError:
                         continue
                 pw += re.sub(
-                    salt.utils.stringutils.to_str(r"[\W_]"),
-                    "",  # future lint: disable=blacklisted-function
+                    salt.utils.stringutils.to_str(
+                        rf"[^{re.escape(chars)}]", encoding=encoding
+                    ),
+                    "",
                     char,
                 )
             else:
-                pw += random.SystemRandom().choice(string.ascii_letters + string.digits)
+                pw += random.SystemRandom().choice(chars)
         return pw
     except Exception as exc:  # pylint: disable=broad-except
         log.exception("Failed to generate secure passsword")
@@ -109,7 +152,7 @@ def _gen_hash_crypt(crypt_salt=None, password=None, algorithm=None):
     else:
         if algorithm != "crypt":
             # all non-crypt algorithms are specified as part of the salt
-            crypt_salt = "${}${}".format(methods[algorithm].ident, crypt_salt)
+            crypt_salt = f"${methods[algorithm].ident}${crypt_salt}"
 
     try:
         ret = crypt.crypt(password, crypt_salt)

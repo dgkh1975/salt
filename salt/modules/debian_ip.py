@@ -6,31 +6,25 @@ References:
 * http://www.debian.org/doc/manuals/debian-reference/ch05.en.html
 """
 
-# Import python libs
-
 import functools
+import io
 import logging
 import os
 import os.path
 import re
 import time
+from collections import OrderedDict
 
-# Import third party libs
 import jinja2
 import jinja2.exceptions
 
-# Import salt libs
 import salt.utils.dns
 import salt.utils.files
-import salt.utils.odict
+import salt.utils.path
 import salt.utils.stringutils
 import salt.utils.templates
 import salt.utils.validate.net
-from salt.ext.six.moves import (  # pylint: disable=import-error,no-name-in-module
-    StringIO,
-)
 
-# Set up logging
 log = logging.getLogger(__name__)
 
 # Set up template environment
@@ -46,11 +40,26 @@ __virtualname__ = "ip"
 
 def __virtual__():
     """
-    Confine this module to Debian-based distros
+    Confine this module to Debian-based distros that manage networking with
+    ifupdown (``/etc/network/interfaces``).
+
+    On netplan-based systems (Ubuntu 18.04+ and Debian where netplan is the
+    active renderer) the :py:mod:`netplan_ip <salt.modules.netplan_ip>`
+    provider claims the ``ip`` virtual instead, because writing
+    ``/etc/network/interfaces`` there has no effect (issue #62219).
     """
-    if __grains__["os_family"] == "Debian":
-        return __virtualname__
-    return (False, "The debian_ip module could not be loaded: unsupported OS family")
+    if __grains__["os_family"] != "Debian":
+        return (
+            False,
+            "The debian_ip module could not be loaded: unsupported OS family",
+        )
+    if salt.utils.path.which("netplan") and os.path.isdir("/etc/netplan"):
+        return (
+            False,
+            "The debian_ip module is not loaded: netplan is the active renderer; "
+            "the netplan_ip provider handles the 'ip' virtual instead",
+        )
+    return __virtualname__
 
 
 _ETHTOOL_CONFIG_OPTS = {
@@ -271,7 +280,7 @@ def _parse_current_network_settings():
     """
     Parse /etc/default/networking and return current configuration
     """
-    opts = salt.utils.odict.OrderedDict()
+    opts = OrderedDict()
     opts["networking"] = ""
 
     if os.path.isfile(_DEB_NETWORKING_FILE):
@@ -373,9 +382,9 @@ def __within2(value, within=None, errmsg=None, dtype=None):
                 "__name__",
                 hasattr(dtype, "__class__") and getattr(dtype.__class__, "name", dtype),
             )
-            errmsg = "{} within '{}'".format(typename, within)
+            errmsg = f"{typename} within '{within}'"
         else:
-            errmsg = "within '{}'".format(within)
+            errmsg = f"within '{within}'"
     return (valid, _value, errmsg)
 
 
@@ -394,7 +403,7 @@ def __space_delimited_list(value):
         return (
             False,
             value,
-            "{} is not a valid space-delimited value.\n".format(value),
+            f"{value} is not a valid space-delimited value.\n",
         )
 
 
@@ -404,6 +413,11 @@ SALT_ATTR_TO_DEBIAN_ATTR_MAP = {
     "hwaddr": "hwaddress",  # TODO: this limits bootp functionality
     "ipaddr": "address",
     "ipaddrs": "addresses",
+    # Aliases so rh_ip-style names resolve to the Debian attributes.  This
+    # lets ``ipv6addr``/``ipv6addrs`` (stripped to ``addr``/``addrs``) and the
+    # bare ``addr``/``addrs`` map to the same address stanzas as ``ipaddr``.
+    "addr": "address",
+    "addrs": "addresses",
 }
 
 
@@ -411,6 +425,7 @@ DEBIAN_ATTR_TO_SALT_ATTR_MAP = {v: k for (k, v) in SALT_ATTR_TO_DEBIAN_ATTR_MAP.
 
 # TODO
 DEBIAN_ATTR_TO_SALT_ATTR_MAP["address"] = "address"
+DEBIAN_ATTR_TO_SALT_ATTR_MAP["addresses"] = "addresses"
 DEBIAN_ATTR_TO_SALT_ATTR_MAP["hwaddress"] = "hwaddress"
 
 IPV4_VALID_PROTO = ["bootp", "dhcp", "static", "manual", "loopback", "ppp"]
@@ -556,14 +571,13 @@ def _parse_interfaces(interface_files=None):
         # Add this later.
         if os.path.exists(_DEB_NETWORK_DIR):
             interface_files += [
-                "{}/{}".format(_DEB_NETWORK_DIR, dir)
-                for dir in os.listdir(_DEB_NETWORK_DIR)
+                f"{_DEB_NETWORK_DIR}/{dir}" for dir in os.listdir(_DEB_NETWORK_DIR)
             ]
 
         if os.path.isfile(_DEB_NETWORK_FILE):
             interface_files.insert(0, _DEB_NETWORK_FILE)
 
-    adapters = salt.utils.odict.OrderedDict()
+    adapters = OrderedDict()
     method = -1
 
     for interface_file in interface_files:
@@ -593,16 +607,14 @@ def _parse_interfaces(interface_files=None):
 
                     # Create item in dict, if not already there
                     if iface_name not in adapters:
-                        adapters[iface_name] = salt.utils.odict.OrderedDict()
+                        adapters[iface_name] = OrderedDict()
 
                     # Create item in dict, if not already there
                     if "data" not in adapters[iface_name]:
-                        adapters[iface_name]["data"] = salt.utils.odict.OrderedDict()
+                        adapters[iface_name]["data"] = OrderedDict()
 
                     if addrfam not in adapters[iface_name]["data"]:
-                        adapters[iface_name]["data"][
-                            addrfam
-                        ] = salt.utils.odict.OrderedDict()
+                        adapters[iface_name]["data"][addrfam] = OrderedDict()
 
                     iface_dict = adapters[iface_name]["data"][addrfam]
 
@@ -635,19 +647,19 @@ def _parse_interfaces(interface_files=None):
 
                     elif attr in _REV_ETHTOOL_CONFIG_OPTS:
                         if "ethtool" not in iface_dict:
-                            iface_dict["ethtool"] = salt.utils.odict.OrderedDict()
+                            iface_dict["ethtool"] = OrderedDict()
                         iface_dict["ethtool"][attr] = valuestr
 
                     elif attr.startswith("bond"):
                         opt = re.split(r"[_-]", attr, maxsplit=1)[1]
                         if "bonding" not in iface_dict:
-                            iface_dict["bonding"] = salt.utils.odict.OrderedDict()
+                            iface_dict["bonding"] = OrderedDict()
                         iface_dict["bonding"][opt] = valuestr
 
                     elif attr.startswith("bridge"):
                         opt = re.split(r"[_-]", attr, maxsplit=1)[1]
                         if "bridging" not in iface_dict:
-                            iface_dict["bridging"] = salt.utils.odict.OrderedDict()
+                            iface_dict["bridging"] = OrderedDict()
                         iface_dict["bridging"][opt] = valuestr
 
                     elif attr in [
@@ -667,32 +679,37 @@ def _parse_interfaces(interface_files=None):
                 elif line.startswith("auto"):
                     for word in line.split()[1:]:
                         if word not in adapters:
-                            adapters[word] = salt.utils.odict.OrderedDict()
+                            adapters[word] = OrderedDict()
                         adapters[word]["enabled"] = True
 
                 elif line.startswith("allow-hotplug"):
                     for word in line.split()[1:]:
                         if word not in adapters:
-                            adapters[word] = salt.utils.odict.OrderedDict()
+                            adapters[word] = OrderedDict()
                         adapters[word]["hotplug"] = True
 
                 elif line.startswith("source"):
                     if "source" not in adapters:
-                        adapters["source"] = salt.utils.odict.OrderedDict()
+                        adapters["source"] = OrderedDict()
 
                     # Create item in dict, if not already there
                     if "data" not in adapters["source"]:
-                        adapters["source"]["data"] = salt.utils.odict.OrderedDict()
+                        adapters["source"]["data"] = OrderedDict()
                         adapters["source"]["data"]["sources"] = []
                     adapters["source"]["data"]["sources"].append(line.split()[1])
 
+    adapters = _filter_malformed_interfaces(adapters=adapters)
+    return adapters
+
+
+def _filter_malformed_interfaces(*, adapters):
     # Return a sorted list of the keys for bond, bridge and ethtool options to
     # ensure a consistent order
-    for iface_name in adapters:
+    for iface_name in list(adapters):
         if iface_name == "source":
             continue
         if "data" not in adapters[iface_name]:
-            msg = "Interface file malformed for interface: {}.".format(iface_name)
+            msg = f"Interface file malformed for interface: {iface_name}."
             log.error(msg)
             adapters.pop(iface_name)
             continue
@@ -704,7 +721,6 @@ def _parse_interfaces(interface_files=None):
                             adapters[iface_name]["data"][inet][opt].keys()
                         )
                         adapters[iface_name]["data"][inet][opt + "_keys"] = opt_keys
-
     return adapters
 
 
@@ -842,7 +858,7 @@ def _parse_settings_bond(opts, iface):
         return _parse_settings_bond_3(opts, iface, bond_def)
     elif opts["mode"] in ["802.3ad", "4"]:
         log.info(
-            "Device: %s Bonding Mode: IEEE 802.3ad Dynamic link " "aggregation", iface
+            "Device: %s Bonding Mode: IEEE 802.3ad Dynamic link aggregation", iface
         )
         return _parse_settings_bond_4(opts, iface, bond_def)
     elif opts["mode"] in ["balance-tlb", "5"]:
@@ -912,7 +928,6 @@ def _parse_settings_bond_0(opts, iface, bond_def):
 
 
 def _parse_settings_bond_1(opts, iface, bond_def):
-
     """
     Filters given options and outputs valid settings for bond1.
     If an option has a value that is not expected, this
@@ -999,7 +1014,6 @@ def _parse_settings_bond_2(opts, iface, bond_def):
 
 
 def _parse_settings_bond_3(opts, iface, bond_def):
-
     """
     Filters given options and outputs valid settings for bond3.
     If an option has a value that is not expected, this
@@ -1086,7 +1100,6 @@ def _parse_settings_bond_4(opts, iface, bond_def):
 
 
 def _parse_settings_bond_5(opts, iface, bond_def):
-
     """
     Filters given options and outputs valid settings for bond5.
     If an option has a value that is not expected, this
@@ -1125,7 +1138,6 @@ def _parse_settings_bond_5(opts, iface, bond_def):
 
 
 def _parse_settings_bond_6(opts, iface, bond_def):
-
     """
     Filters given options and outputs valid settings for bond6.
     If an option has a value that is not expected, this
@@ -1205,7 +1217,7 @@ def _parse_bridge_opts(opts, iface):
             try:
                 port, cost_or_prio = opts[opt].split()
                 int(cost_or_prio)
-                config.update({opt: "{} {}".format(port, cost_or_prio)})
+                config.update({opt: f"{port} {cost_or_prio}"})
             except ValueError:
                 _raise_error_iface(iface, opt, ["interface integer"])
 
@@ -1238,15 +1250,15 @@ def _parse_settings_eth(opts, iface_type, enabled, iface):
     Filters given options and outputs valid settings for a
     network interface.
     """
-    adapters = salt.utils.odict.OrderedDict()
-    adapters[iface] = salt.utils.odict.OrderedDict()
+    adapters = OrderedDict()
+    adapters[iface] = OrderedDict()
 
     adapters[iface]["type"] = iface_type
 
-    adapters[iface]["data"] = salt.utils.odict.OrderedDict()
+    adapters[iface]["data"] = OrderedDict()
     iface_data = adapters[iface]["data"]
-    iface_data["inet"] = salt.utils.odict.OrderedDict()
-    iface_data["inet6"] = salt.utils.odict.OrderedDict()
+    iface_data["inet"] = OrderedDict()
+    iface_data["inet6"] = OrderedDict()
 
     if enabled:
         adapters[iface]["enabled"] = True
@@ -1299,9 +1311,9 @@ def _parse_settings_eth(opts, iface_type, enabled, iface):
             tmp_ethtool = _parse_ethtool_pppoe_opts(opts, iface)
             if tmp_ethtool:
                 for item in tmp_ethtool:
-                    adapters[iface]["data"][addrfam][
-                        _DEB_CONFIG_PPPOE_OPTS[item]
-                    ] = tmp_ethtool[item]
+                    adapters[iface]["data"][addrfam][_DEB_CONFIG_PPPOE_OPTS[item]] = (
+                        tmp_ethtool[item]
+                    )
             iface_data[addrfam]["addrfam"] = addrfam
 
     opts.pop("mode", None)
@@ -1354,7 +1366,7 @@ def _parse_settings_eth(opts, iface_type, enabled, iface):
             iface_data["inet6"][opt] = opts[opt]
 
     # Remove incomplete/disabled inet blocks
-    for (addrfam, opt) in [("inet", "enable_ipv4"), ("inet6", "enable_ipv6")]:
+    for addrfam, opt in [("inet", "enable_ipv4"), ("inet6", "enable_ipv6")]:
         if opts.get(opt, None) is False:
             iface_data.pop(addrfam)
         elif iface_data[addrfam].get("addrfam", "") != addrfam:
@@ -1368,12 +1380,12 @@ def _parse_settings_source(opts, iface_type, enabled, iface):
     Filters given options and outputs valid settings for a
     network interface.
     """
-    adapters = salt.utils.odict.OrderedDict()
-    adapters[iface] = salt.utils.odict.OrderedDict()
+    adapters = OrderedDict()
+    adapters[iface] = OrderedDict()
 
     adapters[iface]["type"] = iface_type
 
-    adapters[iface]["data"] = salt.utils.odict.OrderedDict()
+    adapters[iface]["data"] = OrderedDict()
     iface_data = adapters[iface]["data"]
     iface_data["sources"] = [opts["source"]]
 
@@ -1492,9 +1504,9 @@ def _write_file_network(data, filename, create=False):
     argument is True
     """
     if not os.path.exists(filename) and not create:
-        msg = "{0} cannot be written. {0} does not exist\
-                and create is set to False"
-        msg = msg.format(filename)
+        msg = "{0} cannot be written. {0} does not exist and create is setto False".format(
+            filename
+        )
         log.error(msg)
         raise AttributeError(msg)
     with salt.utils.files.flopen(filename, "w") as fout:
@@ -1505,7 +1517,7 @@ def _read_temp(data):
     """
     Return what would be written to disk
     """
-    tout = StringIO()
+    tout = io.StringIO()
     tout.write(data)
     tout.seek(0)
     output = tout.readlines()
@@ -1637,15 +1649,15 @@ def build_bond(iface, **settings):
     if "test" in settings and settings["test"]:
         return _read_temp(data)
 
-    _write_file(iface, data, _DEB_NETWORK_CONF_FILES, "{}.conf".format(iface))
-    path = os.path.join(_DEB_NETWORK_CONF_FILES, "{}.conf".format(iface))
+    _write_file(iface, data, _DEB_NETWORK_CONF_FILES, f"{iface}.conf")
+    path = os.path.join(_DEB_NETWORK_CONF_FILES, f"{iface}.conf")
     if deb_major == "5":
         for line_type in ("alias", "options"):
             cmd = [
                 "sed",
                 "-i",
                 "-e",
-                r"/^{}\s{}.*/d".format(line_type, iface),
+                rf"/^{line_type}\s{iface}.*/d",
                 "/etc/modprobe.conf",
             ]
             __salt__["cmd.run"](cmd, python_shell=False)
@@ -1654,8 +1666,8 @@ def build_bond(iface, **settings):
     # Load kernel module
     __salt__["kmod.load"]("bonding")
 
-    # install ifenslave-2.6
-    __salt__["pkg.install"]("ifenslave-2.6")
+    # install ifenslave
+    __salt__["pkg.install"]("ifenslave")
 
     return _read_file(path)
 
@@ -1663,6 +1675,10 @@ def build_bond(iface, **settings):
 def build_interface(iface, iface_type, enabled, **settings):
     """
     Build an interface script for a network interface.
+
+    The IPv6 address may be supplied either as ``ipv6ipaddr``/``ipv6ipaddrs``
+    or, for consistency with the Red Hat module, as ``ipv6addr``/``ipv6addrs``.
+    Both spellings map to the same Debian ``address``/``addresses`` stanzas.
 
     CLI Example:
 
@@ -1789,7 +1805,7 @@ def get_bond(iface):
 
         salt '*' ip.get_bond bond0
     """
-    path = os.path.join(_DEB_NETWORK_CONF_FILES, "{}.conf".format(iface))
+    path = os.path.join(_DEB_NETWORK_CONF_FILES, f"{iface}.conf")
     return _read_file(path)
 
 
@@ -1895,10 +1911,10 @@ def get_routes(iface):
         salt '*' ip.get_routes eth0
     """
 
-    filename = os.path.join(_DEB_NETWORK_UP_DIR, "route-{}".format(iface))
+    filename = os.path.join(_DEB_NETWORK_UP_DIR, f"route-{iface}")
     results = _read_file(filename)
 
-    filename = os.path.join(_DEB_NETWORK_DOWN_DIR, "route-{}".format(iface))
+    filename = os.path.join(_DEB_NETWORK_DOWN_DIR, f"route-{iface}")
     results += _read_file(filename)
 
     return results
@@ -2039,20 +2055,20 @@ def build_network_settings(**settings):
 
         for item in _read_file(_DEB_RESOLV_FILE):
             if domain_prog.match(item):
-                item = "domain {}".format(domainname)
+                item = f"domain {domainname}"
             elif search_prog.match(item):
-                item = "search {}".format(searchdomain)
+                item = f"search {searchdomain}"
             new_contents.append(item)
 
         # A domain line didn't exist so we'll add one in
         # with the new domainname
         if "domain" not in resolve:
-            new_contents.insert(0, "domain {}".format(domainname))
+            new_contents.insert(0, f"domain {domainname}")
 
         # A search line didn't exist so we'll add one in
         # with the new search domain
         if "search" not in resolve:
-            new_contents.insert("domain" in resolve, "search {}".format(searchdomain))
+            new_contents.insert("domain" in resolve, f"search {searchdomain}")
 
         new_resolv = "\n".join(new_contents)
 

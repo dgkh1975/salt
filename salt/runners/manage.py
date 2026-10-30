@@ -3,7 +3,6 @@ General management functions for salt, tools like seeing what hosts are up
 and what hosts are down
 """
 
-
 import logging
 import operator
 import os
@@ -53,10 +52,21 @@ def _ping(tgt, tgt_type, timeout, gather_job_timeout):
             tgt,
             tgt_type,
             gather_job_timeout=gather_job_timeout,
+            # ``get_cli_event_returns`` defaults ``expect_minions`` to True so
+            # the ``salt`` CLI emits per-target timeout rows. The manage
+            # runner derives ``up`` / ``down`` from actual returns and
+            # treating the synthesized ``no_return`` rows as returns would
+            # report every targeted minion as up (issue #69582).
+            expect_minions=False,
         ):
 
             if fn_ret:
-                for mid, _ in fn_ret.items():
+                for mid, min_ret in fn_ret.items():
+                    # Defense in depth: drop synthesized timeout rows in case
+                    # a caller passes ``expect_minions=True`` through kwargs
+                    # or a future change re-enables them by default.
+                    if isinstance(min_ret, dict) and min_ret.get("out") == "no_return":
+                        continue
                     log.debug("minion '%s' returned from ping", mid)
                     returned.add(mid)
 
@@ -134,7 +144,7 @@ def key_regen():
             path = os.path.join(root, fn_)
             try:
                 os.remove(path)
-            except os.error:
+            except OSError:
                 pass
     msg = (
         "The minion and master keys have been deleted.  Restart the Salt\n"
@@ -223,7 +233,7 @@ def list_state(subset=None, show_ip=False):
     detection (no commands will be sent to minions)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -253,7 +263,7 @@ def list_not_state(subset=None, show_ip=False):
     detection (no commands will be sent to minions)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -285,7 +295,7 @@ def present(subset=None, show_ip=False):
     detection (no commands will be sent to minions)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -308,7 +318,7 @@ def not_present(subset=None, show_ip=False):
     detection (no commands will be sent)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -331,7 +341,7 @@ def joined(subset=None, show_ip=False):
     detection (no commands will be sent to minions)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -354,7 +364,7 @@ def not_joined(subset=None, show_ip=False):
     detection (no commands will be sent)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -377,7 +387,7 @@ def allowed(subset=None, show_ip=False):
     detection (no commands will be sent to minions)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -400,7 +410,7 @@ def not_allowed(subset=None, show_ip=False):
     detection (no commands will be sent)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -423,7 +433,7 @@ def alived(subset=None, show_ip=False):
     detection (no commands will be sent to minions)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -446,7 +456,7 @@ def not_alived(subset=None, show_ip=False):
     detection (no commands will be sent)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -469,7 +479,7 @@ def reaped(subset=None, show_ip=False):
     detection (no commands will be sent to minions)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -492,7 +502,7 @@ def not_reaped(subset=None, show_ip=False):
     detection (no commands will be sent)
 
     subset : None
-        Pass in a CIDR range to filter minions by IP address.
+        Pass in a list of minion ids.
 
     show_ip : False
         Also show the IP address each minion is connecting from.
@@ -538,11 +548,12 @@ def safe_accept(target, tgt_type="glob"):
                 del ret[minion]
                 continue
             elif minion not in pending:
-                failures[minion] = "Minion key {} not found by salt-key".format(minion)
+                failures[minion] = f"Minion key {minion} not found by salt-key"
             elif pending[minion] != finger:
                 failures[minion] = (
-                    "Minion key {} does not match the key in "
-                    "salt-key: {}".format(finger, pending[minion])
+                    "Minion key {} does not match the key in salt-key: {}".format(
+                        finger, pending[minion]
+                    )
                 )
             else:
                 subprocess.call(["salt-key", "-qya", minion])
@@ -558,9 +569,7 @@ def safe_accept(target, tgt_type="glob"):
             print(message)
             print("")
 
-    __jid_event__.fire_event(
-        {"message": "Accepted {:d} keys".format(len(ret))}, "progress"
-    )
+    __jid_event__.fire_event({"message": f"Accepted {len(ret):d} keys"}, "progress")
     return ret, failures
 
 
@@ -577,7 +586,9 @@ def versions():
     ret = {}
     client = salt.client.get_local_client(__opts__["conf_file"])
     try:
-        minions = client.cmd("*", "test.version", timeout=__opts__["timeout"])
+        minions = client.cmd(
+            "*", "test.version", full_return=True, timeout=__opts__["timeout"]
+        )
     except SaltClientError as client_error:
         print(client_error)
         return ret
@@ -595,11 +606,11 @@ def versions():
     master_version = salt.version.__saltstack_version__
 
     for minion in minions:
-        if not minions[minion]:
+        if not minions[minion] or minions[minion]["retcode"]:
             minion_version = False
             ver_diff = -2
         else:
-            minion_version = salt.version.SaltStackVersion.parse(minions[minion])
+            minion_version = salt.version.SaltStackVersion.parse(minions[minion]["ret"])
             ver_diff = salt.utils.compat.cmp(minion_version, master_version)
 
         if ver_diff not in version_status:
@@ -623,7 +634,7 @@ def versions():
 
 def bootstrap(
     version="develop",
-    script=None,
+    script="https://github.com/saltstack/salt-bootstrap/releases/latest/download/bootstrap-salt.sh",
     hosts="",
     script_args="",
     roster="flat",
@@ -639,7 +650,7 @@ def bootstrap(
     version : develop
         Git tag of version to install
 
-    script : https://bootstrap.saltstack.com
+    script : https://github.com/saltstack/salt-bootstrap/releases/latest/download/bootstrap-salt.sh
         URL containing the script to execute
 
     hosts
@@ -694,17 +705,14 @@ def bootstrap(
 
         .. versionadded:: 2016.11.0
 
-
     CLI Example:
 
     .. code-block:: bash
 
         salt-run manage.bootstrap hosts='host1,host2'
-        salt-run manage.bootstrap hosts='host1,host2' version='v0.17'
-        salt-run manage.bootstrap hosts='host1,host2' version='v0.17' script='https://bootstrap.saltstack.com/develop'
+        salt-run manage.bootstrap hosts='host1,host2' version='v3006.2'
+        salt-run manage.bootstrap hosts='host1,host2' version='v3006.2' script='https://github.com/saltstack/salt-bootstrap/develop'
     """
-    if script is None:
-        script = "https://bootstrap.saltstack.com"
 
     client_opts = __opts__.copy()
     if roster is not None:
@@ -730,8 +738,8 @@ def bootstrap(
             client_opts["argv"] = [
                 "http.query",
                 script,
-                "backend={}".format(http_backend),
-                "text_out={}".format(deploy_command),
+                f"backend={http_backend}",
+                f"text_out={deploy_command}",
             ]
             salt.client.ssh.SSH(client_opts).run()
             client_opts["argv"] = [
@@ -772,7 +780,7 @@ def bootstrap_psexec(
 
     installer_url
         URL of minion installer executable. Defaults to the latest version from
-        https://repo.saltstack.com/windows/
+        https://packages.broadcom.com/artifactory/saltproject-generic/windows/
 
     username
         Optional user name for login on remote computer.
@@ -790,17 +798,20 @@ def bootstrap_psexec(
         salt-run manage.bootstrap_psexec hosts='host1,host2' installer_url='http://exampledomain/salt-installer.exe'
     """
 
+    # TODO: Need to make this gets the latest version from the new repo location
+    # TODO: Similar to tests/support/win_installer.py
+    # TODO: Maybe need to move that ^^^^ to a salt util
     if not installer_url:
-        base_url = "https://repo.saltstack.com/windows/"
+        base_url = "https://repo.saltproject.io/windows/"
         source = urllib.request.urlopen(base_url).read()
         salty_rx = re.compile(
             '>(Salt-Minion-(.+?)-(.+)-Setup.exe)</a></td><td align="right">(.*?)\\s*<'
         )
         source_list = sorted(
-            [
+            (
                 [path, ver, plat, time.strptime(date, "%d-%b-%Y %H:%M")]
                 for path, ver, plat, date in salty_rx.findall(source)
-            ],
+            ),
             key=operator.itemgetter(3),
             reverse=True,
         )
@@ -846,7 +857,7 @@ objShell.Exec("{1}{2}")"""
     vb_saltexec = "saltinstall.exe"
     vb_saltexec_args = " /S /minion-name=%COMPUTERNAME%"
     if master:
-        vb_saltexec_args += " /master={}".format(master)
+        vb_saltexec_args += f" /master={master}"
 
     # One further thing we need to do; the Windows Salt minion is pretty
     # self-contained, except for the Microsoft Visual C++ 2008 runtime.
@@ -875,7 +886,10 @@ objShell.Exec("{1}{2}")"""
     # This is to accommodate for reinstalling Salt over an old or broken build,
     # e.g. if the master address is changed, the salt-minion process will fail
     # to authenticate and quit; which means infinite restarts under Windows.
-    batch = "cd /d %TEMP%\nnet stop salt-minion\ndel c:\\salt\\conf\\pki\\minion\\minion_master.pub\n"
+    batch = (
+        "cd /d %TEMP%\nnet stop salt-minion\ndel"
+        " c:\\salt\\conf\\pki\\minion\\minion_master.pub\n"
+    )
 
     # Speaking of command-line hostile, cscript only supports reading a script
     # from a file. Glue it together line by line.

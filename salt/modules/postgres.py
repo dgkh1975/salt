@@ -16,6 +16,14 @@ Module to provide Postgres compatibility to salt.
     This data can also be passed into pillar. Options passed into opts will
     overwrite options passed into pillar
 
+To prevent Postgres commands from running arbitrarily long, a timeout (in seconds) can be set
+
+    .. code-block:: yaml
+
+        postgres.timeout: 60
+
+    .. versionadded:: 3006.0
+
 :note: This module uses MD5 hashing which may not be compliant with certain
     security audits.
 
@@ -27,27 +35,25 @@ Module to provide Postgres compatibility to salt.
         postgres.bins_dir: '/usr/pgsql-9.5/bin/'
 """
 
-# This pylint error is popping up where there are no colons?
-# pylint: disable=E8203
-
-
+import base64
 import datetime
 import hashlib
+import hmac
+import io
 import logging
 import os
-import pipes
 import re
+import shlex
 import tempfile
+from collections import OrderedDict
 
 import salt.utils.files
 import salt.utils.itertools
-import salt.utils.odict
 import salt.utils.path
 import salt.utils.stringutils
 from salt.exceptions import CommandExecutionError, SaltInvocationError
-from salt.ext.six.moves import zip  # pylint: disable=import-error,redefined-builtin
-from salt.ext.six.moves import StringIO
-from salt.utils.versions import LooseVersion as _LooseVersion
+from salt.ext.saslprep import saslprep
+from salt.utils.versions import LooseVersion
 
 try:
     import csv
@@ -56,11 +62,17 @@ try:
 except ImportError:
     HAS_CSV = False
 
+try:
+    from secrets import token_bytes
+except ImportError:
+    # python <3.6
+    from os import urandom as token_bytes
 
 log = logging.getLogger(__name__)
 
 
-_DEFAULT_PASSWORDS_ENCRYPTION = True
+_DEFAULT_PASSWORDS_ENCRYPTION = "md5"
+_DEFAULT_COMMAND_TIMEOUT_SECS = 0
 _EXTENSION_NOT_INSTALLED = "EXTENSION NOT INSTALLED"
 _EXTENSION_INSTALLED = "EXTENSION INSTALLED"
 _EXTENSION_TO_UPGRADE = "EXTENSION TO UPGRADE"
@@ -84,8 +96,31 @@ _PRIVILEGES_MAP = {
     "X": "EXECUTE",
     "x": "REFERENCES",
     "d": "DELETE",
+    "m": "MAINTAIN",
     "*": "GRANT",
 }
+_DEFAULT_PRIVILEGES_MAP = {
+    "a": "INSERT",
+    "C": "CREATE",
+    "D": "TRUNCATE",
+    "t": "TRIGGER",
+    "r": "SELECT",
+    "U": "USAGE",
+    "w": "UPDATE",
+    "X": "EXECUTE",
+    "x": "REFERENCES",
+    "d": "DELETE",
+    "*": "GRANT",
+}
+_DEFAULT_PRIVILEGES_OBJECTS = frozenset(
+    (
+        "schema",
+        "sequence",
+        "table",
+        "group",
+        "function",
+    )
+)
 _PRIVILEGES_OBJECTS = frozenset(
     (
         "schema",
@@ -99,12 +134,18 @@ _PRIVILEGES_OBJECTS = frozenset(
     )
 )
 _PRIVILEGE_TYPE_MAP = {
-    "table": "arwdDxt",
+    "table": "arwdDxtm",
     "tablespace": "C",
     "language": "U",
     "sequence": "rwU",
     "schema": "UC",
     "database": "CTc",
+    "function": "X",
+}
+_DEFAULT_PRIVILEGE_TYPE_MAP = {
+    "table": "arwdDxt",
+    "sequence": "rwU",
+    "schema": "UC",
     "function": "X",
 }
 
@@ -114,29 +155,25 @@ def __virtual__():
     Only load this module if the psql bin exist.
     initdb bin might also be used, but its presence will be detected on runtime.
     """
-    utils = ["psql"]
     if not HAS_CSV:
         return False
-    for util in utils:
-        if not salt.utils.path.which(util):
-            if not _find_pg_binary(util):
-                return (False, "{} was not found".format(util))
+    if not _find_pg_binary("psql"):
+        return (False, "psql was not found")
     return True
 
 
 def _find_pg_binary(util):
     """
-    ... versionadded::  2016.3.2
+    .. versionadded:: 2016.3.2
 
     Helper function to locate various psql related binaries
     """
     pg_bin_dir = __salt__["config.option"]("postgres.bins_dir")
-    util_bin = salt.utils.path.which(util)
-    if not util_bin:
-        if pg_bin_dir:
-            return salt.utils.path.which(os.path.join(pg_bin_dir, util))
-    else:
-        return util_bin
+    if pg_bin_dir:
+        util_bin = salt.utils.path.which(os.path.join(pg_bin_dir, util))
+        if util_bin:
+            return util_bin
+    return salt.utils.path.which(util)
 
 
 def _run_psql(cmd, runas=None, password=None, host=None, port=None, user=None):
@@ -147,13 +184,16 @@ def _run_psql(cmd, runas=None, password=None, host=None, port=None, user=None):
     kwargs = {
         "reset_system_locale": False,
         "clean_env": True,
+        "timeout": __salt__["config.option"](
+            "postgres.timeout", default=_DEFAULT_COMMAND_TIMEOUT_SECS
+        ),
     }
     if runas is None:
         if not host:
             host = __salt__["config.option"]("postgres.host")
         if not host or host.startswith("/"):
             if "FreeBSD" in __grains__["os_family"]:
-                runas = "pgsql"
+                runas = "postgres"
             elif "OpenBSD" in __grains__["os_family"]:
                 runas = "_postgresql"
             else:
@@ -209,7 +249,7 @@ def _run_initdb(
     """
     if runas is None:
         if "FreeBSD" in __grains__["os_family"]:
-            runas = "pgsql"
+            runas = "postgres"
         elif "OpenBSD" in __grains__["os_family"]:
             runas = "_postgresql"
         else:
@@ -222,14 +262,14 @@ def _run_initdb(
         raise CommandExecutionError("initdb executable not found.")
     cmd = [
         _INITDB_BIN,
-        "--pgdata={}".format(name),
-        "--username={}".format(user),
-        "--auth={}".format(auth),
-        "--encoding={}".format(encoding),
+        f"--pgdata={name}",
+        f"--username={user}",
+        f"--auth={auth}",
+        f"--encoding={encoding}",
     ]
 
     if locale is not None:
-        cmd.append("--locale={}".format(locale))
+        cmd.append(f"--locale={locale}")
 
     # intentionally use short option, as the long option name has been
     # renamed from "xlogdir" to "waldir" in PostgreSQL 10
@@ -243,12 +283,18 @@ def _run_initdb(
     if password is not None:
         pgpassfile = salt.utils.files.mkstemp(text=True)
         with salt.utils.files.fopen(pgpassfile, "w") as fp_:
-            fp_.write(salt.utils.stringutils.to_str("{}".format(password)))
+            fp_.write(salt.utils.stringutils.to_str(f"{password}"))
             __salt__["file.chown"](pgpassfile, runas, "")
-        cmd.extend(["--pwfile={}".format(pgpassfile)])
+        cmd.extend([f"--pwfile={pgpassfile}"])
 
-    kwargs = dict(runas=runas, clean_env=True)
-    cmdstr = " ".join([pipes.quote(c) for c in cmd])
+    kwargs = dict(
+        runas=runas,
+        clean_env=True,
+        timeout=__salt__["config.option"](
+            "postgres.timeout", default=_DEFAULT_COMMAND_TIMEOUT_SECS
+        ),
+    )
+    cmdstr = shlex.join(cmd)
     ret = __salt__["cmd.run_all"](cmdstr, python_shell=False, **kwargs)
 
     if ret.get("retcode", 0) != 0:
@@ -272,9 +318,7 @@ def version(
 
         salt '*' postgres.version
     """
-    query = (
-        "SELECT setting FROM pg_catalog.pg_settings " "WHERE name = 'server_version'"
-    )
+    query = "SELECT setting FROM pg_catalog.pg_settings WHERE name = 'server_version'"
     cmd = _psql_cmd(
         "-c",
         query,
@@ -313,7 +357,7 @@ def _parsed_version(
     )
 
     if psql_version:
-        return _LooseVersion(psql_version)
+        return LooseVersion(psql_version)
     else:
         log.warning(
             "Attempt to parse version of Postgres server failed. "
@@ -459,7 +503,7 @@ def psql_query(
     if cmdret["retcode"] > 0:
         return ret
 
-    csv_file = StringIO(cmdret["stdout"])
+    csv_file = io.StringIO(cmdret["stdout"])
     header = {}
     for row in csv.reader(
         csv_file,
@@ -559,9 +603,7 @@ def _quote_ddl_value(value, quote="'"):
     if value is None:
         return None
     if quote in value:  # detect trivial sqli
-        raise SaltInvocationError(
-            "Unsupported character {} in value: {}".format(quote, value)
-        )
+        raise SaltInvocationError(f"Unsupported character {quote} in value: {value}")
     return "{quote}{value}{quote}".format(quote=quote, value=value)
 
 
@@ -594,10 +636,10 @@ def db_create(
     """
 
     # Base query to create a database
-    query = 'CREATE DATABASE "{}"'.format(name)
+    query = f'CREATE DATABASE "{name}"'
 
     # "With"-options to create a database
-    with_args = salt.utils.odict.OrderedDict(
+    with_args = OrderedDict(
         [
             ("TABLESPACE", _quote_ddl_value(tablespace, '"')),
             # owner needs to be enclosed in double quotes so postgres
@@ -662,11 +704,9 @@ def db_alter(
     else:
         queries = []
         if owner:
-            queries.append('ALTER DATABASE "{}" OWNER TO "{}"'.format(name, owner))
+            queries.append(f'ALTER DATABASE "{name}" OWNER TO "{owner}"')
         if tablespace:
-            queries.append(
-                'ALTER DATABASE "{}" SET TABLESPACE "{}"'.format(name, tablespace)
-            )
+            queries.append(f'ALTER DATABASE "{name}" SET TABLESPACE "{tablespace}"')
         for query in queries:
             ret = _psql_prepare_and_run(
                 ["-c", query],
@@ -703,11 +743,10 @@ def db_remove(
         salt '*' postgres.db_remove 'dbname'
     """
     for query in [
-        'REVOKE CONNECT ON DATABASE "{db}" FROM public;'.format(db=name),
-        "SELECT pid, pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db}' AND pid <> pg_backend_pid();".format(
-            db=name
-        ),
-        'DROP DATABASE "{db}";'.format(db=name),
+        f'REVOKE CONNECT ON DATABASE "{name}" FROM public;',
+        "SELECT pid, pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname ="
+        " '{db}' AND pid <> pg_backend_pid();".format(db=name),
+        f'DROP DATABASE "{name}";',
     ]:
         ret = _psql_prepare_and_run(
             ["-c", query],
@@ -719,7 +758,7 @@ def db_remove(
             password=password,
         )
         if ret["retcode"] != 0:
-            raise Exception("Failed: ret={}".format(ret))
+            raise Exception(f"Failed: ret={ret}")
     return True
 
 
@@ -824,10 +863,10 @@ def tablespace_create(
     owner_query = ""
     options_query = ""
     if owner:
-        owner_query = 'OWNER "{}"'.format(owner)
+        owner_query = f'OWNER "{owner}"'
         # should come out looking like: 'OWNER postgres'
     if options:
-        optionstext = ["{} = {}".format(k, v) for k, v in options.items()]
+        optionstext = [f"{k} = {v}" for k, v in options.items()]
         options_query = "WITH ( {} )".format(", ".join(optionstext))
         # should come out looking like: 'WITH ( opt1 = 1.0, opt2 = 4.0 )'
     query = "CREATE TABLESPACE \"{}\" {} LOCATION '{}' {}".format(
@@ -880,9 +919,9 @@ def tablespace_alter(
     queries = []
 
     if new_name:
-        queries.append('ALTER TABLESPACE "{}" RENAME TO "{}"'.format(name, new_name))
+        queries.append(f'ALTER TABLESPACE "{name}" RENAME TO "{new_name}"')
     if new_owner:
-        queries.append('ALTER TABLESPACE "{}" OWNER TO "{}"'.format(name, new_owner))
+        queries.append(f'ALTER TABLESPACE "{name}" OWNER TO "{new_owner}"')
     if set_option:
         queries.append(
             'ALTER TABLESPACE "{}" SET ({} = {})'.format(
@@ -890,7 +929,7 @@ def tablespace_alter(
             )
         )
     if reset_option:
-        queries.append('ALTER TABLESPACE "{}" RESET ({})'.format(name, reset_option))
+        queries.append(f'ALTER TABLESPACE "{name}" RESET ({reset_option})')
 
     for query in queries:
         ret = _psql_prepare_and_run(
@@ -928,7 +967,7 @@ def tablespace_remove(
 
     .. versionadded:: 2015.8.0
     """
-    query = 'DROP TABLESPACE "{}"'.format(name)
+    query = f'DROP TABLESPACE "{name}"'
     ret = _psql_prepare_and_run(
         ["-c", query],
         user=user,
@@ -976,11 +1015,11 @@ def user_list(
         runas=runas,
     )
     if ver:
-        if ver >= _LooseVersion("9.1"):
+        if ver >= LooseVersion("9.1"):
             replication_column = "pg_roles.rolreplication"
         else:
             replication_column = "NULL"
-        if ver >= _LooseVersion("9.5"):
+        if ver >= LooseVersion("9.5"):
             rolcatupdate_column = "NULL"
         else:
             rolcatupdate_column = "pg_roles.rolcatupdate"
@@ -989,26 +1028,21 @@ def user_list(
         return False
 
     # will return empty string if return_password = False
-    _x = lambda s: s if return_password else ""
+    def _x(s):
+        return s if return_password else ""
 
     query = "".join(
         [
-            "SELECT "
-            'pg_roles.rolname as "name",'
-            'pg_roles.rolsuper as "superuser", '
-            'pg_roles.rolinherit as "inherits privileges", '
-            'pg_roles.rolcreaterole as "can create roles", '
-            'pg_roles.rolcreatedb as "can create databases", '
-            '{0} as "can update system catalogs", '
-            'pg_roles.rolcanlogin as "can login", '
-            '{1} as "replication", '
-            'pg_roles.rolconnlimit as "connections", '
-            "(SELECT array_agg(pg_roles2.rolname)"
-            "    FROM pg_catalog.pg_auth_members"
-            "    JOIN pg_catalog.pg_roles pg_roles2 ON (pg_auth_members.roleid = pg_roles2.oid)"
-            '    WHERE pg_auth_members.member = pg_roles.oid) as "groups",'
-            'pg_roles.rolvaliduntil::timestamp(0) as "expiry time", '
-            'pg_roles.rolconfig  as "defaults variables" ',
+            'SELECT pg_roles.rolname as "name",pg_roles.rolsuper as "superuser",'
+            ' pg_roles.rolinherit as "inherits privileges", pg_roles.rolcreaterole as'
+            ' "can create roles", pg_roles.rolcreatedb as "can create databases", {0}'
+            ' as "can update system catalogs", pg_roles.rolcanlogin as "can login", {1}'
+            ' as "replication", pg_roles.rolconnlimit as "connections", (SELECT'
+            " array_agg(pg_roles2.rolname)    FROM pg_catalog.pg_auth_members    JOIN"
+            " pg_catalog.pg_roles pg_roles2 ON (pg_auth_members.roleid = pg_roles2.oid)"
+            "    WHERE pg_auth_members.member = pg_roles.oid) as"
+            ' "groups",pg_roles.rolvaliduntil::timestamp(0) as "expiry time",'
+            ' pg_roles.rolconfig  as "defaults variables" ',
             _x(', COALESCE(pg_shadow.passwd, pg_authid.rolpassword) as "password" '),
             "FROM pg_roles ",
             _x("LEFT JOIN pg_authid ON pg_roles.oid = pg_authid.oid "),
@@ -1142,27 +1176,96 @@ def _add_role_flag(string, test, flag, cond=None, prefix="NO", addtxt="", skip=F
             cond = test
         if test is not None:
             if cond:
-                string = "{} {}".format(string, flag)
+                string = f"{string} {flag}"
             else:
-                string = "{0} {2}{1}".format(string, flag, prefix)
+                string = f"{string} {prefix}{flag}"
         if addtxt:
-            string = "{} {}".format(string, addtxt)
+            string = f"{string} {addtxt}"
     return string
 
 
 def _maybe_encrypt_password(role, password, encrypted=_DEFAULT_PASSWORDS_ENCRYPTION):
-    """
-    pgsql passwords are md5 hashes of the string: 'md5{password}{rolename}'
-    """
     if password is not None:
         password = str(password)
-    if encrypted and password and not password.startswith("md5"):
-        password = "md5{}".format(
-            hashlib.md5(
-                salt.utils.stringutils.to_bytes("{}{}".format(password, role))
-            ).hexdigest()
-        )
+    else:
+        return None
+
+    if encrypted is True:
+        encrypted = "md5"
+    if encrypted not in (False, "md5", "scram-sha-256"):
+        raise ValueError("Unknown password algorithm: " + str(encrypted))
+
+    if encrypted == "scram-sha-256" and not password.startswith("SCRAM-SHA-256"):
+        password = _scram_sha_256(password)
+    elif encrypted == "md5" and not password.startswith("md5"):
+        log.warning("The md5 password algorithm was deprecated in PostgreSQL 10")
+        password = _md5_password(role, password)
+    elif encrypted is False:
+        log.warning("Unencrypted passwords were removed in PostgreSQL 10")
+
     return password
+
+
+def _verify_password(role, password, verifier, method):
+    """
+    Test the given password against the verifier.
+
+    The given password may already be a verifier, in which case test for
+     simple equality.
+    """
+    if method == "md5" or method is True:
+        if password.startswith("md5"):
+            expected = password
+        else:
+            expected = _md5_password(role, password)
+    elif method == "scram-sha-256":
+        if password.startswith("SCRAM-SHA-256"):
+            expected = password
+        else:
+            match = re.match(r"^SCRAM-SHA-256\$(\d+):([^\$]+?)\$", verifier)
+            if match:
+                iterations = int(match.group(1))
+                salt_bytes = base64.b64decode(match.group(2))
+                expected = _scram_sha_256(
+                    password, salt_bytes=salt_bytes, iterations=iterations
+                )
+            else:
+                expected = object()
+    elif method is False:
+        expected = password
+    else:
+        expected = object()
+
+    return verifier == expected
+
+
+def _md5_password(role, password):
+    return "md5{}".format(
+        hashlib.md5(  # nosec
+            salt.utils.stringutils.to_bytes(f"{password}{role}")
+        ).hexdigest()
+    )
+
+
+def _scram_sha_256(password, salt_bytes=None, iterations=4096):
+    """
+    Build a SCRAM-SHA-256 password verifier.
+
+    Ported from https://doxygen.postgresql.org/scram-common_8c.html
+    """
+    if salt_bytes is None:
+        salt_bytes = token_bytes(16)
+    password = salt.utils.stringutils.to_bytes(saslprep(password))
+    salted_password = hashlib.pbkdf2_hmac("sha256", password, salt_bytes, iterations)
+    stored_key = hmac.new(salted_password, b"Client Key", "sha256").digest()
+    stored_key = hashlib.sha256(stored_key).digest()
+    server_key = hmac.new(salted_password, b"Server Key", "sha256").digest()
+    return "SCRAM-SHA-256${}:{}${}:{}".format(
+        iterations,
+        base64.b64encode(salt_bytes).decode("ascii"),
+        base64.b64encode(stored_key).decode("ascii"),
+        base64.b64encode(server_key).decode("ascii"),
+    )
 
 
 def _role_cmd_args(
@@ -1190,7 +1293,7 @@ def _role_cmd_args(
             login = True
         if typ_ == "group":
             login = False
-    # defaults to encrypted passwords (md5{password}{rolename})
+    # defaults to encrypted passwords
     if encrypted is None:
         encrypted = _DEFAULT_PASSWORDS_ENCRYPTION
     skip_passwd = False
@@ -1211,7 +1314,9 @@ def _role_cmd_args(
             )
         )
     if isinstance(valid_until, str) and bool(valid_until):
-        escaped_valid_until = "'{}'".format(valid_until.replace("'", "''"),)
+        escaped_valid_until = "'{}'".format(
+            valid_until.replace("'", "''"),
+        )
     skip_superuser = False
     if bool(db_role) and bool(superuser) == bool(db_role["superuser"]):
         skip_superuser = True
@@ -1232,7 +1337,7 @@ def _role_cmd_args(
             "flag": "ENCRYPTED",
             "test": (encrypted is not None and bool(rolepassword)),
             "skip": skip_passwd or isinstance(rolepassword, bool),
-            "cond": encrypted,
+            "cond": bool(encrypted),
             "prefix": "UN",
         },
         {
@@ -1256,7 +1361,7 @@ def _role_cmd_args(
         if isinstance(groups, list):
             groups = ",".join(groups)
         for group in groups.split(","):
-            sub_cmd = '{}; GRANT "{}" TO "{}"'.format(sub_cmd, group, name)
+            sub_cmd = f'{sub_cmd}; GRANT "{group}" TO "{name}"'
     return sub_cmd
 
 
@@ -1293,7 +1398,7 @@ def _role_create(
         log.info("%s '%s' already exists", typ_.capitalize(), name)
         return False
 
-    sub_cmd = 'CREATE ROLE "{}" WITH'.format(name)
+    sub_cmd = f'CREATE ROLE "{name}" WITH'
     sub_cmd = "{} {}".format(
         sub_cmd,
         _role_cmd_args(
@@ -1419,7 +1524,7 @@ def _role_update(
         log.info("%s '%s' could not be found", typ_.capitalize(), name)
         return False
 
-    sub_cmd = 'ALTER ROLE "{}" WITH'.format(name)
+    sub_cmd = f'ALTER ROLE "{name}" WITH'
     sub_cmd = "{} {}".format(
         sub_cmd,
         _role_cmd_args(
@@ -1526,7 +1631,7 @@ def _role_remove(
         return False
 
     # user exists, proceed
-    sub_cmd = 'DROP ROLE "{}"'.format(name)
+    sub_cmd = f'DROP ROLE "{name}"'
     _psql_prepare_and_run(
         ["-c", sub_cmd],
         runas=runas,
@@ -1560,7 +1665,7 @@ def available_extensions(
 
     """
     exts = []
-    query = "select * " "from pg_available_extensions();"
+    query = "select * from pg_available_extensions();"
     ret = psql_query(
         query,
         user=user,
@@ -1703,11 +1808,11 @@ def is_available_extension(
 
 def _pg_is_older_ext_ver(a, b):
     """
-    Compare versions of extensions using salt.utils.versions.LooseVersion.
+    Compare versions of extensions using `looseversion.LooseVersion`.
 
     Returns ``True`` if version a is lesser than b.
     """
-    return _LooseVersion(a) < _LooseVersion(b)
+    return LooseVersion(a) < LooseVersion(b)
 
 
 def is_installed_extension(
@@ -1908,14 +2013,14 @@ def create_extension(
             args = ["CREATE EXTENSION"]
             if if_not_exists:
                 args.append("IF NOT EXISTS")
-            args.append('"{}"'.format(name))
+            args.append(f'"{name}"')
             sargs = []
             if schema:
-                sargs.append('SCHEMA "{}"'.format(schema))
+                sargs.append(f'SCHEMA "{schema}"')
             if ext_version:
-                sargs.append("VERSION {}".format(ext_version))
+                sargs.append(f"VERSION {ext_version}")
             if from_version:
-                sargs.append("FROM {}".format(from_version))
+                sargs.append(f"FROM {from_version}")
             if sargs:
                 args.append("WITH")
                 args.extend(sargs)
@@ -1924,13 +2029,9 @@ def create_extension(
         else:
             args = []
             if schema and _EXTENSION_TO_MOVE in mtdata:
-                args.append(
-                    'ALTER EXTENSION "{}" SET SCHEMA "{}";'.format(name, schema)
-                )
+                args.append(f'ALTER EXTENSION "{name}" SET SCHEMA "{schema}";')
             if ext_version and _EXTENSION_TO_UPGRADE in mtdata:
-                args.append(
-                    'ALTER EXTENSION "{}" UPDATE TO {};'.format(name, ext_version)
-                )
+                args.append(f'ALTER EXTENSION "{name}" UPDATE TO {ext_version};')
             cmd = " ".join(args).strip()
         if cmd:
             _psql_prepare_and_run(
@@ -2140,7 +2241,7 @@ def owner_to(
 
     sqlfile = tempfile.NamedTemporaryFile()
     sqlfile.write("begin;\n")
-    sqlfile.write('alter database "{}" owner to "{}";\n'.format(dbname, ownername))
+    sqlfile.write(f'alter database "{dbname}" owner to "{ownername}";\n')
 
     queries = (
         # schemas
@@ -2248,9 +2349,9 @@ def schema_create(
         log.info("'%s' already exists in '%s'", name, dbname)
         return False
 
-    sub_cmd = 'CREATE SCHEMA "{}"'.format(name)
+    sub_cmd = f'CREATE SCHEMA "{name}"'
     if owner is not None:
-        sub_cmd = '{} AUTHORIZATION "{}"'.format(sub_cmd, owner)
+        sub_cmd = f'{sub_cmd} AUTHORIZATION "{owner}"'
 
     ret = _psql_prepare_and_run(
         ["-c", sub_cmd],
@@ -2314,7 +2415,7 @@ def schema_remove(
         return False
 
     # schema exists, proceed
-    sub_cmd = 'DROP SCHEMA "{}"'.format(name)
+    sub_cmd = f'DROP SCHEMA "{name}"'
     _psql_prepare_and_run(
         ["-c", sub_cmd],
         runas=user,
@@ -2634,7 +2735,7 @@ def language_create(
         log.info("Language %s already exists in %s", name, maintenance_db)
         return False
 
-    query = "CREATE LANGUAGE {}".format(name)
+    query = f"CREATE LANGUAGE {name}"
 
     ret = _psql_prepare_and_run(
         ["-c", query],
@@ -2689,7 +2790,7 @@ def language_remove(
         log.info("Language %s does not exist in %s", name, maintenance_db)
         return False
 
-    query = "DROP LANGUAGE {}".format(name)
+    query = f"DROP LANGUAGE {name}"
 
     ret = _psql_prepare_and_run(
         ["-c", query],
@@ -2702,6 +2803,89 @@ def language_remove(
     )
 
     return ret["retcode"] == 0
+
+
+def _make_default_privileges_list_query(name, object_type, prepend):
+    """
+    Generate the SQL required for specific object type
+    """
+    if object_type == "table":
+        query = (
+            " ".join(
+                [
+                    "SELECT defacl.defaclacl AS name",
+                    "FROM pg_default_acl defacl",
+                    "JOIN pg_authid aid",
+                    "ON defacl.defaclrole = aid.oid ",
+                    "JOIN pg_namespace nsp ",
+                    "ON nsp.oid = defacl.defaclnamespace",
+                    "WHERE nsp.nspname = '{0}'",
+                    "AND defaclobjtype ='r'",
+                    "ORDER BY nspname",
+                ]
+            )
+        ).format(prepend)
+    elif object_type == "sequence":
+        query = (
+            " ".join(
+                [
+                    "SELECT defacl.defaclacl AS name",
+                    "FROM pg_default_acl defacl",
+                    "JOIN pg_authid aid",
+                    "ON defacl.defaclrole = aid.oid ",
+                    "JOIN pg_namespace nsp ",
+                    "ON nsp.oid = defacl.defaclnamespace",
+                    "WHERE nsp.nspname = '{0}'",
+                    "AND defaclobjtype ='S'",
+                    "ORDER BY nspname",
+                ]
+            )
+        ).format(prepend, name)
+    elif object_type == "schema":
+        query = (
+            " ".join(
+                [
+                    "SELECT nspacl AS name",
+                    "FROM pg_catalog.pg_namespace",
+                    "WHERE nspname = '{0}'",
+                    "ORDER BY nspname",
+                ]
+            )
+        ).format(name)
+    elif object_type == "function":
+        query = (
+            " ".join(
+                [
+                    "SELECT defacl.defaclacl AS name",
+                    "FROM pg_default_acl defacl",
+                    "JOIN pg_authid aid",
+                    "ON defacl.defaclrole = aid.oid ",
+                    "JOIN pg_namespace nsp ",
+                    "ON nsp.oid = defacl.defaclnamespace",
+                    "WHERE nsp.nspname = '{0}'",
+                    "AND defaclobjtype ='f'",
+                    "ORDER BY nspname",
+                ]
+            )
+        ).format(prepend, name)
+    elif object_type == "group":
+        query = (
+            " ".join(
+                [
+                    "SELECT rolname, admin_option",
+                    "FROM pg_catalog.pg_auth_members m",
+                    "JOIN pg_catalog.pg_roles r",
+                    "ON m.member=r.oid",
+                    "WHERE m.roleid IN",
+                    "(SELECT oid",
+                    "FROM pg_catalog.pg_roles",
+                    "WHERE rolname='{0}')",
+                    "ORDER BY rolname",
+                ]
+            )
+        ).format(name)
+
+    return query
 
 
 def _make_privileges_list_query(name, object_type, prepend):
@@ -2718,7 +2902,7 @@ def _make_privileges_list_query(name, object_type, prepend):
                     "ON n.oid = c.relnamespace",
                     "WHERE nspname = '{0}'",
                     "AND relname = '{1}'",
-                    "AND relkind = 'r'",
+                    "AND relkind in ('r', 'v')",
                     "ORDER BY relname",
                 ]
             )
@@ -2877,6 +3061,8 @@ def _get_object_owner(
                     "FROM pg_catalog.pg_proc p",
                     "JOIN pg_catalog.pg_namespace n",
                     "ON n.oid = p.pronamespace",
+                    "JOIN pg_catalog.pg_roles r",
+                    "ON p.proowner = r.oid",
                     "WHERE nspname = '{0}'",
                     "AND p.oid::regprocedure::text = '{1}'",
                     "ORDER BY proname, proargtypes",
@@ -2937,6 +3123,64 @@ def _get_object_owner(
     return ret
 
 
+def _validate_default_privileges(object_type, defprivs, defprivileges):
+    """
+    Validate the supplied privileges
+    """
+    if object_type != "group":
+        _defperms = [
+            _DEFAULT_PRIVILEGES_MAP[defperm]
+            for defperm in _DEFAULT_PRIVILEGE_TYPE_MAP[object_type]
+        ]
+        _defperms.append("ALL")
+
+        if object_type not in _DEFAULT_PRIVILEGES_OBJECTS:
+            raise SaltInvocationError(f"Invalid object_type: {object_type} provided")
+
+        if not set(defprivs).issubset(set(_defperms)):
+            raise SaltInvocationError(
+                "Invalid default privilege(s): {} provided for object {}".format(
+                    defprivileges, object_type
+                )
+            )
+    else:
+        if defprivileges:
+            raise SaltInvocationError(
+                "The default privileges option should not "
+                "be set for object_type group"
+            )
+
+
+def _mod_defpriv_opts(object_type, defprivileges):
+    """
+    Format options
+    """
+    object_type = object_type.lower()
+    defprivileges = "" if defprivileges is None else defprivileges
+    _defprivs = re.split(r"\s?,\s?", defprivileges.upper())
+
+    return object_type, defprivileges, _defprivs
+
+
+def _process_defpriv_part(defperms):
+    """
+    Process part
+    """
+    _tmp = {}
+    previous = None
+    for defperm in defperms:
+        if previous is None:
+            _tmp[_DEFAULT_PRIVILEGES_MAP[defperm]] = False
+            previous = _DEFAULT_PRIVILEGES_MAP[defperm]
+        else:
+            if defperm == "*":
+                _tmp[previous] = True
+            else:
+                _tmp[_DEFAULT_PRIVILEGES_MAP[defperm]] = False
+                previous = _DEFAULT_PRIVILEGES_MAP[defperm]
+    return _tmp
+
+
 def _validate_privileges(object_type, privs, privileges):
     """
     Validate the supplied privileges
@@ -2946,9 +3190,7 @@ def _validate_privileges(object_type, privs, privileges):
         _perms.append("ALL")
 
         if object_type not in _PRIVILEGES_OBJECTS:
-            raise SaltInvocationError(
-                "Invalid object_type: {} provided".format(object_type)
-            )
+            raise SaltInvocationError(f"Invalid object_type: {object_type} provided")
 
         if not set(privs).issubset(set(_perms)):
             raise SaltInvocationError(
@@ -2959,7 +3201,7 @@ def _validate_privileges(object_type, privs, privileges):
     else:
         if privileges:
             raise SaltInvocationError(
-                "The privileges option should not " "be set for object_type group"
+                "The privileges option should not be set for object_type group"
             )
 
 
@@ -2991,6 +3233,103 @@ def _process_priv_part(perms):
                 _tmp[_PRIVILEGES_MAP[perm]] = False
                 previous = _PRIVILEGES_MAP[perm]
     return _tmp
+
+
+def default_privileges_list(
+    name,
+    object_type,
+    prepend="public",
+    maintenance_db=None,
+    user=None,
+    host=None,
+    port=None,
+    password=None,
+    runas=None,
+):
+    """
+    .. versionadded:: 3009.0
+
+    Return a list of default privileges for the specified object.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' postgres.default_privileges_list table_name table maintenance_db=db_name
+
+    name
+       Name of the object for which the permissions should be returned
+
+    object_type
+       The object type, which can be one of the following:
+
+       - table
+       - sequence
+       - schema
+       - group
+       - function
+
+    prepend
+        Table and Sequence object types live under a schema so this should be
+        provided if the object is not under the default `public` schema
+
+    maintenance_db
+        The database to connect to
+
+    user
+        database username if different from config or default
+
+    password
+        user password if any password for a specified user
+
+    host
+        Database host if different from config or default
+
+    port
+        Database port if different from config or default
+
+    runas
+        System user all operations should be performed on behalf of
+    """
+    object_type = object_type.lower()
+    query = _make_default_privileges_list_query(name, object_type, prepend)
+
+    if object_type not in _DEFAULT_PRIVILEGES_OBJECTS:
+        raise SaltInvocationError(f"Invalid object_type: {object_type} provided")
+
+    rows = psql_query(
+        query,
+        runas=runas,
+        host=host,
+        user=user,
+        port=port,
+        maintenance_db=maintenance_db,
+        password=password,
+    )
+
+    ret = {}
+
+    for row in rows:
+        if object_type != "group":
+            result = row["name"]
+            result = result.strip("{}")
+            parts = result.split(",")
+            for part in parts:
+                perms_part, _ = part.split("/")
+                rolename, defperms = perms_part.split("=")
+                if rolename == "":
+                    rolename = "public"
+                _tmp = _process_defpriv_part(defperms)
+                ret[rolename] = _tmp
+        else:
+            if row["admin_option"] == "t":
+                admin_option = True
+            else:
+                admin_option = False
+
+            ret[row["rolname"]] = admin_option
+
+    return ret
 
 
 def privileges_list(
@@ -3056,9 +3395,7 @@ def privileges_list(
     query = _make_privileges_list_query(name, object_type, prepend)
 
     if object_type not in _PRIVILEGES_OBJECTS:
-        raise SaltInvocationError(
-            "Invalid object_type: {} provided".format(object_type)
-        )
+        raise SaltInvocationError(f"Invalid object_type: {object_type} provided")
 
     rows = psql_query(
         query,
@@ -3078,8 +3415,15 @@ def privileges_list(
             result = result.strip("{}")
             parts = result.split(",")
             for part in parts:
-                perms_part, _ = part.split("/")
-                rolename, perms = perms_part.split("=")
+                if not part:
+                    # Empty ACL (e.g. after all privileges were revoked)
+                    continue
+                perms_part, _, _grantor = part.partition("/")
+                if "=" not in perms_part:
+                    # Malformed ACL entry; skip instead of crashing
+                    log.debug("Skipping malformed ACL entry: %s", part)
+                    continue
+                rolename, _, perms = perms_part.partition("=")
                 if rolename == "":
                     rolename = "public"
                 _tmp = _process_priv_part(perms)
@@ -3093,6 +3437,145 @@ def privileges_list(
             ret[row["rolname"]] = admin_option
 
     return ret
+
+
+def has_default_privileges(
+    name,
+    object_name,
+    object_type,
+    defprivileges=None,
+    grant_option=None,
+    prepend="public",
+    maintenance_db=None,
+    user=None,
+    host=None,
+    port=None,
+    password=None,
+    runas=None,
+):
+    """
+    .. versionadded:: 3009.0
+
+    Check if a role has the specified privileges on an object
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' postgres.has_default_privileges user_name table_name table \\
+        SELECT,INSERT maintenance_db=db_name
+
+    name
+       Name of the role whose privileges should be checked on object_type
+
+    object_name
+       Name of the object on which the check is to be performed
+
+    object_type
+       The object type, which can be one of the following:
+
+       - table
+       - sequence
+       - schema
+       - group
+       - function
+
+    privileges
+       Comma separated list of privileges to check, from the list below:
+
+       - INSERT
+       - CREATE
+       - TRUNCATE
+       - TRIGGER
+       - SELECT
+       - USAGE
+       - UPDATE
+       - EXECUTE
+       - REFERENCES
+       - DELETE
+       - ALL
+
+    grant_option
+        If grant_option is set to True, the grant option check is performed
+
+    prepend
+        Table and Sequence object types live under a schema so this should be
+        provided if the object is not under the default `public` schema
+
+    maintenance_db
+        The database to connect to
+
+    user
+        database username if different from config or default
+
+    password
+        user password if any password for a specified user
+
+    host
+        Database host if different from config or default
+
+    port
+        Database port if different from config or default
+
+    runas
+        System user all operations should be performed on behalf of
+    """
+    object_type, defprivileges, _defprivs = _mod_defpriv_opts(
+        object_type, defprivileges
+    )
+
+    _validate_default_privileges(object_type, _defprivs, defprivileges)
+
+    if object_type != "group":
+        owner = _get_object_owner(
+            object_name,
+            object_type,
+            prepend=prepend,
+            maintenance_db=maintenance_db,
+            user=user,
+            host=host,
+            port=port,
+            password=password,
+            runas=runas,
+        )
+        if owner is not None and name == owner:
+            return True
+
+    _defprivileges = default_privileges_list(
+        object_name,
+        object_type,
+        prepend=prepend,
+        maintenance_db=maintenance_db,
+        user=user,
+        host=host,
+        port=port,
+        password=password,
+        runas=runas,
+    )
+
+    if name in _defprivileges:
+        if object_type == "group":
+            if grant_option:
+                retval = _defprivileges[name]
+            else:
+                retval = True
+            return retval
+        else:
+            _defperms = _DEFAULT_PRIVILEGE_TYPE_MAP[object_type]
+            if grant_option:
+                defperms = {
+                    _DEFAULT_PRIVILEGES_MAP[defperm]: True for defperm in _defperms
+                }
+                retval = defperms == _defprivileges[name]
+            else:
+                defperms = [_DEFAULT_PRIVILEGES_MAP[defperm] for defperm in _defperms]
+                if "ALL" in _defprivs:
+                    retval = defperms.sort() == _defprivileges[name].keys().sort()
+                else:
+                    retval = set(_defprivs).issubset(set(_defprivileges[name].keys()))
+            return retval
+
+    return False
 
 
 def has_privileges(
@@ -3235,6 +3718,301 @@ def has_privileges(
     return False
 
 
+def default_privileges_grant(
+    name,
+    object_name,
+    object_type,
+    defprivileges=None,
+    grant_option=None,
+    prepend="public",
+    maintenance_db=None,
+    user=None,
+    host=None,
+    port=None,
+    password=None,
+    runas=None,
+):
+    """
+    .. versionadded:: 3009.0
+
+    Grant default privileges on a postgres object
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' postgres.default_privileges_grant user_name table_name table \\
+        SELECT,UPDATE maintenance_db=db_name
+
+    name
+       Name of the role to which default privileges should be granted
+
+    object_name
+       Name of the object on which the grant is to be performed
+
+    object_type
+       The object type, which can be one of the following:
+
+       - table
+       - sequence
+       - schema
+       - group
+       - function
+
+    privileges
+       Comma separated list of privileges to grant, from the list below:
+
+       - INSERT
+       - CREATE
+       - TRUNCATE
+       - TRIGGER
+       - SELECT
+       - USAGE
+       - UPDATE
+       - EXECUTE
+       - REFERENCES
+       - DELETE
+       - ALL
+
+    grant_option
+        If grant_option is set to True, the recipient of the default privilege can
+        in turn grant it to others
+
+    prepend
+        Table and Sequence object types live under a schema so this should be
+        provided if the object is not under the default `public` schema
+
+    maintenance_db
+        The database to connect to
+
+    user
+        database username if different from config or default
+
+    password
+        user password if any password for a specified user
+
+    host
+        Database host if different from config or default
+
+    port
+        Database port if different from config or default
+
+    runas
+        System user all operations should be performed on behalf of
+    """
+    object_type, pdefrivileges, _defprivs = _mod_defpriv_opts(
+        object_type, defprivileges
+    )
+
+    _validate_default_privileges(object_type, _defprivs, defprivileges)
+
+    if has_default_privileges(
+        name,
+        object_name,
+        object_type,
+        defprivileges,
+        prepend=prepend,
+        maintenance_db=maintenance_db,
+        user=user,
+        host=host,
+        port=port,
+        password=password,
+        runas=runas,
+    ):
+        log.info(
+            "The object: %s of type: %s already has default privileges: %s set",
+            object_name,
+            object_type,
+            defprivileges,
+        )
+        return False
+
+    _grants = ",".join(_defprivs)
+
+    if object_type in ["table", "sequence"]:
+        on_part = f'{prepend}."{object_name}"'
+    elif object_type == "function":
+        on_part = f"{object_name}"
+    else:
+        on_part = f'"{object_name}"'
+
+    if grant_option:
+        if object_type == "group":
+            query = (
+                'ALTER DEFAULT PRIVILEGES GRANT {} TO "{}" WITH ADMIN OPTION'.format(
+                    object_name, name
+                )
+            )
+        elif (
+            object_type in ("table", "sequence", "function")
+            and object_name.upper() == "ALL"
+        ):
+            query = (
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA {2} GRANT {0} ON {1}S TO "
+                '"{3}" WITH GRANT OPTION'.format(
+                    _grants, object_type.upper(), prepend, name
+                )
+            )
+        else:
+            query = 'ALTER DEFAULT PRIVILEGES IN SCHEMA {2} GRANT {0} ON {1}S TO "{3}" WITH GRANT OPTION'.format(
+                _grants, object_type.upper(), on_part, name
+            )
+    else:
+        if object_type == "group":
+            query = 'ALTER DEFAULT PRIVILEGES GRANT {} TO "{}"'.format(
+                object_name, name
+            )
+        elif object_type in ("table", "sequence") and object_name.upper() == "ALL":
+            query = 'ALTER DEFAULT PRIVILEGES IN SCHEMA {2} GRANT {0} ON {1}S TO "{3}"'.format(
+                _grants, object_type.upper(), prepend, name
+            )
+        else:
+            query = 'ALTER DEFAULT PRIVILEGES IN SCHEMA {2} GRANT {0} ON {1}S TO "{3}"'.format(
+                _grants, object_type.upper(), prepend, name
+            )
+
+    ret = _psql_prepare_and_run(
+        ["-c", query],
+        user=user,
+        host=host,
+        port=port,
+        maintenance_db=maintenance_db,
+        password=password,
+        runas=runas,
+    )
+
+    return ret["retcode"] == 0
+
+
+def default_privileges_revoke(
+    name,
+    object_name,
+    object_type,
+    defprivileges=None,
+    prepend="public",
+    maintenance_db=None,
+    user=None,
+    host=None,
+    port=None,
+    password=None,
+    runas=None,
+):
+    """
+    .. versionadded:: 3009.0
+
+    Revoke default privileges on a postgres object
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' postgres.default_privileges_revoke user_name table_name table \\
+        SELECT,UPDATE maintenance_db=db_name
+
+    name
+       Name of the role whose default privileges should be revoked
+
+    object_name
+       Name of the object on which the revoke is to be performed
+
+    object_type
+       The object type, which can be one of the following:
+
+       - table
+       - sequence
+       - schema
+       - group
+       - function
+
+    privileges
+       Comma separated list of privileges to revoke, from the list below:
+
+       - INSERT
+       - CREATE
+       - TRUNCATE
+       - TRIGGER
+       - SELECT
+       - USAGE
+       - UPDATE
+       - EXECUTE
+       - REFERENCES
+       - DELETE
+       - ALL
+
+    maintenance_db
+        The database to connect to
+
+    user
+        database username if different from config or default
+
+    password
+        user password if any password for a specified user
+
+    host
+        Database host if different from config or default
+
+    port
+        Database port if different from config or default
+
+    runas
+        System user all operations should be performed on behalf of
+    """
+    object_type, defprivileges, _defprivs = _mod_defpriv_opts(
+        object_type, defprivileges
+    )
+
+    _validate_default_privileges(object_type, _defprivs, defprivileges)
+
+    if not has_default_privileges(
+        name,
+        object_name,
+        object_type,
+        defprivileges,
+        prepend=prepend,
+        maintenance_db=maintenance_db,
+        user=user,
+        host=host,
+        port=port,
+        password=password,
+        runas=runas,
+    ):
+        log.info(
+            "The object: %s of type: %s does not have default privileges: %s set",
+            object_name,
+            object_type,
+            defprivileges,
+        )
+        return False
+
+    _grants = ",".join(_defprivs)
+
+    if object_type in ["table", "sequence"]:
+        on_part = f"{prepend}.{object_name}"
+    else:
+        on_part = object_name
+
+    if object_type == "group":
+        query = f"ALTER DEFAULT PRIVILEGES REVOKE {object_name} FROM {name}"
+    else:
+        query = (
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {2} REVOKE {0} ON {1}S FROM {3}".format(
+                _grants, object_type.upper(), prepend, name
+            )
+        )
+
+    ret = _psql_prepare_and_run(
+        ["-c", query],
+        user=user,
+        host=host,
+        port=port,
+        maintenance_db=maintenance_db,
+        password=password,
+        runas=runas,
+    )
+
+    return ret["retcode"] == 0
+
+
 def privileges_grant(
     name,
     object_name,
@@ -3349,22 +4127,20 @@ def privileges_grant(
 
     _grants = ",".join(_privs)
 
-    if object_type in ["table", "sequence"]:
-        on_part = '{}."{}"'.format(prepend, object_name)
-    elif object_type == "function":
-        on_part = "{}".format(object_name)
+    if object_type in ["table", "sequence", "function"]:
+        on_part = f'{prepend}."{object_name}"'
     else:
-        on_part = '"{}"'.format(object_name)
+        on_part = f'"{object_name}"'
 
     if grant_option:
         if object_type == "group":
-            query = 'GRANT {} TO "{}" WITH ADMIN OPTION'.format(object_name, name)
-        elif object_type in ("table", "sequence") and object_name.upper() == "ALL":
-            query = (
-                "GRANT {} ON ALL {}S IN SCHEMA {} TO "
-                '"{}" WITH GRANT OPTION'.format(
-                    _grants, object_type.upper(), prepend, name
-                )
+            query = f'GRANT {object_name} TO "{name}" WITH ADMIN OPTION'
+        elif (
+            object_type in ("table", "sequence", "function")
+            and object_name.upper() == "ALL"
+        ):
+            query = 'GRANT {} ON ALL {}S IN SCHEMA {} TO "{}" WITH GRANT OPTION'.format(
+                _grants, object_type.upper(), prepend, name
             )
         else:
             query = 'GRANT {} ON {} {} TO "{}" WITH GRANT OPTION'.format(
@@ -3372,8 +4148,11 @@ def privileges_grant(
             )
     else:
         if object_type == "group":
-            query = 'GRANT {} TO "{}"'.format(object_name, name)
-        elif object_type in ("table", "sequence") and object_name.upper() == "ALL":
+            query = f'GRANT {object_name} TO "{name}"'
+        elif (
+            object_type in ("table", "sequence", "function")
+            and object_name.upper() == "ALL"
+        ):
             query = 'GRANT {} ON ALL {}S IN SCHEMA {} TO "{}"'.format(
                 _grants, object_type.upper(), prepend, name
             )
@@ -3491,7 +4270,7 @@ def privileges_revoke(
         runas=runas,
     ):
         log.info(
-            "The object: %s of type: %s does not" " have privileges: %s set",
+            "The object: %s of type: %s does not have privileges: %s set",
             object_name,
             object_type,
             privileges,
@@ -3500,13 +4279,13 @@ def privileges_revoke(
 
     _grants = ",".join(_privs)
 
-    if object_type in ["table", "sequence"]:
-        on_part = "{}.{}".format(prepend, object_name)
+    if object_type in ["table", "sequence", "function"]:
+        on_part = f'{prepend}."{object_name}"'
     else:
-        on_part = object_name
+        on_part = f'"{object_name}"'
 
     if object_type == "group":
-        query = "REVOKE {} FROM {}".format(object_name, name)
+        query = f"REVOKE {object_name} FROM {name}"
     else:
         query = "REVOKE {} ON {} {} FROM {}".format(
             _grants, object_type.upper(), on_part, name
@@ -3574,7 +4353,7 @@ def datadir_init(
     checksums
         If True, the cluster will be created with data page checksums.
 
-        .. note::  Data page checksums are supported since PostgreSQL 9.3.
+        .. note:: Data page checksums are supported since PostgreSQL 9.3.
 
         .. versionadded:: 2019.2.0
 
@@ -3593,6 +4372,7 @@ def datadir_init(
         password=password,
         encoding=encoding,
         locale=locale,
+        waldir=waldir,
         checksums=checksums,
         runas=runas,
     )

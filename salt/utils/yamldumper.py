@@ -1,26 +1,28 @@
-# -*- coding: utf-8 -*-
 """
     salt.utils.yamldumper
     ~~~~~~~~~~~~~~~~~~~~~
 
 """
+
 # pylint: disable=W0232
 #         class has no __init__ method
 
-from __future__ import absolute_import, print_function, unicode_literals
 
 import collections
+from collections import OrderedDict
+
+import yaml  # pylint: disable=blacklisted-import
 
 import salt.utils.context
-import yaml  # pylint: disable=blacklisted-import
-from salt.utils.odict import OrderedDict
+from salt.utils.datastructures import HashableOrderedDict
+from salt.utils.optsdict import DictProxy, ListProxy, OptsDict
+from salt.utils.secret import MaskedDict, MaskedList
 
 try:
     from yaml import CDumper as Dumper
     from yaml import CSafeDumper as SafeDumper
 except ImportError:
-    from yaml import Dumper
-    from yaml import SafeDumper
+    from yaml import Dumper, SafeDumper
 
 
 __all__ = [
@@ -41,7 +43,7 @@ class IndentMixin(Dumper):
     """
 
     def increase_indent(self, flow=False, indentless=False):
-        return super(IndentMixin, self).increase_indent(flow, False)
+        return super().increase_indent(flow, False)
 
 
 class OrderedDumper(Dumper):
@@ -71,9 +73,29 @@ def represent_undefined(dumper, data):
     return dumper.represent_scalar("tag:yaml.org,2002:null", "NULL")
 
 
+def represent_optsdict(dumper, data):
+    """Represent OptsDict as a plain dict for YAML serialization."""
+    # Use to_dict() to recursively convert proxies to plain types
+    return dumper.represent_dict(data.to_dict())
+
+
+def represent_dictproxy(dumper, data):
+    """Represent DictProxy as a plain dict for YAML serialization."""
+    return dumper.represent_dict(dict(data))
+
+
+def represent_listproxy(dumper, data):
+    """Represent ListProxy as a plain list for YAML serialization."""
+    return dumper.represent_list(list(data))
+
+
 OrderedDumper.add_representer(OrderedDict, represent_ordereddict)
+OrderedDumper.add_representer(HashableOrderedDict, represent_ordereddict)
 SafeOrderedDumper.add_representer(OrderedDict, represent_ordereddict)
+SafeOrderedDumper.add_representer(HashableOrderedDict, represent_ordereddict)
 SafeOrderedDumper.add_representer(None, represent_undefined)
+IndentedSafeOrderedDumper.add_representer(OrderedDict, represent_ordereddict)
+IndentedSafeOrderedDumper.add_representer(HashableOrderedDict, represent_ordereddict)
 
 OrderedDumper.add_representer(
     collections.defaultdict, yaml.representer.SafeRepresenter.represent_dict
@@ -88,6 +110,49 @@ OrderedDumper.add_representer(
 SafeOrderedDumper.add_representer(
     salt.utils.context.NamespacedDictWrapper,
     yaml.representer.SafeRepresenter.represent_dict,
+)
+
+OrderedDumper.add_representer(OptsDict, represent_optsdict)
+SafeOrderedDumper.add_representer(OptsDict, represent_optsdict)
+OrderedDumper.add_representer(DictProxy, represent_dictproxy)
+SafeOrderedDumper.add_representer(DictProxy, represent_dictproxy)
+OrderedDumper.add_representer(ListProxy, represent_listproxy)
+SafeOrderedDumper.add_representer(ListProxy, represent_listproxy)
+# Pillar containers are wrapped in MaskedDict / MaskedList for repr redaction;
+# they are still plain dict / list at the data level, so dump them as such
+# instead of falling through to represent_undefined (which would emit NULL).
+OrderedDumper.add_representer(
+    MaskedDict, yaml.representer.SafeRepresenter.represent_dict
+)
+SafeOrderedDumper.add_representer(
+    MaskedDict, yaml.representer.SafeRepresenter.represent_dict
+)
+IndentedSafeOrderedDumper.add_representer(
+    MaskedDict, yaml.representer.SafeRepresenter.represent_dict
+)
+OrderedDumper.add_representer(
+    MaskedList, yaml.representer.SafeRepresenter.represent_list
+)
+SafeOrderedDumper.add_representer(
+    MaskedList, yaml.representer.SafeRepresenter.represent_list
+)
+IndentedSafeOrderedDumper.add_representer(
+    MaskedList, yaml.representer.SafeRepresenter.represent_list
+)
+# Also register with base YAML dumpers for salt.utils.yaml.dump()
+yaml.Dumper.add_representer(OptsDict, represent_optsdict)
+yaml.SafeDumper.add_representer(OptsDict, represent_optsdict)
+yaml.Dumper.add_representer(DictProxy, represent_dictproxy)
+yaml.SafeDumper.add_representer(DictProxy, represent_dictproxy)
+yaml.Dumper.add_representer(ListProxy, represent_listproxy)
+yaml.SafeDumper.add_representer(ListProxy, represent_listproxy)
+yaml.Dumper.add_representer(MaskedDict, yaml.representer.SafeRepresenter.represent_dict)
+yaml.SafeDumper.add_representer(
+    MaskedDict, yaml.representer.SafeRepresenter.represent_dict
+)
+yaml.Dumper.add_representer(MaskedList, yaml.representer.SafeRepresenter.represent_list)
+yaml.SafeDumper.add_representer(
+    MaskedList, yaml.representer.SafeRepresenter.represent_list
 )
 
 OrderedDumper.add_representer(

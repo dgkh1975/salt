@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Module for managing Windows systems and getting Windows system information.
 Support for reboot, shutdown, join domain, rename
@@ -10,31 +9,28 @@ Support for reboot, shutdown, join domain, rename
     - win32net
     - wmi
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
-# Import Python libs
 import ctypes
 import logging
 import platform
 import time
 from datetime import datetime
 
-# Import salt libs
 import salt.utils.functools
 import salt.utils.locales
 import salt.utils.platform
 import salt.utils.win_system
 import salt.utils.winapi
 from salt.exceptions import CommandExecutionError
-from salt.ext import six
 
 try:
+    from ctypes import windll
+
     import pywintypes
     import win32api
     import win32con
     import win32net
     import wmi
-    from ctypes import windll
 
     HAS_WIN32NET_MODS = True
 except ImportError:
@@ -76,34 +72,26 @@ def _convert_date_time_string(dt_string):
     return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _to_unicode(instr):
-    """
-    Converts from current users character encoding to unicode.
-    When instr has a value of None, the return value of the function
-    will also be None.
-    """
-    if instr is None or isinstance(instr, six.text_type):
-        return instr
-    else:
-        return six.text_type(instr, "utf8")
-
-
 def halt(timeout=5, in_seconds=False):
     """
     Halt a running system.
 
     Args:
 
-        timeout (int):
-            Number of seconds before halting the system. Default is 5 seconds.
+        timeout (:obj:`int`, optional):
+            Number of minutes/seconds before halting the system.
 
-        in_seconds (bool):
+            Default is 5 minutes.
+
+        in_seconds (:obj:`bool`, optional):
             Whether to treat timeout as seconds or minutes.
+
+            Default is ``True``.
 
             .. versionadded:: 2015.8.0
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -141,17 +129,20 @@ def poweroff(timeout=5, in_seconds=False):
 
     Args:
 
-        timeout (int):
-            Number of seconds before powering off the system. Default is 5
-            seconds.
+        timeout (:obj:`int`, optional):
+            Number of minutes/seconds before powering off the system.
 
-        in_seconds (bool):
+            Default is 5 minutes.
+
+        in_seconds (:obj:`bool`, optional):
             Whether to treat timeout as seconds or minutes.
 
             .. versionadded:: 2015.8.0
 
+            Default is ``False``.
+
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -173,34 +164,40 @@ def reboot(
 
     Args:
 
-        timeout (int):
+        timeout (:obj:`int`, optional):
             The number of minutes/seconds before rebooting the system. Use of
-            minutes or seconds depends on the value of ``in_seconds``. Default
-            is 5 minutes.
+            minutes or seconds depends on the value of ``in_seconds``.
 
-        in_seconds (bool):
+            Default is 5 minutes.
+
+        in_seconds (:obj:`bool`, optional):
             ``True`` will cause the ``timeout`` parameter to be in seconds.
-             ``False`` will be in minutes. Default is ``False``.
+            ``False`` will be in minutes.
 
-            .. versionadded:: 2015.8.0
-
-        wait_for_reboot (bool)
-            ``True`` will sleep for timeout + 30 seconds after reboot has been
-            initiated. This is useful for use in a highstate. For example, you
-            may have states that you want to apply only after the reboot.
             Default is ``False``.
 
             .. versionadded:: 2015.8.0
 
-        only_on_pending_reboot (bool):
+        wait_for_reboot (:obj:`bool`, optional):
+            ``True`` will sleep for timeout + 30 seconds after reboot has been
+            initiated. This is useful for use in a highstate. For example, you
+            may have states that you want to apply only after the reboot.
+
+            Default is ``False``.
+
+            .. versionadded:: 2015.8.0
+
+        only_on_pending_reboot (:obj:`bool`, optional):
             If this is set to ``True``, then the reboot will only proceed
             if the system reports a pending reboot. Setting this parameter to
             ``True`` could be useful when calling this function from a final
             housekeeping state intended to be executed at the end of a state run
-            (using *order: last*). Default is ``False``.
+            (using *order: last*).
+
+            Default is ``False``.
 
     Returns:
-        bool: ``True`` if successful (a reboot will occur), otherwise ``False``
+        bool: ``True`` if successful (a reboot will occur), otherwise ``False``.
 
     CLI Example:
 
@@ -214,10 +211,10 @@ def reboot(
     .. code-block:: yaml
 
         final_housekeeping:
-           module.run:
-              - name: system.reboot
-              - only_on_pending_reboot: True
-              - order: last
+          module.run:
+            - name: system.reboot
+            - only_on_pending_reboot: True
+            - order: last
     """
     ret = shutdown(
         timeout=timeout,
@@ -246,10 +243,12 @@ def shutdown(
 
     Args:
 
-        message (str):
+        message (:obj:`str`, optional):
             The message to display to the user before shutting down.
 
-        timeout (int):
+            Default is ``None``.
+
+        timeout (:obj:`int`, optional):
             The length of time (in seconds) that the shutdown dialog box should
             be displayed. While this dialog box is displayed, the shutdown can
             be aborted using the ``system.shutdown_abort`` function.
@@ -268,50 +267,51 @@ def shutdown(
 
             Default is 5 minutes
 
-        in_seconds (bool):
+        in_seconds (:obj:`bool`, optional):
             ``True`` will cause the ``timeout`` parameter to be in seconds.
-             ``False`` will be in minutes. Default is ``False``.
+             ``False`` will be in minutes.
+
+             Default is ``False``.
 
             .. versionadded:: 2015.8.0
 
-        force_close (bool):
+        force_close (:obj:`bool`, optional):
             ``True`` will force close all open applications. ``False`` will
             display a dialog box instructing the user to close open
-            applications. Default is ``True``.
+            applications.
 
-        reboot (bool):
+            Default is ``True``.
+
+        reboot (:obj:`bool`, optional):
             ``True`` restarts the computer immediately after shutdown. ``False``
-            powers down the system. Default is ``False``.
+            powers down the system.
 
-        only_on_pending_reboot (bool): If this is set to True, then the shutdown
-            will only proceed if the system reports a pending reboot. To
-            optionally shutdown in a highstate, consider using the shutdown
-            state instead of this module.
+            Default is ``False``.
 
-        only_on_pending_reboot (bool):
+        only_on_pending_reboot (:obj:`bool`, optional):
             If ``True`` the shutdown will only proceed if there is a reboot
-            pending. ``False`` will shutdown the system. Default is ``False``.
+            pending. ``False`` will shutdown the system. To optionally shutdown
+            in a highstate, consider using the shutdown state instead of this
+            module.
+
+            Default is ``False``.
 
     Returns:
-        bool:
-            ``True`` if successful (a shutdown or reboot will occur), otherwise
-            ``False``
+        bool: ``True`` if successful (a shutdown or reboot will occur),
+            otherwise ``False``
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' system.shutdown "System will shutdown in 5 minutes"
+        salt '*' system.shutdown 'System will shutdown in 5 minutes'
     """
-    if six.PY2:
-        message = _to_unicode(message)
-
     timeout = _convert_minutes_seconds(timeout, in_seconds)
 
     if only_on_pending_reboot and not get_pending_reboot():
         return False
 
-    if message and not isinstance(message, six.string_types):
+    if message and not isinstance(message, str):
         message = message.decode("utf-8")
     try:
         win32api.InitiateSystemShutdown(
@@ -332,7 +332,7 @@ def shutdown_hard():
     Shutdown a running system with no timeout or warning.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -350,7 +350,7 @@ def shutdown_abort():
     aborted.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -375,7 +375,7 @@ def lock():
     Lock the workstation.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -396,9 +396,8 @@ def set_computer_name(name):
             The new name to give the computer. Requires a reboot to take effect.
 
     Returns:
-        dict:
-            Returns a dictionary containing the old and new names if successful.
-            ``False`` if not.
+        dict: Returns a dictionary containing the old and new names.
+        bool: ``False`` if failed to set computer name
 
     CLI Example:
 
@@ -406,9 +405,6 @@ def set_computer_name(name):
 
         salt 'minion-id' system.set_computer_name 'DavesComputer'
     """
-    if six.PY2:
-        name = _to_unicode(name)
-
     if windll.kernel32.SetComputerNameExW(
         win32con.ComputerNamePhysicalDnsHostname, name
     ):
@@ -430,9 +426,8 @@ def get_pending_computer_name():
     error message will be logged to the minion log.
 
     Returns:
-        str:
-            Returns the pending name if pending restart. Returns ``None`` if not
-            pending restart.
+        str: Returns the pending name if pending restart. Returns ``None`` if
+            not pending restart.
 
     CLI Example:
 
@@ -448,7 +443,7 @@ def get_computer_name():
     Get the Windows computer name
 
     Returns:
-        str: Returns the computer name if found. Otherwise returns ``False``.
+        str: Returns the computer name if found. Otherwise, returns ``False``.
 
     CLI Example:
 
@@ -461,15 +456,16 @@ def get_computer_name():
 
 def set_computer_desc(desc=None):
     """
-    Set the Windows computer description
+    Set the Windows computer description.
 
     Args:
 
-        desc (str):
-            The computer description
+        desc (:obj:`str`, optional): The computer description.
+
+            Default is ``None``.
 
     Returns:
-        str: Description if successful, otherwise ``False``
+        str: Description if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -477,9 +473,6 @@ def set_computer_desc(desc=None):
 
         salt 'minion-id' system.set_computer_desc 'This computer belongs to Dave!'
     """
-    if six.PY2:
-        desc = _to_unicode(desc)
-
     # Make sure the system exists
     # Return an object containing current information array for the computer
     system_info = win32net.NetServerGetInfo(None, 101)
@@ -533,16 +526,16 @@ def get_system_info():
 
     def byte_calc(val):
         val = float(val)
-        if val < 2 ** 10:
-            return "{0:.3f}B".format(val)
-        elif val < 2 ** 20:
-            return "{0:.3f}KB".format(val / 2 ** 10)
-        elif val < 2 ** 30:
-            return "{0:.3f}MB".format(val / 2 ** 20)
-        elif val < 2 ** 40:
-            return "{0:.3f}GB".format(val / 2 ** 30)
+        if val < 2**10:
+            return f"{val:.3f}B"
+        elif val < 2**20:
+            return f"{val / 2**10:.3f}KB"
+        elif val < 2**30:
+            return f"{val / 2**20:.3f}MB"
+        elif val < 2**40:
+            return f"{val / 2**30:.3f}GB"
         else:
-            return "{0:.3f}TB".format(val / 2 ** 40)
+            return f"{val / 2**40:.3f}TB"
 
     # Lookup dicts for Win32_OperatingSystem
     os_type = {1: "Work Station", 2: "Domain Controller", 3: "Server"}
@@ -640,9 +633,7 @@ def get_system_info():
         ret["processor_cores"] = 0
         ret["processor_cores_enabled"] = 0
         ret["processor_manufacturer"] = processors[0].Manufacturer
-        ret["processor_max_clock_speed"] = (
-            six.text_type(processors[0].MaxClockSpeed) + "MHz"
-        )
+        ret["processor_max_clock_speed"] = str(processors[0].MaxClockSpeed) + "MHz"
         for processor in processors:
             ret["processors"] += 1
             ret["processors_logical"] += processor.NumberOfLogicalProcessors
@@ -674,11 +665,11 @@ def get_system_info():
 
 def get_computer_desc():
     """
-    Get the Windows computer description
+    Get the Windows computer description.
 
     Returns:
-        str: Returns the computer description if found. Otherwise returns
-        ``False``.
+        str: Returns the computer description if found. Otherwise, returns
+            ``False``.
 
     CLI Example:
 
@@ -699,7 +690,7 @@ get_computer_description = salt.utils.functools.alias_function(
 
 def get_hostname():
     """
-    Get the hostname of the windows minion
+    Get the hostname of the windows minion.
 
     .. versionadded:: 2016.3.0
 
@@ -725,10 +716,11 @@ def set_hostname(hostname):
     .. versionadded:: 2016.3.0
 
     Args:
-        hostname (str): The hostname to set
+
+        hostname (str): The hostname to set.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -757,32 +749,41 @@ def join_domain(
 
         domain (str):
             The domain to which the computer should be joined, e.g.
-            ``example.com``
+            ``example.com``.
 
-        username (str):
+        username (:obj:`str`, optional):
             Username of an account which is authorized to join computers to the
             specified domain. Needs to be either fully qualified like
-            ``user@domain.tld`` or simply ``user``
+            ``user@domain.tld`` or simply ``user``.
 
-        password (str):
-            Password of the specified user
+            Default is ``None``.
 
-        account_ou (str):
+        password (:obj:`str`, optional):
+            Password of the specified user.
+
+            Default is ``None``.
+
+        account_ou (:obj:`str`, optional):
             The DN of the OU below which the account for this computer should be
             created when joining the domain, e.g.
-            ``ou=computers,ou=departm_432,dc=my-company,dc=com``
+            ``ou=computers,ou=departm_432,dc=my-company,dc=com``.
 
-        account_exists (bool):
+            Default is ``None``.
+
+        account_exists (:obj:`bool`, optional):
             If set to ``True`` the computer will only join the domain if the
-            account already exists. If set to ``False`` the computer account
+            account already exists. If set to ``False``, the computer account
             will be created if it does not exist, otherwise it will use the
-            existing account. Default is ``False``
+            existing account.
 
-        restart (bool):
-            ``True`` will restart the computer after a successful join. Default
-            is ``False``
+            Default is ``False``.
 
-            .. versionadded:: 2015.8.2/2015.5.7
+        restart (:obj:`bool`, optional):
+            ``True`` will restart the computer after a successful join.
+
+             Default is ``False``.
+
+            .. versionadded:: 2015.5.7,2015.8.2
 
     Returns:
         dict: Returns a dictionary if successful, otherwise ``False``
@@ -796,25 +797,19 @@ def join_domain(
                          account_ou='ou=clients,ou=org,dc=domain,dc=tld' \\
                          account_exists=False, restart=True
     """
-    if six.PY2:
-        domain = _to_unicode(domain)
-        username = _to_unicode(username)
-        password = _to_unicode(password)
-        account_ou = _to_unicode(account_ou)
-
     status = get_domain_workgroup()
     if "Domain" in status:
         if status["Domain"] == domain:
-            return "Already joined to {0}".format(domain)
+            return f"Already joined to {domain}"
 
     if username and "\\" not in username and "@" not in username:
-        username = "{0}@{1}".format(username, domain)
+        username = f"{username}@{domain}"
 
     if username and password is None:
         return "Must specify a password if you pass a username"
 
     # remove any escape characters
-    if isinstance(account_ou, six.string_types):
+    if isinstance(account_ou, str):
         account_ou = account_ou.split("\\")
         account_ou = "".join(account_ou)
 
@@ -842,26 +837,39 @@ def _join_domain(
     Helper function to join the domain.
 
     Args:
-        domain (str): The domain to which the computer should be joined, e.g.
-            ``example.com``
 
-        username (str): Username of an account which is authorized to join
-            computers to the specified domain. Need to be either fully qualified
-            like ``user@domain.tld`` or simply ``user``
+        domain (str):
+            The domain to which the computer should be joined, e.g.
+            ``example.com``.
 
-        password (str): Password of the specified user
+        username (:obj:`str`, optional):
+            Username of an account which is authorized to join computers to the
+            specified domain. Need to be either fully qualified like
+            ``user@domain.tld`` or simply ``user``.
 
-        account_ou (str): The DN of the OU below which the account for this
-            computer should be created when joining the domain, e.g.
-            ``ou=computers,ou=departm_432,dc=my-company,dc=com``
+            Default is ``None``.
 
-        account_exists (bool): If set to ``True`` the computer will only join
-            the domain if the account already exists. If set to ``False`` the
-            computer account will be created if it does not exist, otherwise it
-            will use the existing account. Default is False.
+        password (:obj:`str`, optional): Password of the specified user.
+
+            Default is ``None``.
+
+        account_ou (:obj:`str`, optional):
+            The DN of the OU below which the account for this computer should be
+            created when joining the domain, e.g.
+            ``ou=computers,ou=departm_432,dc=my-company,dc=com``.
+
+            Default is ``None``.
+
+        account_exists (:obj:`bool`, optional):
+            If set to ``True`` the computer will only join the domain if the
+            account already exists. If set to ``False``, the computer account
+            will be created if it does not exist, otherwise it will use the
+            existing account.
+
+            Default is ``False``.
 
     Returns:
-        int:
+        int: Representing the success of failure of the domain join
     """
     NETSETUP_JOIN_DOMAIN = 0x1  # pylint: disable=invalid-name
     NETSETUP_ACCOUNT_CREATE = 0x2  # pylint: disable=invalid-name
@@ -905,7 +913,7 @@ def unjoin_domain(
 
     Args:
 
-        username (str):
+        username (:obj:`str`, optional):
             Username of an account which is authorized to manage computer
             accounts on the domain. Needs to be a fully qualified name like
             ``user@domain.tld`` or ``domain.tld\\user``. If the domain is not
@@ -913,29 +921,39 @@ def unjoin_domain(
             doesn't need to be disabled after the computer is unjoined, this can
             be ``None``.
 
-        password (str):
-            The password of the specified user
+            Default is ``None``.
 
-        domain (str):
-            The domain from which to unjoin the computer. Can be ``None``
+        password (:obj:`str`, optional):
+            The password of the specified user.
 
-        workgroup (str):
-            The workgroup to join the computer to. Default is ``WORKGROUP``
+            Default is ``None``.
 
-            .. versionadded:: 2015.8.2/2015.5.7
+        domain (:obj:`str`, optional):
+            The domain from which to unjoin the computer. Can be ``None``.
 
-        disable (bool):
+            Default is ``None``.
+
+        workgroup (:obj:`str`, optional):
+            The workgroup to join the computer to.
+
+            Default is ``WORKGROUP``.
+
+            .. versionadded:: 2015.5.7,2015.8.2
+
+        disable (:obj:`bool`, optional):
             ``True`` to disable the computer account in Active Directory.
+
             Default is ``False``
 
-        restart (bool):
-            ``True`` will restart the computer after successful unjoin. Default
-            is ``False``
+        restart (:obj:`bool`, optional):
+            ``True`` will restart the computer after successful unjoin.
 
-            .. versionadded:: 2015.8.2/2015.5.7
+            Default is ``False``.
+
+            .. versionadded:: 2015.5.7,2015.8.2
 
     Returns:
-        dict: Returns a dictionary if successful, otherwise ``False``
+        dict: Returns a dictionary if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -948,19 +966,14 @@ def unjoin_domain(
                          restart=True
     """
     # pylint: enable=anomalous-backslash-in-string
-    if six.PY2:
-        username = _to_unicode(username)
-        password = _to_unicode(password)
-        domain = _to_unicode(domain)
-
     status = get_domain_workgroup()
     if "Workgroup" in status:
         if status["Workgroup"] == workgroup:
-            return "Already joined to {0}".format(workgroup)
+            return f"Already joined to {workgroup}"
 
     if username and "\\" not in username and "@" not in username:
         if domain:
-            username = "{0}@{1}".format(username, domain)
+            username = f"{username}@{domain}"
         else:
             return "Must specify domain if not supplied in username"
 
@@ -1008,7 +1021,7 @@ def get_domain_workgroup():
     .. versionadded:: 2015.8.2
 
     Returns:
-        str: The name of the domain or workgroup
+        str: The name of the domain or workgroup.
 
     CLI Example:
 
@@ -1031,8 +1044,13 @@ def set_domain_workgroup(workgroup):
 
     .. versionadded:: 3001
 
+    Args:
+
+        workgroup (str):
+            The name of the domain or workgroup.
+
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -1040,9 +1058,6 @@ def set_domain_workgroup(workgroup):
 
         salt 'minion-id' system.set_domain_workgroup LOCAL
     """
-    if six.PY2:
-        workgroup = _to_unicode(workgroup)
-
     # Initialize COM
     with salt.utils.winapi.Com():
         # Grab the first Win32_ComputerSystem object from wmi
@@ -1101,7 +1116,7 @@ def get_system_time():
     elif hours > 12:
         hours = hours - 12
         meridian = "PM"
-    return "{0:02d}:{1:02d}:{2:02d} {3}".format(hours, now[5], now[6], meridian)
+    return f"{hours:02d}:{now[5]:02d}:{now[6]:02d} {meridian}"
 
 
 def set_system_time(newtime):
@@ -1119,7 +1134,7 @@ def set_system_time(newtime):
             - HH:MM (24 hour)
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -1150,15 +1165,32 @@ def set_system_date_time(
 
     Args:
 
-        years (int): Years digit, ie: 2015
-        months (int): Months digit: 1 - 12
-        days (int): Days digit: 1 - 31
-        hours (int): Hours digit: 0 - 23
-        minutes (int): Minutes digit: 0 - 59
-        seconds (int): Seconds digit: 0 - 59
+        years (:obj:`int`, optional): Years digit, ie: 2015
+
+            Default is ``None``.
+
+        months (:obj:`int`, optional): Months digit: 1 - 12
+
+            Default is ``None``.
+
+        days (:obj:`int`, optional): Days digit: 1 - 31
+
+            Default is ``None``.
+
+        hours (:obj:`int`, optional): Hours digit: 0 - 23
+
+            Default is ``None``.
+
+        minutes (:obj:`int`, optional): Minutes digit: 0 - 59
+
+            Default is ``None``.
+
+        seconds (:obj:`int`, optional): Seconds digit: 0 - 59
+
+            Default is ``None``.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -1231,7 +1263,7 @@ def get_system_date():
     Get the Windows system date
 
     Returns:
-        str: Returns the system date
+        str: Returns the system date.
 
     CLI Example:
 
@@ -1240,7 +1272,7 @@ def get_system_date():
         salt '*' system.get_system_date
     """
     now = win32api.GetLocalTime()
-    return "{0:02d}/{1:02d}/{2:04d}".format(now[1], now[3], now[0])
+    return f"{now[1]:02d}/{now[3]:02d}/{now[0]:04d}"
 
 
 def set_system_date(newdate):
@@ -1248,6 +1280,7 @@ def set_system_date(newdate):
     Set the Windows system date. Use <mm-dd-yy> format for the date.
 
     Args:
+
         newdate (str):
             The date to set. Can be any of the following formats
 
@@ -1259,7 +1292,7 @@ def set_system_date(newdate):
             - YYYY/MM/DD
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -1279,10 +1312,10 @@ def set_system_date(newdate):
 
 def start_time_service():
     """
-    Start the Windows time service
+    Start the Windows time service.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -1295,10 +1328,10 @@ def start_time_service():
 
 def stop_time_service():
     """
-    Stop the Windows time service
+    Stop the Windows time service.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -1318,7 +1351,7 @@ def get_pending_component_servicing():
 
     Returns:
         bool: ``True`` if there are pending Component Based Servicing tasks,
-        otherwise ``False``
+        otherwise ``False``.
 
     CLI Example:
 
@@ -1338,7 +1371,7 @@ def get_pending_domain_join():
 
     Returns:
         bool: ``True`` if there is a pending domain join action, otherwise
-        ``False``
+        ``False``.
 
     CLI Example:
 
@@ -1358,7 +1391,7 @@ def get_pending_file_rename():
 
     Returns:
         bool: ``True`` if there are pending file rename operations, otherwise
-        ``False``
+        ``False``.
 
     CLI Example:
 
@@ -1378,7 +1411,7 @@ def get_pending_servermanager():
 
     Returns:
         bool: ``True`` if there are pending Server Manager tasks, otherwise
-        ``False``
+        ``False``.
 
     CLI Example:
 
@@ -1396,7 +1429,7 @@ def get_pending_update():
     .. versionadded:: 2016.11.0
 
     Returns:
-        bool: ``True`` if there are pending updates, otherwise ``False``
+        bool: ``True`` if there are pending updates, otherwise ``False``.
 
     CLI Example:
 
@@ -1426,7 +1459,7 @@ def set_reboot_required_witnessed():
     .. versionadded:: 2016.11.0
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -1450,7 +1483,7 @@ def get_reboot_required_witnessed():
 
     Returns:
         bool: ``True`` if the ``Requires reboot`` registry flag is set to ``1``,
-        otherwise ``False``
+        otherwise ``False``.
 
     CLI Example:
 
@@ -1469,7 +1502,7 @@ def get_pending_reboot():
     .. versionadded:: 2016.11.0
 
     Returns:
-        bool: ``True`` if the system is pending reboot, otherwise ``False``
+        bool: ``True`` if the system is pending reboot, otherwise ``False``.
 
     CLI Example:
 
@@ -1489,7 +1522,7 @@ def get_pending_reboot_details():
 
     Returns:
         dict: A dictionary of the results of each system that would indicate a
-        pending reboot
+            pending reboot.
 
     CLI Example:
 
@@ -1511,7 +1544,7 @@ def get_pending_windows_update():
 
     Returns:
         bool: ``True`` if the Windows Update system reports a pending update,
-        otherwise ``False``
+            otherwise ``False``.
 
     CLI Example:
 

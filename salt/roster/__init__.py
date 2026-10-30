@@ -8,10 +8,8 @@ systems that cannot or should not host a minion agent.
 import logging
 import os
 
-# Import salt libs
 import salt.loader
 import salt.syspaths
-from salt.ext import six
 
 log = logging.getLogger(__name__)
 
@@ -47,10 +45,10 @@ def get_roster_file(options):
             template = os.path.join(salt.syspaths.CONFIG_DIR, "roster")
 
     if not os.path.isfile(template):
-        raise OSError('Roster file "{}" not found'.format(template))
+        raise OSError(f'Roster file "{template}" not found')
 
     if not os.access(template, os.R_OK):
-        raise OSError('Access denied to roster "{}"'.format(template))
+        raise OSError(f'Access denied to roster "{template}"')
 
     return template
 
@@ -71,9 +69,25 @@ class Roster:
             self.backends = backends
         if not backends:
             self.backends = ["flat"]
-        utils = salt.loader.utils(self.opts)
-        runner = salt.loader.runner(self.opts, utils=utils)
-        self.rosters = salt.loader.roster(self.opts, runner=runner, utils=utils)
+        self.utils = salt.loader.utils(self.opts)
+        self.runner = salt.loader.runner(self.opts, utils=self.utils)
+        self.rosters = salt.loader.roster(
+            self.opts, runner=self.runner, utils=self.utils
+        )
+
+    def destroy(self):
+        if hasattr(self, "rosters") and self.rosters is not None:
+            if hasattr(self.rosters, "destroy"):
+                self.rosters.destroy()
+            self.rosters = {}
+        if hasattr(self, "runner") and self.runner is not None:
+            if hasattr(self.runner, "destroy"):
+                self.runner.destroy()
+            self.runner = {}
+        if hasattr(self, "utils") and self.utils is not None:
+            if hasattr(self.utils, "destroy"):
+                self.utils.destroy()
+            self.utils = {}
 
     def _gen_back(self):
         """
@@ -82,7 +96,7 @@ class Roster:
         back = set()
         if self.backends:
             for backend in self.backends:
-                fun = "{}.targets".format(backend)
+                fun = f"{backend}.targets"
                 if fun in self.rosters:
                     back.add(backend)
             return back
@@ -95,7 +109,7 @@ class Roster:
         """
         targets = {}
         for back in self._gen_back():
-            f_str = "{}.targets".format(back)
+            f_str = f"{back}.targets"
             if f_str not in self.rosters:
                 continue
             try:
@@ -105,5 +119,4 @@ class Roster:
             except OSError as exc:
                 log.error("Can't access roster for backend %s: %s", back, exc)
 
-        log.debug("Matched minions: %s", targets)
         return targets

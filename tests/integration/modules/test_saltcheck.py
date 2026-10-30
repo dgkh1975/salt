@@ -2,16 +2,18 @@
 Test the saltcheck module
 """
 
+import pytest
+
 from tests.support.case import ModuleCase
-from tests.support.helpers import slowTest
 
 
+@pytest.mark.timeout_unless_on_windows(120)
 class SaltcheckModuleTest(ModuleCase):
     """
     Test the saltcheck module
     """
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_saltcheck_run(self):
         """
         saltcheck.run_test
@@ -23,21 +25,21 @@ class SaltcheckModuleTest(ModuleCase):
             "args": ["This works!"],
         }
         ret = self.run_function("saltcheck.run_test", test=saltcheck_test)
-        self.assertDictContainsSubset({"status": "Pass"}, ret)
+        self.assertEqual(ret.get("status"), "Pass")
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_saltcheck_state(self):
         """
         saltcheck.run_state_tests
         """
         saltcheck_test = "validate-saltcheck"
         ret = self.run_function("saltcheck.run_state_tests", [saltcheck_test])
-        self.assertDictContainsSubset(
-            {"status": "Pass"}, ret[0]["validate-saltcheck"]["echo_test_hello"]
+        self.assertEqual(
+            ret[0]["validate-saltcheck"]["echo_test_hello"].get("status"), "Pass"
         )
-        self.assertDictContainsSubset({"Failed": 0}, ret[1]["TEST RESULTS"])
+        self.assertEqual(ret[1]["TEST RESULTS"].get("Failed"), 0)
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_topfile_validation(self):
         """
         saltcheck.run_highstate_tests
@@ -48,7 +50,7 @@ class SaltcheckModuleTest(ModuleCase):
         for top_state_dict in ret:
             self.assertIn(list(top_state_dict)[0], expected_top_states)
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_saltcheck_checkall(self):
         """
         Validate saltcheck.run_state_tests check_all for the default saltenv of base.
@@ -59,14 +61,14 @@ class SaltcheckModuleTest(ModuleCase):
         ret = self.run_function(
             "saltcheck.run_state_tests", [saltcheck_test], check_all=True
         )
-        self.assertDictContainsSubset(
-            {"status": "Pass"}, ret[0]["validate-saltcheck"]["echo_test_hello"]
+        self.assertEqual(
+            ret[0]["validate-saltcheck"]["echo_test_hello"].get("status"), "Pass"
         )
-        self.assertDictContainsSubset(
-            {"status": "Pass"}, ret[0]["validate-saltcheck"]["check_all_validate"]
+        self.assertEqual(
+            ret[0]["validate-saltcheck"]["check_all_validate"].get("status"), "Pass"
         )
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_saltcheck_checkall_saltenv(self):
         """
         Validate saltcheck.run_state_tests check_all for the prod saltenv
@@ -80,14 +82,15 @@ class SaltcheckModuleTest(ModuleCase):
             saltenv="prod",
             check_all=True,
         )
-        self.assertDictContainsSubset(
-            {"status": "Pass"}, ret[0]["validate-saltcheck"]["echo_test_prod_env"]
+        self.assertEqual(
+            ret[0]["validate-saltcheck"]["echo_test_prod_env"].get("status"), "Pass"
         )
-        self.assertDictContainsSubset(
-            {"status": "Pass"}, ret[0]["validate-saltcheck"]["check_all_validate_prod"]
+        self.assertEqual(
+            ret[0]["validate-saltcheck"]["check_all_validate_prod"].get("status"),
+            "Pass",
         )
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_saltcheck_saltenv(self):
         """
         Validate saltcheck.run_state_tests for the prod saltenv
@@ -96,6 +99,6 @@ class SaltcheckModuleTest(ModuleCase):
         ret = self.run_function(
             "saltcheck.run_state_tests", [saltcheck_test], saltenv="prod"
         )
-        self.assertDictContainsSubset(
-            {"status": "Pass"}, ret[0]["validate-saltcheck"]["echo_test_prod_env"]
+        self.assertEqual(
+            ret[0]["validate-saltcheck"]["echo_test_prod_env"].get("status"), "Pass"
         )

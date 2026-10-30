@@ -1,12 +1,8 @@
-# -*- coding: utf-8 -*-
 """
 Module for managing logrotate.
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
-
-# Import python libs
 import os
 
 import salt.utils.files
@@ -14,11 +10,21 @@ import salt.utils.platform
 import salt.utils.stringutils
 from salt.exceptions import SaltInvocationError
 
-# Import salt libs
-from salt.ext import six
-
 _LOG = logging.getLogger(__name__)
 _DEFAULT_CONF = "/etc/logrotate.conf"
+
+# Directives that introduce a multi-line shell script body terminated by
+# ``endscript``. The body must be kept opaque (not parsed as key/value
+# settings) so that lines like ``invoke-rc.d syslog-ng reload`` or repeated
+# ``endscript`` terminators do not collapse into bogus dict keys. See
+# the logrotate(8) manpage for the full list of script directives.
+_SCRIPT_DIRECTIVES = (
+    "firstaction",
+    "lastaction",
+    "prerotate",
+    "postrotate",
+    "preremove",
+)
 
 
 # Define a function alias in order not to shadow built-in's
@@ -48,10 +54,22 @@ def _convert_if_int(value):
     :rtype: bool|int|str
     """
     try:
-        value = int(six.text_type(value))
+        value = int(str(value))
     except ValueError:
         pass
     return value
+
+
+def _is_logfile_token(token):
+    """
+    Return True if a lone token that appears before a ``{`` looks like a
+    logrotate log-file pattern (an absolute/home path or a glob) rather than
+    a standalone global directive such as ``compress`` or ``missingok``.
+    logrotate stanza names are filesystem paths or globs; global directives
+    are bare keywords, so this lets the parser tell the two apart when either
+    can appear alone on a line.
+    """
+    return token.startswith(("/", "~", '"', "'")) or any(c in token for c in "*?[")
 
 
 def _parse_conf(conf_file=_DEFAULT_CONF):
@@ -67,11 +85,36 @@ def _parse_conf(conf_file=_DEFAULT_CONF):
     mode = "single"
     multi_names = []
     multi = {}
-    prev_comps = None
+    # Names listed one-per-line before a ``{`` all belong to the same stanza
+    # (as in CentOS' /etc/logrotate.d/syslog). Buffer consecutive single-token
+    # lines here until we know whether a ``{`` follows (they are stanza names)
+    # or another line follows (they were standalone boolean directives).
+    pending_names = []
+    # When inside a ``prerotate``/``postrotate``/... block, collect the raw
+    # script body lines here and stash them on the enclosing dict under the
+    # script directive name once ``endscript`` is seen.
+    script_directive = None
+    script_body = []
 
     with salt.utils.files.fopen(conf_file, "r") as ifile:
         for line in ifile:
-            line = salt.utils.stringutils.to_unicode(line).strip()
+            line = salt.utils.stringutils.to_unicode(line).rstrip("\r\n")
+            stripped = line.strip()
+
+            if script_directive is not None:
+                # Inside a script block: lines are opaque shell content until
+                # the ``endscript`` terminator. Do not strip comments or skip
+                # blank lines — they are part of the script.
+                if stripped == "endscript":
+                    target = multi if mode == "multi" else ret
+                    target[script_directive] = list(script_body)
+                    script_directive = None
+                    script_body = []
+                    continue
+                script_body.append(stripped)
+                continue
+
+            line = stripped
             if not line:
                 continue
             if line.startswith("#"):
@@ -80,11 +123,11 @@ def _parse_conf(conf_file=_DEFAULT_CONF):
             comps = line.split()
             if "{" in line and "}" not in line:
                 mode = "multi"
-                if len(comps) == 1 and prev_comps:
-                    multi_names = prev_comps
-                else:
-                    multi_names = comps
-                    multi_names.pop()
+                # The stanza name(s) may be listed on preceding lines (buffered
+                # in ``pending_names``) and/or on this line before the ``{``.
+                names_on_line = [comp for comp in comps if comp != "{"]
+                multi_names = pending_names + names_on_line
+                pending_names = []
                 continue
             if "}" in line:
                 mode = "single"
@@ -95,11 +138,26 @@ def _parse_conf(conf_file=_DEFAULT_CONF):
                 continue
 
             if mode == "single":
+                # A lone token in single mode is either a log-file pattern
+                # awaiting its ``{`` on a later line (as in CentOS' syslog
+                # config, which lists paths one per line) or a standalone
+                # boolean directive such as ``compress``. Log-file patterns
+                # look like paths or globs and are buffered until their ``{``;
+                # everything else is a directive committed immediately, so a
+                # directive sitting just before a stanza is never mistaken for
+                # one of that stanza's names.
+                if len(comps) == 1:
+                    if _is_logfile_token(comps[0]):
+                        pending_names.append(comps[0])
+                    else:
+                        ret[comps[0]] = True
+                    continue
                 key = ret
             else:
                 key = multi
 
             if comps[0] == "include":
+                ret["include"] = comps[1]
                 if "include files" not in ret:
                     ret["include files"] = {}
                 for include in os.listdir(comps[1]):
@@ -113,13 +171,25 @@ def _parse_conf(conf_file=_DEFAULT_CONF):
                         ret[file_key] = include_conf[file_key]
                         ret["include files"][include].append(file_key)
 
-            prev_comps = comps
+            # Recognize the start of a script block. The body that follows
+            # (up to ``endscript``) is kept opaque so embedded shell commands
+            # don't get parsed as settings and so a second script block's
+            # ``endscript`` is not lost to a duplicate-key collision.
+            if comps[0] in _SCRIPT_DIRECTIVES and len(comps) == 1:
+                script_directive = comps[0]
+                script_body = []
+                continue
+
             if len(comps) > 2:
                 key[comps[0]] = " ".join(comps[1:])
             elif len(comps) > 1:
                 key[comps[0]] = _convert_if_int(comps[1])
             else:
                 key[comps[0]] = True
+
+    # Any tokens still buffered at EOF were trailing standalone directives.
+    for name in pending_names:
+        ret[name] = True
     return ret
 
 
@@ -166,7 +236,7 @@ def get(key, value=None, conf_file=_DEFAULT_CONF):
     if value:
         if stanza:
             return stanza.get(value, False)
-        _LOG.warning("Block '%s' not present or empty.", key)
+        _LOG.debug("Block '%s' not present or empty.", key)
     return stanza
 
 
@@ -209,16 +279,17 @@ def set_(key, value, setting=None, conf_file=_DEFAULT_CONF):
     and make changes in the appropriate file.
     """
     conf = _parse_conf(conf_file)
-    for include in conf["include files"]:
-        if key in conf["include files"][include]:
+    include_files = conf.get("include files", {})
+    for include in include_files:
+        if key in include_files[include]:
             conf_file = os.path.join(conf["include"], include)
 
-    new_line = six.text_type()
+    new_line = ""
     kwargs = {
         "flags": 8,
         "backup": False,
         "path": conf_file,
-        "pattern": "^{0}.*".format(key),
+        "pattern": f"^{key}.*",
         "show_changes": False,
     }
 
@@ -226,11 +297,10 @@ def set_(key, value, setting=None, conf_file=_DEFAULT_CONF):
         current_value = conf.get(key, False)
 
         if isinstance(current_value, dict):
-            error_msg = (
-                "Error: {0} includes a dict, and a specific setting inside the "
-                "dict was not declared"
-            ).format(key)
-            raise SaltInvocationError(error_msg)
+            raise SaltInvocationError(
+                "Error: {} includes a dict, and a specific setting inside the "
+                "dict was not declared".format(key)
+            )
 
         if value == current_value:
             _LOG.debug("Command '%s' already has: %s", key, value)
@@ -240,7 +310,7 @@ def set_(key, value, setting=None, conf_file=_DEFAULT_CONF):
         if value is True:
             new_line = key
         elif value:
-            new_line = "{0} {1}".format(key, value)
+            new_line = f"{key} {value}"
 
         kwargs.update({"prepend_if_not_found": True})
     else:
@@ -267,7 +337,7 @@ def set_(key, value, setting=None, conf_file=_DEFAULT_CONF):
 
         kwargs.update(
             {
-                "pattern": "^{0}.*?{{.*?}}".format(key),
+                "pattern": f"^{key}.*?{{.*?}}",
                 "flags": 24,
                 "append_if_not_found": True,
             }
@@ -285,7 +355,20 @@ def _dict_to_stanza(key, stanza):
     """
     ret = ""
     for skey in stanza:
-        if stanza[skey] is True:
+        value = stanza[skey]
+        # Script directives (``prerotate``/``postrotate``/...) are stored as
+        # a list of opaque body lines; emit them as a script block followed
+        # by an ``endscript`` terminator. Without this, a stanza containing
+        # both ``prerotate`` and ``postrotate`` would lose the second
+        # ``endscript`` on round-trip — see issue #68293.
+        if skey in _SCRIPT_DIRECTIVES and isinstance(value, list):
+            ret += f"    {skey}\n"
+            for body_line in value:
+                ret += f"        {body_line}\n"
+            ret += "    endscript\n"
+            continue
+        if value is True:
+            value = ""
             stanza[skey] = ""
-        ret += "    {0} {1}\n".format(skey, stanza[skey])
-    return "{0} {{\n{1}}}".format(key, ret)
+        ret += f"    {skey} {value}\n"
+    return f"{key} {{\n{ret}}}"

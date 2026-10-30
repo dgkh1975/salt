@@ -1,19 +1,15 @@
-# -*- coding: utf-8 -*-
 """
     :codeauthor: Bo Maryniuk <bo@suse.de>
 """
 
-# Import Python Libs
-from __future__ import absolute_import
-
-import imp
+import importlib.machinery
+import importlib.util
 import os
-import sys
+
+import pytest
 
 from tests.support.mock import MagicMock, patch
-
-# Import Salt Testing Libs
-from tests.support.unit import TestCase, skipIf
+from tests.support.unit import TestCase
 
 try:
     from zypp_plugin import BogusIO
@@ -22,10 +18,7 @@ try:
 except ImportError:
     HAS_ZYPP_PLUGIN = False
 
-if sys.version_info >= (3,):
-    BUILTINS_OPEN = "builtins.open"
-else:
-    BUILTINS_OPEN = "__builtin__.open"
+BUILTINS_OPEN = "builtins.open"
 
 ZYPPNOTIFY_FILE = os.path.sep.join(
     os.path.dirname(__file__).split(os.path.sep)[:-2]
@@ -33,15 +26,15 @@ ZYPPNOTIFY_FILE = os.path.sep.join(
 )
 
 
-@skipIf(not HAS_ZYPP_PLUGIN, "zypp_plugin is missing.")
+@pytest.mark.skipif(not HAS_ZYPP_PLUGIN, reason="zypp_plugin is missing.")
 class ZyppPluginsTestCase(TestCase):
     """
     Test shipped libzypp plugins.
     """
 
-    @skipIf(
+    @pytest.mark.skipif(
         not os.path.exists(ZYPPNOTIFY_FILE),
-        "Required file '{}' does not exist.".format(ZYPPNOTIFY_FILE),
+        reason=f"Required file '{ZYPPNOTIFY_FILE}' does not exist.",
     )
     def test_drift_detector(self):
         """
@@ -49,7 +42,10 @@ class ZyppPluginsTestCase(TestCase):
         Returns:
 
         """
-        zyppnotify = imp.load_source("zyppnotify", ZYPPNOTIFY_FILE)
+        loader = importlib.machinery.SourceFileLoader("zyppnotify", ZYPPNOTIFY_FILE)
+        spec = importlib.util.spec_from_loader("zyppnotify", loader)
+        zyppnotify = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(zyppnotify)
         drift = zyppnotify.DriftDetector()
         drift._get_mtime = MagicMock(return_value=123)
         drift._get_checksum = MagicMock(return_value="deadbeef")

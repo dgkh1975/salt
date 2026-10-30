@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 Provide token storage in Redis cluster.
 
@@ -15,14 +13,12 @@ Default values for these configs are as follow:
 :depends:   - redis-py-cluster Python package
 """
 
-from __future__ import absolute_import, print_function, unicode_literals
-
 import hashlib
 import logging
 import os
 
 import salt.payload
-from salt.ext import six
+from salt.config import DEFAULT_HASH_TYPE
 
 try:
     import rediscluster
@@ -51,13 +47,22 @@ def _redis_client(opts):
     """
     Connect to the redis host and return a StrictRedisCluster client object.
     If connection fails then return None.
+
+    Note: ``decode_responses`` is intentionally NOT enabled here.
+    Token values are msgpack-serialised by ``salt.payload`` and must
+    round-trip as bytes; ``list_tokens`` likewise calls ``.decode()``
+    on each key it gets back, which requires bytes. Enabling
+    ``decode_responses=True`` makes ``redis_client.get()`` and
+    ``redis_client.keys()`` return ``str`` instead, which would break
+    both ``get_token`` (msgpack rejects ``str``) and ``list_tokens``
+    (``str.decode`` does not exist) -- and the broad ``except``
+    handlers in those callers would silently turn every read into an
+    empty result.
     """
     redis_host = opts.get("eauth_redis_host", "localhost")
     redis_port = opts.get("eauth_redis_port", 6379)
     try:
-        return rediscluster.StrictRedisCluster(
-            host=redis_host, port=redis_port, decode_responses=True
-        )
+        return rediscluster.StrictRedisCluster(host=redis_host, port=redis_port)
     except rediscluster.exceptions.RedisClusterException as err:
         log.warning(
             "Failed to connect to redis at %s:%s - %s", redis_host, redis_port, err
@@ -78,20 +83,19 @@ def mk_token(opts, tdata):
     redis_client = _redis_client(opts)
     if not redis_client:
         return {}
-    hash_type = getattr(hashlib, opts.get("hash_type", "md5"))
-    tok = six.text_type(hash_type(os.urandom(512)).hexdigest())
+    hash_type = getattr(hashlib, opts.get("hash_type", DEFAULT_HASH_TYPE))
+    tok = str(hash_type(os.urandom(512)).hexdigest())
     try:
         while redis_client.get(tok) is not None:
-            tok = six.text_type(hash_type(os.urandom(512)).hexdigest())
+            tok = str(hash_type(os.urandom(512)).hexdigest())
     except Exception as err:  # pylint: disable=broad-except
         log.warning(
             "Authentication failure: cannot get token %s from redis: %s", tok, err
         )
         return {}
     tdata["token"] = tok
-    serial = salt.payload.Serial(opts)
     try:
-        redis_client.set(tok, serial.dumps(tdata))
+        redis_client.set(tok, salt.payload.dumps(tdata))
     except Exception as err:  # pylint: disable=broad-except
         log.warning(
             "Authentication failure: cannot save token %s to redis: %s", tok, err
@@ -111,9 +115,8 @@ def get_token(opts, tok):
     redis_client = _redis_client(opts)
     if not redis_client:
         return {}
-    serial = salt.payload.Serial(opts)
     try:
-        tdata = serial.loads(redis_client.get(tok))
+        tdata = salt.payload.loads(redis_client.get(tok))
         return tdata
     except Exception as err:  # pylint: disable=broad-except
         log.warning(
@@ -151,7 +154,6 @@ def list_tokens(opts):
     redis_client = _redis_client(opts)
     if not redis_client:
         return []
-    serial = salt.payload.Serial(opts)
     try:
         return [k.decode("utf8") for k in redis_client.keys()]
     except Exception as err:  # pylint: disable=broad-except

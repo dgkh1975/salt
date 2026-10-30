@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Module for managing IIS SMTP server configuration on Windows servers.
 The Windows features 'SMTP-Server' and 'Web-WMI' must be installed.
@@ -8,33 +7,27 @@ The Windows features 'SMTP-Server' and 'Web-WMI' must be installed.
 """
 
 # IIS metabase configuration settings:
-#   https://goo.gl/XCt1uO
+#   https://learn.microsoft.com/en-us/previous-versions/iis/settings-schema/aa347565(v=vs.90)?redirectedfrom=MSDN
 # IIS logging options:
-#   https://goo.gl/RL8ki9
-#   https://goo.gl/iwnDow
+#   https://learn.microsoft.com/en-us/previous-versions/iis/6.0-sdk/ms524877(v=vs.90)?redirectedfrom=MSDN
+#   https://learn.microsoft.com/en-us/previous-versions/iis/6.0-sdk/ms524877(v=vs.90)?redirectedfrom=MSDN
 # MicrosoftIISv2 namespace in Windows 2008r2 and later:
-#   http://goo.gl/O4m48T
+#   https://learn.microsoft.com/en-us/answers/tags/828/developer-technologies
 # Connection and relay IPs in PowerShell:
-#   https://goo.gl/aBMZ9K
-#   http://goo.gl/MrybFq
+#   https://learn.microsoft.com/en-us/archive/msdn-technet-forums/aff78c7a-db4e-4039-babb-cb68dad9c21e
+#   https://asknicks.blogspot.com/2015/04/allow-ip-address-in-smtp-connection.html
 
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
 import re
 
 import salt.utils.args
 import salt.utils.platform
-
-# Import Salt libs
 from salt.exceptions import SaltInvocationError
-
-# Import 3rd-party libs
-from salt.ext import six
 
 try:
     import wmi
+
     import salt.utils.winapi
 
     _HAS_MODULE_DEPENDENCIES = True
@@ -114,9 +107,9 @@ def _normalize_server_settings(**settings):
     for setting in settings:
         if isinstance(settings[setting], dict):
             _LOG.debug("Fixing value: %s", settings[setting])
-            value_from_key = next(six.iterkeys(settings[setting]))
+            value_from_key = next(iter(settings[setting].keys()))
 
-            ret[setting] = "{{{0}}}".format(value_from_key)
+            ret[setting] = f"{{{value_from_key}}}"
         else:
             ret[setting] = settings[setting]
     return ret
@@ -126,8 +119,8 @@ def get_log_format_types():
     """
     Get all available log format names and ids.
 
-    :return: A dictionary of the log format names and ids.
-    :rtype: dict
+    Returns:
+        dict: A dictionary of the log format names and IDs.
 
     CLI Example:
 
@@ -145,8 +138,8 @@ def get_log_format_types():
 
             # Remove the prefix from the name.
             for obj in objs:
-                name = six.text_type(obj.Name).replace(prefix, "", 1)
-                ret[name] = six.text_type(obj.LogModuleId)
+                name = str(obj.Name).replace(prefix, "", 1)
+                ret[name] = str(obj.LogModuleId)
         except wmi.x_wmi as error:
             _LOG.error("Encountered WMI error: %s", error.com_error)
         except (AttributeError, IndexError) as error:
@@ -161,8 +154,8 @@ def get_servers():
     """
     Get the SMTP virtual server names.
 
-    :return: A list of the SMTP virtual servers.
-    :rtype: list
+    Returns:
+        list: A list of the SMTP virtual servers.
 
     CLI Example:
 
@@ -178,7 +171,7 @@ def get_servers():
             objs = connection.IIsSmtpServerSetting()
 
             for obj in objs:
-                ret.append(six.text_type(obj.Name))
+                ret.append(str(obj.Name))
         except wmi.x_wmi as error:
             _LOG.error("Encountered WMI error: %s", error.com_error)
         except (AttributeError, IndexError) as error:
@@ -192,17 +185,22 @@ def get_server_setting(settings, server=_DEFAULT_SERVER):
     """
     Get the value of the setting for the SMTP virtual server.
 
-    :param str settings: A list of the setting names.
-    :param str server: The SMTP server name.
+    Args:
 
-    :return: A dictionary of the provided settings and their values.
-    :rtype: dict
+        settings (list): A list of the setting names.
+
+        server (:obj:`str`, optional): The SMTP server name.
+
+            Default is "SmtpSvc/1".
+
+    Returns:
+        dict: A dictionary of the provided settings and their values.
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' win_smtp_server.get_server_setting settings="['MaxRecipients']"
+        salt '*' win_smtp_server.get_server_setting settings='["MaxRecipients"]'
     """
     ret = dict()
 
@@ -216,7 +214,7 @@ def get_server_setting(settings, server=_DEFAULT_SERVER):
             objs = connection.IIsSmtpServerSetting(settings, Name=server)[0]
 
             for setting in settings:
-                ret[setting] = six.text_type(getattr(objs, setting))
+                ret[setting] = str(getattr(objs, setting))
         except wmi.x_wmi as error:
             _LOG.error("Encountered WMI error: %s", error.com_error)
         except (AttributeError, IndexError) as error:
@@ -232,17 +230,22 @@ def set_server_setting(settings, server=_DEFAULT_SERVER):
 
         The setting names are case-sensitive.
 
-    :param str settings: A dictionary of the setting names and their values.
-    :param str server: The SMTP server name.
+    Args:
 
-    :return: A boolean representing whether all changes succeeded.
-    :rtype: bool
+        settings (dict): A dictionary of the setting names and their values.
+
+        server (:obj:`str`, optional): The SMTP server name.
+
+            Default is "SmtpSvc/1".
+
+    Returns:
+        bool: A boolean representing whether all changes succeeded.
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' win_smtp_server.set_server_setting settings="{'MaxRecipients': '500'}"
+        salt '*' win_smtp_server.set_server_setting settings='{"MaxRecipients": "500"}'
     """
     if not settings:
         _LOG.warning("No settings provided")
@@ -271,9 +274,7 @@ def set_server_setting(settings, server=_DEFAULT_SERVER):
             _LOG.error("Error getting IIsSmtpServerSetting: %s", error)
 
         for setting in settings:
-            if six.text_type(settings[setting]) != six.text_type(
-                current_settings[setting]
-            ):
+            if str(settings[setting]) != str(current_settings[setting]):
                 try:
                     setattr(objs, setting, settings[setting])
                 except wmi.x_wmi as error:
@@ -287,7 +288,7 @@ def set_server_setting(settings, server=_DEFAULT_SERVER):
     failed_settings = dict()
 
     for setting in settings:
-        if six.text_type(settings[setting]) != six.text_type(new_settings[setting]):
+        if str(settings[setting]) != str(new_settings[setting]):
             failed_settings[setting] = settings[setting]
     if failed_settings:
         _LOG.error("Failed to change settings: %s", failed_settings)
@@ -301,10 +302,14 @@ def get_log_format(server=_DEFAULT_SERVER):
     """
     Get the active log format for the SMTP virtual server.
 
-    :param str server: The SMTP server name.
+    Args:
 
-    :return: A string of the log format name.
-    :rtype: str
+        server (:obj:`str`, optional): The SMTP server name.
+
+            Default is "SmtpSvc/1".
+
+    Returns:
+        str: A string of the log format name.
 
     CLI Example:
 
@@ -318,7 +323,7 @@ def get_log_format(server=_DEFAULT_SERVER):
     # Since IIsSmtpServerSetting stores the log type as an id, we need
     # to get the mapping from IISLogModuleSetting and extract the name.
     for key in log_format_types:
-        if six.text_type(format_id) == log_format_types[key]:
+        if str(format_id) == log_format_types[key]:
             return key
     _LOG.warning("Unable to determine log format.")
     return None
@@ -328,11 +333,16 @@ def set_log_format(log_format, server=_DEFAULT_SERVER):
     """
     Set the active log format for the SMTP virtual server.
 
-    :param str log_format: The log format name.
-    :param str server: The SMTP server name.
+    Args:
 
-    :return: A boolean representing whether the change succeeded.
-    :rtype: bool
+        log_format (str): The log format name.
+
+        server (:obj:`str`, optional): The SMTP server name.
+
+            Default is "SmtpSvc/1".
+
+    Returns:
+        bool: A boolean representing whether the change succeeded.
 
     CLI Example:
 
@@ -345,7 +355,7 @@ def set_log_format(log_format, server=_DEFAULT_SERVER):
     format_id = log_format_types.get(log_format, None)
 
     if not format_id:
-        message = ("Invalid log format '{0}' specified. Valid formats:" " {1}").format(
+        message = "Invalid log format '{}' specified. Valid formats: {}".format(
             log_format, log_format_types.keys()
         )
         raise SaltInvocationError(message)
@@ -374,11 +384,18 @@ def get_connection_ip_list(as_wmi_format=False, server=_DEFAULT_SERVER):
     """
     Get the IPGrant list for the SMTP virtual server.
 
-    :param bool as_wmi_format: Returns the connection IPs as a list in the format WMI expects.
-    :param str server: The SMTP server name.
+    Args:
+        as_wmi_format (:obj:`bool`, optional):
+            Returns the connection IPs as a list in the format WMI expects.
 
-    :return: A dictionary of the IP and subnet pairs.
-    :rtype: dict
+            Default is ``False``.
+
+        server (:obj:`str`, optional): The SMTP server name.
+
+            Default is "SmtpSvc/1".
+
+    Returns:
+        dict: A dictionary of the IP and subnet pairs.
 
     CLI Example:
 
@@ -400,7 +417,7 @@ def get_connection_ip_list(as_wmi_format=False, server=_DEFAULT_SERVER):
     for unnormalized_address in addresses:
         ip_address, subnet = re.split(reg_separator, unnormalized_address)
         if as_wmi_format:
-            ret.append("{0}, {1}".format(ip_address, subnet))
+            ret.append(f"{ip_address}, {subnet}")
         else:
             ret[ip_address] = subnet
 
@@ -415,18 +432,29 @@ def set_connection_ip_list(
     """
     Set the IPGrant list for the SMTP virtual server.
 
-    :param str addresses: A dictionary of IP + subnet pairs.
-    :param bool grant_by_default: Whether the addresses should be a blacklist or whitelist.
-    :param str server: The SMTP server name.
+    Args:
 
-    :return: A boolean representing whether the change succeeded.
-    :rtype: bool
+        addresses (:obj:`dict`, optional): A dictionary of IP + subnet pairs.
+
+            Default is ``None``.
+
+        grant_by_default (:obj:`bool`, optional):
+            Whether the addresses should be a blacklist or whitelist.
+
+            Default is ``False``.
+
+        server (:obj:`str`, optional): The SMTP server name.
+
+            Default is "SmtpSvc/1".
+
+    Returns:
+        bool: A boolean representing whether the change succeeded.
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' win_smtp_server.set_connection_ip_list addresses="{'127.0.0.1': '255.255.255.255'}"
+        salt '*' win_smtp_server.set_connection_ip_list addresses='{"127.0.0.1": "255.255.255.255"}'
     """
     setting = "IPGrant"
     formatted_addresses = list()
@@ -440,9 +468,7 @@ def set_connection_ip_list(
     # Convert addresses to the 'ip_address, subnet' format used by
     # IIsIPSecuritySetting.
     for address in addresses:
-        formatted_addresses.append(
-            "{0}, {1}".format(address.strip(), addresses[address].strip())
-        )
+        formatted_addresses.append(f"{address.strip()}, {addresses[address].strip()}")
 
     current_addresses = get_connection_ip_list(as_wmi_format=True, server=server)
 
@@ -478,10 +504,14 @@ def get_relay_ip_list(server=_DEFAULT_SERVER):
     """
     Get the RelayIpList list for the SMTP virtual server.
 
-    :param str server: The SMTP server name.
+    Args:
 
-    :return: A list of the relay IPs.
-    :rtype: list
+        server (:obj:`str`, optional): The SMTP server name.
+
+            Default is "SmtpSvc/1".
+
+    Returns:
+        list: A list of the relay IPs.
 
     .. note::
 
@@ -510,7 +540,7 @@ def get_relay_ip_list(server=_DEFAULT_SERVER):
     # need to group them and reassemble them into IP addresses.
     i = 0
     while i < len(lines):
-        octets = [six.text_type(x) for x in lines[i : i + 4]]
+        octets = [str(x) for x in lines[i : i + 4]]
         address = ".".join(octets)
         ret.append(address)
         i += 4
@@ -540,17 +570,25 @@ def set_relay_ip_list(addresses=None, server=_DEFAULT_SERVER):
         with an empty access list configured, and setting an empty list/tuple corresponds to the
         more permissive 'All except the list below' GUI parameter.
 
-    :param str addresses: A list of the relay IPs. The order of the list is important.
-    :param str server: The SMTP server name.
+    Args:
 
-    :return: A boolean representing whether the change succeeded.
-    :rtype: bool
+        addresses (:obj:`list`, optional):
+            A list of the relay IPs. The order of the list is important.
+
+            Default is ``None``.
+
+        server (:obj:`str`, optional): The SMTP server name.
+
+            Default is "SmtpSvc/1".
+
+    Returns:
+        bool: A boolean representing whether the change succeeded.
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' win_smtp_server.set_relay_ip_list addresses="['192.168.1.1', '172.16.1.1']"
+        salt '*' win_smtp_server.set_relay_ip_list addresses='["192.168.1.1", "172.16.1.1"]'
     """
     setting = "RelayIpList"
     formatted_addresses = list()

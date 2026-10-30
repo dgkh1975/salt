@@ -5,6 +5,7 @@ Extract the pillar data for this minion
 import copy
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Mapping
 
 import salt.pillar
@@ -12,9 +13,9 @@ import salt.utils.crypt
 import salt.utils.data
 import salt.utils.dictupdate
 import salt.utils.functools
-import salt.utils.odict
+import salt.utils.secret
 import salt.utils.yaml
-from salt.defaults import DEFAULT_TARGET_DELIM
+from salt.defaults import DEFAULT_TARGET_DELIM, NOT_SET
 from salt.exceptions import CommandExecutionError
 
 __proxyenabled__ = ["*"]
@@ -24,15 +25,16 @@ log = logging.getLogger(__name__)
 
 def get(
     key,
-    default=KeyError,
+    default=NOT_SET,
     merge=False,
     merge_nested_lists=None,
     delimiter=DEFAULT_TARGET_DELIM,
     pillarenv=None,
     saltenv=None,
+    unmask=None,
 ):
     """
-    .. versionadded:: 0.14
+    .. versionadded:: 0.14.0
 
     Attempt to retrieve the named value from :ref:`in-memory pillar data
     <pillar-in-memory>`. If the pillar key is not present in the in-memory
@@ -115,6 +117,11 @@ def get(
 
         .. versionadded:: 2017.7.0
 
+    unmask
+        If set to ``True``, the pillar data will be unmasked.
+
+        .. versionadded:: 3008.0
+
     CLI Example:
 
     .. code-block:: bash
@@ -122,6 +129,8 @@ def get(
         salt '*' pillar.get pkg:apache
         salt '*' pillar.get abc::def|ghi delimiter='|'
     """
+    if default == NOT_SET:
+        default = KeyError
     if not __opts__.get("pillar_raise_on_missing"):
         if default is KeyError:
             default = ""
@@ -136,6 +145,9 @@ def get(
         else items(saltenv=saltenv, pillarenv=pillarenv)
     )
 
+    if unmask is None:
+        unmask = not salt.utils.secret.mask_pillar.get()
+
     if merge:
         if isinstance(default, dict):
             ret = salt.utils.data.traverse_dict_and_list(
@@ -143,9 +155,12 @@ def get(
             )
             if isinstance(ret, Mapping):
                 default = copy.deepcopy(default)
-                return salt.utils.dictupdate.update(
+                merged = salt.utils.dictupdate.update(
                     default, ret, merge_lists=opt_merge_lists
                 )
+                if unmask:
+                    return salt.utils.secret.expose(merged)
+                return salt.utils.secret.serial(merged)
             else:
                 log.error(
                     "pillar.get: Default (%s) is a dict, but the returned "
@@ -162,7 +177,9 @@ def get(
             if isinstance(ret, list):
                 default = copy.deepcopy(default)
                 default.extend([x for x in ret if x not in default])
-                return default
+                if unmask:
+                    return salt.utils.secret.expose(default)
+                return salt.utils.secret.serial(default)
             else:
                 log.error(
                     "pillar.get: Default (%s) is a list, but the returned "
@@ -182,12 +199,16 @@ def get(
 
     ret = salt.utils.data.traverse_dict_and_list(pillar_dict, key, default, delimiter)
     if ret is KeyError:
-        raise KeyError("Pillar key not found: {}".format(key))
+        raise KeyError(f"Pillar key not found: {key}")
 
-    return ret
+    if unmask:
+        return salt.utils.secret.expose(ret)
+    return salt.utils.secret.serial(ret)
 
 
-def items(*args, **kwargs):
+def items(
+    *args, pillar=None, pillar_enc=None, pillarenv=None, saltenv=None, unmask=None
+):
     """
     Calls the master for a fresh pillar and generates the pillar data on the
     fly
@@ -232,6 +253,14 @@ def items(*args, **kwargs):
         Included only for compatibility with
         :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
 
+    unmask
+        If set to ``True``, the pillar data will be unmasked. If not set, the
+        default is unmasked when either the current render context has
+        already disabled masking, or the :conf_minion:`pillar_mask_output`
+        config option is set to ``False``.
+
+        .. versionadded:: 3008.0
+
     CLI Example:
 
     .. code-block:: bash
@@ -240,17 +269,15 @@ def items(*args, **kwargs):
     """
     # Preserve backwards compatibility
     if args:
-        return item(*args)
+        return item(*args, pillarenv=pillarenv, saltenv=saltenv)
 
-    pillarenv = kwargs.get("pillarenv")
     if pillarenv is None:
         if __opts__.get("pillarenv_from_saltenv", False):
-            pillarenv = kwargs.get("saltenv") or __opts__["saltenv"]
+            pillarenv = saltenv or __opts__["saltenv"]
         else:
             pillarenv = __opts__["pillarenv"]
 
-    pillar_override = kwargs.get("pillar")
-    pillar_enc = kwargs.get("pillar_enc")
+    pillar_override = pillar
 
     if pillar_override and pillar_enc:
         try:
@@ -262,9 +289,7 @@ def items(*args, **kwargs):
                 valid_rend=__opts__["decrypt_pillar_renderers"],
             )
         except Exception as exc:  # pylint: disable=broad-except
-            raise CommandExecutionError(
-                "Failed to decrypt pillar override: {}".format(exc)
-            )
+            raise CommandExecutionError(f"Failed to decrypt pillar override: {exc}")
 
     pillar = salt.pillar.get_pillar(
         __opts__,
@@ -273,11 +298,76 @@ def items(*args, **kwargs):
         pillar_override=pillar_override,
         pillarenv=pillarenv,
     )
-    return pillar.compile_pillar()
+    ret = pillar.compile_pillar()
+    if unmask is None:
+        # VCOPS-98852: pillar_mask_output only changes items()'s *default*
+        # when the caller didn't explicitly request masked/unmasked output —
+        # it does not disable masking elsewhere (pillar.get/item/raw/ext,
+        # no_log states, or the general output safety net keep their own
+        # existing behavior regardless of this option).
+        unmask = not salt.utils.secret.mask_pillar.get() or not __opts__.get(
+            "pillar_mask_output", True
+        )
+    if unmask:
+        return salt.utils.secret.expose(ret)
+    else:
+        return salt.utils.secret.serial(ret)
 
 
 # Allow pillar.data to also be used to return pillar data
-data = salt.utils.functools.alias_function(items, "data")
+def data(
+    *args, pillar=None, pillar_enc=None, pillarenv=None, saltenv=None, unmask=None
+):
+    """
+    Calls the master for a fresh pillar, generates the pillar data on the
+    fly (same as :py:func:`items`)
+
+    pillar
+        If specified, allows for a dictionary of pillar data to be made
+        available to pillar and ext_pillar rendering. these pillar variables
+        will also override any variables of the same name in pillar or
+        ext_pillar.
+
+    pillar_enc
+        If specified, the data passed in the ``pillar`` argument will be passed
+        through this renderer to decrypt it.
+
+        .. note::
+            This will decrypt on the minion side, so the specified renderer
+            must be set up on the minion for this to work. Alternatively,
+            pillar data can be decrypted master-side. For more information, see
+            the :ref:`Pillar Encryption <pillar-encryption>` documentation.
+            Pillar data that is decrypted master-side, is not decrypted until
+            the end of pillar compilation though, so minion-side decryption
+            will be necessary if the encrypted pillar data must be made
+            available in an decrypted state pillar/ext_pillar rendering.
+
+    pillarenv
+        Pass a specific pillar environment from which to compile pillar data.
+        If not specified, then the minion's :conf_minion:`pillarenv` option is
+        not used, and if that also is not specified then all configured pillar
+        environments will be merged into a single pillar dictionary and
+        returned.
+
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+
+    CLI Examples:
+
+    .. code-block:: bash
+
+        salt '*' pillar.data
+    """
+
+    return items(
+        *args,
+        pillar=pillar,
+        pillar_enc=pillar_enc,
+        pillarenv=pillarenv,
+        saltenv=saltenv,
+        unmask=unmask,
+    )
 
 
 def _obfuscate_inner(var):
@@ -288,15 +378,22 @@ def _obfuscate_inner(var):
     Known collection types trigger recursion.
     In the special case of mapping types, keys are not obfuscated
     """
-    if isinstance(var, (dict, salt.utils.odict.OrderedDict)):
+    if isinstance(var, (dict, OrderedDict)):
         return var.__class__((key, _obfuscate_inner(val)) for key, val in var.items())
     elif isinstance(var, (list, set, tuple)):
         return type(var)(_obfuscate_inner(v) for v in var)
     else:
-        return "<{}>".format(var.__class__.__name__)
+        return f"<{var.__class__.__name__}>"
 
 
-def obfuscate(*args):
+def obfuscate(
+    *args,
+    pillar=None,
+    pillar_enc=None,
+    pillarenv=None,
+    saltenv=None,
+    unmask=None,
+):
     """
     .. versionadded:: 2015.8.0
 
@@ -316,6 +413,14 @@ def obfuscate(*args):
     * ``{'login': 'somelogin', 'pwd': 'secret'}`` becomes
       ``{'login': '<str>', 'pwd': '<str>'}``
 
+    unmask
+        Forwarded to :py:func:`items` when sourcing the pillar data. The
+        returned structure is then obfuscated, so the practical effect of
+        this flag is limited; it is accepted for API consistency with the
+        other ``pillar`` functions.
+
+        .. versionadded:: 3008.2
+
     CLI Examples:
 
     .. code-block:: bash
@@ -323,17 +428,72 @@ def obfuscate(*args):
         salt '*' pillar.obfuscate
 
     """
-    return _obfuscate_inner(items(*args))
+    return _obfuscate_inner(
+        items(
+            *args,
+            pillar=pillar,
+            pillar_enc=pillar_enc,
+            pillarenv=pillarenv,
+            saltenv=saltenv,
+            unmask=unmask,
+        )
+    )
 
 
 # naming chosen for consistency with grains.ls, although it breaks the short
 # identifier rule.
-def ls(*args):
+def ls(
+    *args,
+    pillar=None,
+    pillar_enc=None,
+    pillarenv=None,
+    saltenv=None,
+    unmask=None,
+):
     """
     .. versionadded:: 2015.8.0
 
     Calls the master for a fresh pillar, generates the pillar data on the
     fly (same as :py:func:`items`), but only shows the available main keys.
+
+    pillar
+        If specified, allows for a dictionary of pillar data to be made
+        available to pillar and ext_pillar rendering. these pillar variables
+        will also override any variables of the same name in pillar or
+        ext_pillar.
+
+    pillar_enc
+        If specified, the data passed in the ``pillar`` argument will be passed
+        through this renderer to decrypt it.
+
+        .. note::
+            This will decrypt on the minion side, so the specified renderer
+            must be set up on the minion for this to work. Alternatively,
+            pillar data can be decrypted master-side. For more information, see
+            the :ref:`Pillar Encryption <pillar-encryption>` documentation.
+            Pillar data that is decrypted master-side, is not decrypted until
+            the end of pillar compilation though, so minion-side decryption
+            will be necessary if the encrypted pillar data must be made
+            available in an decrypted state pillar/ext_pillar rendering.
+
+    pillarenv
+        Pass a specific pillar environment from which to compile pillar data.
+        If not specified, then the minion's :conf_minion:`pillarenv` option is
+        not used, and if that also is not specified then all configured pillar
+        environments will be merged into a single pillar dictionary and
+        returned.
+
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+
+    unmask
+        Forwarded to :py:func:`items` when sourcing the pillar data. Top-level
+        pillar keys are not masked, so this flag is a practical no-op for
+        ``ls``; it is accepted for API consistency with the other ``pillar``
+        functions.
+
+        .. versionadded:: 3008.2
 
     CLI Examples:
 
@@ -342,10 +502,21 @@ def ls(*args):
         salt '*' pillar.ls
     """
 
-    return list(items(*args))
+    return list(
+        items(
+            *args,
+            pillar=pillar,
+            pillar_enc=pillar_enc,
+            pillarenv=pillarenv,
+            saltenv=saltenv,
+            unmask=unmask,
+        )
+    )
 
 
-def item(*args, **kwargs):
+def item(
+    *args, default=None, delimiter=None, pillarenv=None, saltenv=None, unmask=None
+):
     """
     .. versionadded:: 0.16.2
 
@@ -390,6 +561,11 @@ def item(*args, **kwargs):
 
         .. versionadded:: 2017.7.6,2018.3.1
 
+    unmask
+        If set to ``True``, the pillar data will be unmasked.
+
+        .. versionadded:: 3008.0
+
     CLI Examples:
 
     .. code-block:: bash
@@ -399,10 +575,12 @@ def item(*args, **kwargs):
         salt '*' pillar.item foo bar baz
     """
     ret = {}
-    default = kwargs.get("default", "")
-    delimiter = kwargs.get("delimiter", DEFAULT_TARGET_DELIM)
-    pillarenv = kwargs.get("pillarenv", None)
-    saltenv = kwargs.get("saltenv", None)
+
+    if default is None:
+        default = ""
+
+    if delimiter is None:
+        delimiter = DEFAULT_TARGET_DELIM
 
     pillar_dict = (
         __pillar__
@@ -410,23 +588,36 @@ def item(*args, **kwargs):
         else items(saltenv=saltenv, pillarenv=pillarenv)
     )
 
+    if unmask is None:
+        unmask = not salt.utils.secret.mask_pillar.get()
+
     try:
         for arg in args:
             ret[arg] = salt.utils.data.traverse_dict_and_list(
-                pillar_dict, arg, default, delimiter
+                data=pillar_dict, key=arg, default=default, delimiter=delimiter
             )
     except KeyError:
         pass
 
-    return ret
+    if unmask:
+        return salt.utils.secret.expose(ret)
+    else:
+        return salt.utils.secret.serial(ret)
 
 
-def raw(key=None):
+def raw(key=None, unmask=None):
     """
     Return the raw pillar data that is currently loaded into the minion.
 
     Contrast with :py:func:`items` which calls the master to fetch the most
     up-to-date Pillar.
+
+    unmask
+        Defaults to ``True``: ``pillar.raw`` has historically returned
+        unmasked data, since the intent of the call is to inspect the in-memory
+        pillar verbatim. Set to ``False`` to receive masked values instead.
+
+        .. versionadded:: 3008.2
 
     CLI Example:
 
@@ -439,15 +630,20 @@ def raw(key=None):
 
         salt '*' pillar.raw key='roles'
     """
+    if unmask is None:
+        unmask = True
+
     if key:
-        ret = __pillar__.get(key, {})
+        value = __pillar__.get(key, {})
     else:
-        ret = dict(__pillar__)
+        value = dict(__pillar__)
 
-    return ret
+    if unmask:
+        return salt.utils.secret.expose(value)
+    return salt.utils.secret.serial(value)
 
 
-def ext(external, pillar=None):
+def ext(external, pillar=None, unmask=None):
     '''
     .. versionchanged:: 2016.3.6,2016.11.3,2017.7.0
         The supported ext_pillar types are now tunable using the
@@ -491,6 +687,15 @@ def ext(external, pillar=None):
 
         .. versionadded:: 2015.5.0
 
+    unmask
+        If set to ``True``, the pillar data will be returned unmasked. If set
+        to ``False``, masked values are returned. The default of ``None``
+        auto-detects from the :func:`salt.utils.secret.mask_pillar` context
+        variable so direct user invocations see plain values while invocations
+        from inside the renderer/state pipeline stay masked.
+
+        .. versionadded:: 3008.2
+
     CLI Examples:
 
     .. code-block:: bash
@@ -503,7 +708,7 @@ def ext(external, pillar=None):
         external = salt.utils.yaml.safe_load(external)
     pillar_obj = salt.pillar.get_pillar(
         __opts__,
-        __grains__,
+        __grains__.value(),
         __opts__["id"],
         __opts__["saltenv"],
         ext=external,
@@ -512,10 +717,15 @@ def ext(external, pillar=None):
 
     ret = pillar_obj.compile_pillar()
 
-    return ret
+    if unmask is None:
+        unmask = not salt.utils.secret.mask_pillar.get()
+
+    if unmask:
+        return salt.utils.secret.expose(ret)
+    return salt.utils.secret.serial(ret)
 
 
-def keys(key, delimiter=DEFAULT_TARGET_DELIM):
+def keys(key, delimiter=DEFAULT_TARGET_DELIM, unmask=None):
     """
     .. versionadded:: 2015.8.0
 
@@ -527,19 +737,30 @@ def keys(key, delimiter=DEFAULT_TARGET_DELIM):
     delimiter
         Specify an alternate delimiter to use when traversing a nested dict
 
+    unmask
+        Nested pillar keys are not masked, so this flag is a practical no-op
+        for ``keys``; it is accepted for API consistency with the other
+        ``pillar`` functions.
+
+        .. versionadded:: 3008.2
+
     CLI Example:
 
     .. code-block:: bash
 
         salt '*' pillar.keys web:sites
     """
+    # ``unmask`` is accepted purely for API uniformity; keys themselves are
+    # never masked. Reference the parameter so static analyzers don't flag it.
+    del unmask
+
     ret = salt.utils.data.traverse_dict_and_list(__pillar__, key, KeyError, delimiter)
 
     if ret is KeyError:
-        raise KeyError("Pillar key not found: {}".format(key))
+        raise KeyError(f"Pillar key not found: {key}")
 
-    if not isinstance(ret, dict):
-        raise ValueError("Pillar value in key {} is not a dict".format(key))
+    if not isinstance(ret, Mapping):
+        raise ValueError(f"Pillar value in key {key} is not a dict")
 
     return list(ret)
 
@@ -575,7 +796,7 @@ def file_exists(path, saltenv=None):
     pillar_roots = __opts__.get("pillar_roots")
     if not pillar_roots:
         raise CommandExecutionError(
-            "No pillar_roots found. Are you running " "this on the master?"
+            "No pillar_roots found. Are you running this on the master?"
         )
 
     if saltenv:
@@ -645,11 +866,12 @@ def filter_by(lookup_dict, pillar, merge=None, default="default", base=None):
 
         salt '*' pillar.filter_by '{web: Serve it up, db: I query, default: x_x}' role
     """
-    return salt.utils.data.filter_by(
+    ret = salt.utils.data.filter_by(
         lookup_dict=lookup_dict,
         lookup=pillar,
-        traverse=__pillar__,
+        traverse=salt.utils.secret.expose(__pillar__),
         merge=merge,
         default=default,
         base=base,
     )
+    return ret

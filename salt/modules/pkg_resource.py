@@ -1,10 +1,6 @@
-# -*- coding: utf-8 -*-
 """
 Resources needed by pkg providers
 """
-
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
 import copy
 import fnmatch
@@ -12,14 +8,10 @@ import logging
 import os
 import pprint
 
-# Import salt libs
 import salt.utils.data
 import salt.utils.versions
 import salt.utils.yaml
-from salt.exceptions import SaltInvocationError
-
-# Import third party libs
-from salt.ext import six
+from salt.exceptions import CommandExecutionError, SaltInvocationError
 
 log = logging.getLogger(__name__)
 __SUFFIX_NOT_NEEDED = ("x86_64", "noarch")
@@ -33,16 +25,24 @@ def _repack_pkgs(pkgs, normalize=True):
     if normalize and "pkg.normalize_name" in __salt__:
         _normalize_name = __salt__["pkg.normalize_name"]
     else:
-        _normalize_name = lambda pkgname: pkgname
-    return dict(
-        [
-            (
-                _normalize_name(six.text_type(x)),
-                six.text_type(y) if y is not None else y,
+
+        def _normalize_name(pkgname):
+            return pkgname
+
+    repacked_pkgs = {
+        _normalize_name(str(x)): str(y) if y is not None else y
+        for x, y in salt.utils.data.repack_dictlist(pkgs).items()
+    }
+
+    # Check if there were collisions in names
+    if len(pkgs) != len(repacked_pkgs):
+        raise SaltInvocationError(
+            "You are passing a list of packages that contains duplicated packages names: {}. This cannot be processed. In case you are targeting different versions of the same package, please target them individually".format(
+                pkgs
             )
-            for x, y in six.iteritems(salt.utils.data.repack_dictlist(pkgs))
-        ]
-    )
+        )
+
+    return repacked_pkgs
 
 
 def pack_sources(sources, normalize=True):
@@ -72,9 +72,11 @@ def pack_sources(sources, normalize=True):
     if normalize and "pkg.normalize_name" in __salt__:
         _normalize_name = __salt__["pkg.normalize_name"]
     else:
-        _normalize_name = lambda pkgname: pkgname
 
-    if isinstance(sources, six.string_types):
+        def _normalize_name(pkgname):
+            return pkgname
+
+    if isinstance(sources, str):
         try:
             sources = salt.utils.yaml.safe_load(sources)
         except salt.utils.yaml.parser.ParserError as err:
@@ -131,7 +133,7 @@ def parse_targets(
     elif pkgs:
         if version is not None:
             log.warning(
-                "'version' argument will be ignored for multiple " "package targets"
+                "'version' argument will be ignored for multiple package targets"
             )
         pkgs = _repack_pkgs(pkgs, normalize=normalize)
         if not pkgs:
@@ -142,24 +144,31 @@ def parse_targets(
     elif sources and __grains__["os"] != "MacOS":
         if version is not None:
             log.warning(
-                "'version' argument will be ignored for multiple " "package targets"
+                "'version' argument will be ignored for multiple package targets"
             )
         sources = pack_sources(sources, normalize=normalize)
         if not sources:
             return None, None
 
         srcinfo = []
-        for pkg_name, pkg_src in six.iteritems(sources):
+        for pkg_name, pkg_src in sources.items():
             if __salt__["config.valid_fileproto"](pkg_src):
                 # Cache package from remote source (salt master, HTTP, FTP) and
                 # append the cached path.
-                srcinfo.append(__salt__["cp.cache_file"](pkg_src, saltenv))
+                cached_path = __salt__["cp.cache_file"](pkg_src, saltenv)
+                if not cached_path:
+                    raise CommandExecutionError(
+                        "Unable to cache source {} for package {}".format(
+                            pkg_src, pkg_name
+                        )
+                    )
+                srcinfo.append(cached_path)
             else:
                 # Package file local to the minion, just append the path to the
                 # package file.
                 if not os.path.isabs(pkg_src):
                     raise SaltInvocationError(
-                        "Path {0} for package {1} is either not absolute or "
+                        "Path {} for package {} is either not absolute or "
                         "an invalid protocol".format(pkg_src, pkg_name)
                     )
                 srcinfo.append(pkg_src)
@@ -171,9 +180,9 @@ def parse_targets(
             _normalize_name = __salt__.get(
                 "pkg.normalize_name", lambda pkgname: pkgname
             )
-            packed = dict([(_normalize_name(x), version) for x in name.split(",")])
+            packed = {_normalize_name(x): version for x in name.split(",")}
         else:
-            packed = dict([(x, version) for x in name.split(",")])
+            packed = {x: version for x in name.split(",")}
         return packed, "repository"
 
     else:
@@ -196,7 +205,7 @@ def version(*names, **kwargs):
     ret = {}
     versions_as_list = salt.utils.data.is_true(kwargs.pop("versions_as_list", False))
     pkg_glob = False
-    if len(names) != 0:
+    if names:
         pkgs = __salt__["pkg.list_pkgs"](versions_as_list=True, **kwargs)
         for name in names:
             if "*" in name:
@@ -211,7 +220,7 @@ def version(*names, **kwargs):
     # return dict
     if len(ret) == 1 and not pkg_glob:
         try:
-            return next(six.itervalues(ret))
+            return next(iter(ret.values()))
         except StopIteration:
             return ""
     return ret
@@ -319,8 +328,8 @@ def version_compare(ver1, oper, ver2, ignore_epoch=False):
 
     .. code-block:: jinja
 
-        {%- set postfix_version = salt.pkg.version('postfix') %}
-        {%- if postfix_version and salt.pkg_resource.version_compare(postfix_version, '>=', '3.3', ignore_epoch=True) %}
+        {%- set postfix_version = salt['pkg.version']('postfix') %}
+        {%- if postfix_version and salt['pkg_resource.version_compare'](postfix_version, '>=', '3.3', ignore_epoch=True) %}
           {#- do stuff #}
         {%- endif %}
 
@@ -411,7 +420,7 @@ def format_version(epoch, version, release):
     """
     Formats a version string for list_pkgs.
     """
-    full_version = "{0}:{1}".format(epoch, version) if epoch else version
+    full_version = f"{epoch}:{version}" if epoch else version
     if release:
-        full_version += "-{0}".format(release)
+        full_version += f"-{release}"
     return full_version

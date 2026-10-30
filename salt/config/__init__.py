@@ -1,6 +1,7 @@
 """
 All salt configuration loading and defaults should be in this module
 """
+
 import codecs
 import glob
 import logging
@@ -9,49 +10,50 @@ import re
 import sys
 import time
 import types
+import urllib.parse
 from copy import deepcopy
 
+import salt.crypt
 import salt.defaults.exitcodes
 import salt.exceptions
+import salt.features
 import salt.syspaths
 import salt.utils.data
 import salt.utils.dictupdate
 import salt.utils.files
 import salt.utils.immutabletypes as immutabletypes
 import salt.utils.network
+import salt.utils.optsdict
 import salt.utils.path
 import salt.utils.platform
 import salt.utils.stringutils
 import salt.utils.user
 import salt.utils.validate.path
+import salt.utils.versions
 import salt.utils.xdg
 import salt.utils.yaml
-import salt.utils.zeromq
-
-# pylint: disable=import-error,no-name-in-module
-from salt.ext.six.moves.urllib.parse import urlparse
-
-# pylint: enable=import-error,no-name-in-module
-
+from salt._logging import (
+    DFLT_LOG_DATEFMT,
+    DFLT_LOG_DATEFMT_LOGFILE,
+    DFLT_LOG_FMT_CONSOLE,
+    DFLT_LOG_FMT_JID,
+    DFLT_LOG_FMT_LOGFILE,
+    DFLT_LOG_FMT_MINION_ID,
+)
 
 try:
     import psutil
 
-    if not hasattr(psutil, "virtual_memory"):
-        raise ImportError("Version of psutil too old.")
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
 
 log = logging.getLogger(__name__)
 
-_DFLT_LOG_DATEFMT = "%H:%M:%S"
-_DFLT_LOG_DATEFMT_LOGFILE = "%Y-%m-%d %H:%M:%S"
-_DFLT_LOG_FMT_CONSOLE = "[%(levelname)-8s] %(message)s"
-_DFLT_LOG_FMT_LOGFILE = "%(asctime)s,%(msecs)03d [%(name)-17s:%(lineno)-4d][%(levelname)-8s][%(process)d] %(message)s"
-_DFLT_LOG_FMT_JID = "[JID: %(jid)s]"
 _DFLT_REFSPECS = ["+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*"]
 DEFAULT_INTERVAL = 60
+DEFAULT_HASH_TYPE = "sha256"
+
 
 if salt.utils.platform.is_windows():
     # Since an 'ipc_mode' of 'ipc' will never work on Windows due to lack of
@@ -68,10 +70,16 @@ elif salt.utils.platform.is_proxy():
     _DFLT_FQDNS_GRAINS = False
     _MASTER_TRIES = 1
     _MASTER_USER = salt.utils.user.get_user()
+elif salt.utils.platform.is_darwin():
+    _DFLT_IPC_MODE = "ipc"
+    # fqdn resolution can be very slow on macOS, see issue #62168
+    _DFLT_FQDNS_GRAINS = False
+    _MASTER_TRIES = 1
+    _MASTER_USER = salt.utils.user.get_user()
 else:
     _DFLT_IPC_MODE = "ipc"
-    _DFLT_FQDNS_GRAINS = True
-    _MASTER_TRIES = 1
+    _DFLT_FQDNS_GRAINS = False
+    _MASTER_TRIES = -1
     _MASTER_USER = salt.utils.user.get_user()
 
 
@@ -82,12 +90,13 @@ def _gather_buffer_space():
 
     Result is in bytes.
     """
-    if HAS_PSUTIL and psutil.version_info >= (0, 6, 0):
+    if HAS_PSUTIL:
         # Oh good, we have psutil. This will be quick.
         total_mem = psutil.virtual_memory().total
     else:
         # Avoid loading core grains unless absolutely required
         import platform
+
         import salt.grains.core
 
         # We need to load up ``mem_total`` grain. Let's mimic required OS data.
@@ -100,9 +109,9 @@ def _gather_buffer_space():
 
 # For the time being this will be a fixed calculation
 # TODO: Allow user configuration
-_DFLT_IPC_WBUFFER = _gather_buffer_space() * 0.5
+_DFLT_IPC_WBUFFER = int(_gather_buffer_space() * 0.5)
 # TODO: Reserved for future use
-_DFLT_IPC_RBUFFER = _gather_buffer_space() * 0.5
+_DFLT_IPC_RBUFFER = int(_gather_buffer_space() * 0.5)
 
 VALID_OPTS = immutabletypes.freeze(
     {
@@ -120,9 +129,9 @@ VALID_OPTS = immutabletypes.freeze(
         # specify 'default' or 'ip_only'. If 'ip_only' is specified, then the
         # master address will not be split into IP and PORT.
         "master_uri_format": str,
-        # The following optiosn refer to the Minion only, and they specify
+        # The following options refer to the Minion only, and they specify
         # the details of the source address / port to be used when connecting to
-        # the Master. This is useful when dealing withmachines where due to firewall
+        # the Master. This is useful when dealing with machines where due to firewall
         # rules you are restricted to use a certain IP/port combination only.
         "source_interface_name": str,
         "source_address": str,
@@ -134,7 +143,7 @@ VALID_OPTS = immutabletypes.freeze(
         # Deprecated in 2019.2.0. Use 'random_master' instead.
         # Do not remove! Keep as an alias for usability.
         "master_shuffle": bool,
-        # When in multi-master mode, temporarily remove a master from the list if a conenction
+        # When in multi-master mode, temporarily remove a master from the list if a connection
         # is interrupted and try another master in the list.
         "master_alive_interval": int,
         # When in multi-master failover mode, fail back to the first master in the list if it's back
@@ -155,20 +164,36 @@ VALID_OPTS = immutabletypes.freeze(
         "always_verify_signature": bool,
         # The name of the file in the masters pki-directory that holds the pre-calculated signature of
         # the masters public-key
-        "master_pubkey_signature": str,
+        "master_pubkey_signature": (type(None), str),
         # Instead of computing the signature for each auth-reply, use a pre-calculated signature.
         # The master_pubkey_signature must also be set for this.
         "master_use_pubkey_signature": bool,
-        # Enable master stats eveents to be fired, these events will contain information about
+        # Enable master stats events to be fired, these events will contain information about
         # what commands the master is processing and what the rates are of the executions
         "master_stats": bool,
         "master_stats_event_iter": int,
+        # Opt-in switch to enable async MWorker dispatch (AESFuncs / ClearFuncs /
+        # AuthFuncs handlers offload blocking work to a thread executor and the
+        # PoolRoutingChannel uses one IPC socket per MWorker for fair dispatch).
+        # DEFAULT: False on LTS (3008.x). When False, MWorker uses the pre-PR
+        # synchronous handlers and single-socket IPC routing (byte-for-byte
+        # identical to Argon v3008.2 and earlier).
+        "master_async_mworker": bool,
+        # Per-MWorker cap on the number of concurrent request handlers.
+        # Only has effect when ``master_async_mworker`` is True.  Default
+        # 0 = unlimited (backwards compatible).  When positive, each
+        # MWorker uses its own asyncio.BoundedSemaphore, so the effective
+        # total cap across the pool is
+        # ``master_mworker_max_inflight * worker_threads``.  Coroutines
+        # blocked on the semaphore create natural TCP / ZMQ backpressure
+        # — no error return, no dropped requests.
+        "master_mworker_max_inflight": int,
         # The key fingerprint of the higher-level master for the syndic to verify it is talking to the
         # intended master
         "syndic_finger": str,
         # The caching mechanism to use for the PKI key store. Can substantially decrease master publish
         # times. Available types:
-        # 'maint': Runs on a schedule as a part of the maintanence process.
+        # 'maint': Runs on a schedule as a part of the maintenance process.
         # '': Disable the key cache [default]
         "key_cache": str,
         # The user under which the daemon should run
@@ -181,6 +206,64 @@ VALID_OPTS = immutabletypes.freeze(
         "pki_dir": str,
         # A unique identifier for this daemon
         "id": str,
+        # When defined we operate this master as a part of a cluster.
+        "cluster_id": str,
+        # Defines the other masters in the cluster.
+        "cluster_peers": list,
+        # Use this location instead of pki dir for cluster. This allows users
+        # to define where minion keys and the cluster private key will be
+        # stored.
+        "cluster_pki_dir": str,
+        # The port required to be open for a master cluster to properly function
+        "cluster_pool_port": int,
+        # Optional SHA-256 hex fingerprint of the shared cluster public key.
+        # When set, a joining master rejects any discover-reply whose
+        # ``cluster_pub`` does not hash to this value. See the ``cluster_secret``
+        # docs and the master-cluster tutorial for the trust model.
+        "cluster_pub_fingerprint": str,
+        # Shared pre-shared string that authenticates a master joining an
+        # existing cluster at runtime.
+        "cluster_secret": str,
+        # When True, cluster masters do NOT share ``cluster_pki_dir`` /
+        # ``cachedir`` between members.  In this mode keys.cache_driver
+        # defaults to mmap_key (so cache files are deterministic per-bank
+        # and can be sync'd as opaque blobs) and joining masters request a
+        # bulk state-sync from an existing peer before becoming Raft voters.
+        "cluster_isolated_filesystem": bool,
+        # Maximum number of in-memory Raft log entries before the log
+        # compacts into a snapshot.  ``None`` (the default) disables
+        # compaction — fine for small clusters but unbounded growth at
+        # scale.  Setting to a positive integer triggers
+        # ``Log.snapshot()`` whenever the log reaches the threshold;
+        # the snapshot envelope (``raft.snapshot.v1``) carries every
+        # registered state machine so membership survives compaction.
+        "cluster_max_log_size": (type(None), int),
+        # Upper bound on the number of voting peers in the cluster Raft
+        # group.  ``None`` (the default) preserves today's behaviour:
+        # every master that joins is promoted to a voter once its log
+        # catches up.  Setting a positive integer caps the voter set;
+        # late joiners that arrive after the cap is hit stay as
+        # non-voting learners indefinitely.  Learners still receive
+        # log replication and cluster events, so they remain useful
+        # for handling minion traffic — they just don't count toward
+        # election or commit quorum.
+        "cluster_max_voters": (type(None), int),
+        # Auto-replacement of failed voters (Ongaro thesis §6.4 single-server
+        # changes).  When ``cluster_auto_replace_voters`` is True the leader
+        # watches each voter's last_contact timestamp; a voter silent for
+        # ``cluster_voter_timeout`` seconds becomes a candidate for
+        # demotion.  The leader proposes a CONFIG entry moving it to the
+        # learner set; the existing replacement-promotion path then
+        # promotes a caught-up learner to fill the slot, subject to
+        # ``cluster_max_voters``.  ``cluster_min_voters`` is a floor that
+        # refuses demotion if it would shrink the voter set below safety;
+        # ``cluster_demote_cooldown`` blocks immediate re-promotion of a
+        # node that flaps.  Default is opt-in (False) until field-tested.
+        "cluster_voter_health_check_interval": float,
+        "cluster_voter_timeout": float,
+        "cluster_min_voters": int,
+        "cluster_demote_cooldown": float,
+        "cluster_auto_replace_voters": bool,
         # Use a module function to determine the unique identifier. If this is
         # set and 'id' is not set, it will allow invocation of a module function
         # to determine the value of 'id'. For simple invocations without function
@@ -211,7 +294,7 @@ VALID_OPTS = immutabletypes.freeze(
         "renderer": str,
         # Renderer whitelist. The only renderers from this list are allowed.
         "renderer_whitelist": list,
-        # Rendrerer blacklist. Renderers from this list are disalloed even if specified in whitelist.
+        # Renderer blacklist. Renderers from this list are disallowed even if specified in whitelist.
         "renderer_blacklist": list,
         # A flag indicating that a highstate run should immediately cease if a failure occurs.
         "failhard": bool,
@@ -257,6 +340,8 @@ VALID_OPTS = immutabletypes.freeze(
         "decrypt_pillar_default": str,
         # List of renderers available for decrypt_pillar
         "decrypt_pillar_renderers": list,
+        # Treat GPG decryption errors as renderer errors
+        "gpg_decrypt_must_succeed": bool,
         # The type of hashing algorithm to use when doing file comparisons
         "hash_type": str,
         # Order of preference for optimized .pyc files (PY3 only)
@@ -267,6 +352,11 @@ VALID_OPTS = immutabletypes.freeze(
         "disable_returners": list,
         # Tell the loader to only load modules in this list
         "whitelist_modules": list,
+        # State-loader counterpart to ``whitelist_modules``.  When set,
+        # only state modules whose name is in this list are loadable; an
+        # SLS that references any other state module fails compile with
+        # ``State '<mod>.<fun>' was not found in SLS ...``.
+        "whitelist_state_modules": list,
         # A list of additional directories to search for salt modules in
         "module_dirs": list,
         # A list of additional directories to search for salt returners in
@@ -331,6 +421,10 @@ VALID_OPTS = immutabletypes.freeze(
         "log_fmt_console": str,
         # The format for a given log file
         "log_fmt_logfile": (tuple, str),
+        # The format for JIDs prior to formatting into log lines as %(jid)s
+        "log_fmt_jid": (type(None), str),
+        # The format for minion_ids prior to formatting into log lines as %(minion_id)s
+        "log_fmt_minion_id": (type(None), str),
         # A dictionary of logging levels
         "log_granular_levels": dict,
         # The maximum number of bytes a single log file may contain before
@@ -366,16 +460,27 @@ VALID_OPTS = immutabletypes.freeze(
         # to the jid. WARNING: A change to the jid format may break external
         # applications that depend on the original format.
         "unique_jid": bool,
+        # Governs whether state runs will queue or fail to run when a state is already running
+        "state_queue": (bool, int),
         # Tells the highstate outputter to show successful states. False will omit successes.
         "state_verbose": bool,
         # Specify the format for state outputs. See highstate outputter for additional details.
         "state_output": str,
         # Tells the highstate outputter to only report diffs of states that changed
         "state_output_diff": bool,
+        # Tells the highstate outputter whether profile information will be shown for each state run
+        "state_output_profile": bool,
+        # Tells the highstate outputter whether success and failure percents will be shown for each state run
+        "state_output_pct": bool,
+        # Tells the highstate outputter to aggregate information about states which
+        # have multiple "names" under the same state ID in the highstate output.
+        "state_compress_ids": bool,
         # When true, states run in the order defined in an SLS file, unless requisites re-order them
         "state_auto_order": bool,
         # Fire events as state chunks are processed by the state compiler
         "state_events": bool,
+        # Limit the number of states that can be running in parallel
+        "state_max_parallel": int,
         # The number of seconds a minion should wait before retry when attempting authentication
         "acceptance_wait_time": float,
         # The number of seconds a minion should wait before giving up during authentication
@@ -394,6 +499,8 @@ VALID_OPTS = immutabletypes.freeze(
         "permissive_pki_access": bool,
         # The passphrase of the master's private key
         "key_pass": (type(None), str),
+        # The passphrase of the master cluster's private key
+        "cluster_key_pass": (type(None), str),
         # The passphrase of the master's private signing key
         "signing_key_pass": (type(None), str),
         # The path to a directory to pull in configuration file includes
@@ -423,6 +530,10 @@ VALID_OPTS = immutabletypes.freeze(
         "return_retry_timer_max": int,
         # Configures amount of return retries
         "return_retry_tries": int,
+        # Configures amount of retries for Syndic to Master of Masters
+        "syndic_retries": int,
+        # Top-level pillar key for per-type resource configuration (default: resources)
+        "resource_pillar_key": str,
         # Specify one or more returners in which all events will be sent to. Requires that the returners
         # in question have an event_return(event) function!
         "event_return": (list, str),
@@ -464,6 +575,17 @@ VALID_OPTS = immutabletypes.freeze(
         # Set the zeromq high water mark on the publisher interface.
         # http://api.zeromq.org/3-2:zmq-setsockopt
         "pub_hwm": int,
+        # Per-subscriber timeout (seconds) for the TCP PubServer to drain
+        # a single publish write.  Subscribers that don't drain within
+        # this window are closed and removed to keep publish_payload
+        # from wedging on a slow peer.  See #69988.
+        "publish_drain_timeout": float,
+        # Per-subscriber cap on queued publish payloads for the TCP
+        # PubServer.  Subscribers that let their writer coroutine back
+        # up beyond this many payloads are treated as slow and
+        # disconnected.  Bounds in-flight drain-task allocation to one
+        # writer task per subscriber under bursty load.  See #70147.
+        "pub_server_write_queue_size": int,
         # IPC buffer size
         # Refs https://github.com/saltstack/salt/issues/34215
         "ipc_write_buffer": int,
@@ -480,11 +602,15 @@ VALID_OPTS = immutabletypes.freeze(
         # The number of MWorker processes for a master to startup. This number needs to scale up as
         # the number of connected minions increases.
         "worker_threads": int,
+        # Enable worker pool routing for mworkers
+        "worker_pools_enabled": bool,
+        # Worker pool configuration (dict of pool_name -> {worker_count, commands})
+        "worker_pools": dict,
         # The port for the master to listen to returns on. The minion needs to connect to this port
         # to send returns.
         "ret_port": int,
-        # The number of hours to keep jobs around in the job cache on the master
-        "keep_jobs": int,
+        # The number of seconds to keep jobs around in the job cache on the master
+        "keep_jobs_seconds": int,
         # If the returner supports `clean_old_jobs`, then at cleanup time,
         # archive the job data before deleting it.
         "archive_jobs": bool,
@@ -520,7 +646,6 @@ VALID_OPTS = immutabletypes.freeze(
         "proxy_keep_alive_interval": int,
         # Update intervals
         "roots_update_interval": int,
-        "azurefs_update_interval": int,
         "gitfs_update_interval": int,
         "git_pillar_update_interval": int,
         "hgfs_update_interval": int,
@@ -543,6 +668,7 @@ VALID_OPTS = immutabletypes.freeze(
         "git_pillar_refspecs": list,
         "git_pillar_includes": bool,
         "git_pillar_verify_config": bool,
+        "git_pillar_proxy": str,
         # NOTE: gitfs_base, gitfs_fallback, gitfs_mountpoint, and gitfs_root omitted
         # here because their values could conceivably be loaded as non-string types,
         # which is OK because gitfs will normalize them to strings. But rather than
@@ -560,6 +686,7 @@ VALID_OPTS = immutabletypes.freeze(
         "gitfs_ref_types": list,
         "gitfs_refspecs": list,
         "gitfs_disable_saltenv_mapping": bool,
+        "gitfs_proxy": str,
         "hgfs_remotes": list,
         "hgfs_mountpoint": str,
         "hgfs_root": str,
@@ -603,6 +730,10 @@ VALID_OPTS = immutabletypes.freeze(
         "pillar_source_merging_strategy": str,
         # Recursively merge lists by aggregating them instead of replacing them.
         "pillar_merge_lists": bool,
+        # When False, changes pillar.items()'s default (when the caller
+        # doesn't pass unmask=) to return unmasked pillar values. Does not
+        # affect pillar.get/item/raw/ext, no_log states, or general output.
+        "pillar_mask_output": bool,
         # If True, values from included pillar SLS targets will override
         "pillar_includes_override_sls": bool,
         # How to merge multiple top files from multiple salt environments
@@ -638,9 +769,8 @@ VALID_OPTS = immutabletypes.freeze(
         "fileserver_backend": list,
         "fileserver_followsymlinks": bool,
         "fileserver_ignoresymlinks": bool,
-        "fileserver_limit_traversal": bool,
         "fileserver_verify_config": bool,
-        # Optionally apply '*' permissioins to any user. By default '*' is a fallback case that is
+        # Optionally apply '*' permissions to any user. By default '*' is a fallback case that is
         # applied only if the user didn't matched by other matchers.
         "permissive_acl": bool,
         # Optionally enables keeping the calculated user's auth list in the token file.
@@ -683,7 +813,7 @@ VALID_OPTS = immutabletypes.freeze(
         "minion_data_cache": bool,
         # The number of seconds between AES key rotations on the master
         "publish_session": int,
-        # Defines a salt reactor. See http://docs.saltstack.com/en/latest/topics/reactor/
+        # Defines a salt reactor. See https://docs.saltproject.io/en/latest/topics/reactor/
         "reactor": list,
         # The TTL for the cache of the reactor configuration
         "reactor_refresh_interval": int,
@@ -691,14 +821,14 @@ VALID_OPTS = immutabletypes.freeze(
         "reactor_worker_threads": int,
         # The queue size for workers in the reactor
         "reactor_worker_hwm": int,
-        # Defines engines. See https://docs.saltstack.com/en/latest/topics/engines/
+        # Defines engines. See https://docs.saltproject.io/en/latest/topics/engines/
         "engines": list,
         # Whether or not to store runner returns in the job cache
         "runner_returns": bool,
         "serial": str,
         "search": str,
         # A compound target definition.
-        # See: http://docs.saltstack.com/en/latest/topics/targeting/nodegroups.html
+        # See: https://docs.saltproject.io/en/latest/topics/targeting/nodegroups.html
         "nodegroups": (dict, list),
         # List-only nodegroups for salt-ssh. Each group must be formed as either a
         # comma-separated list, or a YAML list.
@@ -727,9 +857,11 @@ VALID_OPTS = immutabletypes.freeze(
         # be, we'll just skip type-checking.
         "winrepo_cache_expire_max": int,
         "winrepo_cache_expire_min": int,
+        "winrepo_installer_cache_expire": int,
         "winrepo_remotes": list,
         "winrepo_remotes_ng": list,
         "winrepo_ssl_verify": bool,
+        "winrepo_proxy": str,
         "winrepo_user": str,
         "winrepo_password": str,
         "winrepo_insecure_auth": bool,
@@ -743,6 +875,8 @@ VALID_OPTS = immutabletypes.freeze(
         "grains_blacklist": list,
         # The number of minutes between the minion refreshing its cache of grains
         "grains_refresh_every": int,
+        # Enable grains refresh prior to any operation
+        "grains_refresh_pre_exec": bool,
         # Use lspci to gather system data for grains on a minion
         "enable_lspci": bool,
         # The number of seconds for the salt client to wait for additional syndics to
@@ -775,6 +909,13 @@ VALID_OPTS = immutabletypes.freeze(
         "auth_timeout": int,
         # The number of attempts to authenticate to a master before giving up
         "auth_tries": int,
+        # Cap on the AsyncAuth outer retry loop on the minion. When the master
+        # answers sign_in() with a ``retry`` sentinel (key not yet accepted,
+        # AES rotation in flight, multi-master probe), the minion sleeps and
+        # retries.  Set this to a positive integer to bail out with
+        # ``SaltClientError`` after that many outer attempts.  Default is ``0``
+        # which preserves the pre-3006.26 behavior of retrying forever.
+        "auth_retries": int,
         # The number of attempts to connect to a master before giving up.
         # Set this to -1 for unlimited attempts. This allows for a master to have
         # downtime and the minion to reconnect to it later when it comes back up.
@@ -799,6 +940,9 @@ VALID_OPTS = immutabletypes.freeze(
         "ssh_sudo": bool,
         "ssh_sudo_user": str,
         "ssh_timeout": float,
+        "ssh_keepalive": bool,
+        "ssh_keepalive_interval": int,
+        "ssh_keepalive_count_max": int,
         "ssh_user": str,
         "ssh_scan_ports": str,
         "ssh_scan_timeout": float,
@@ -864,7 +1008,7 @@ VALID_OPTS = immutabletypes.freeze(
         "no_proxy": list,
         # Minion de-dup jid cache max size
         "minion_jid_queue_hwm": int,
-        # Minion data cache driver (one of satl.cache.* modules)
+        # Minion data cache driver (one of salt.cache.* modules)
         "cache": str,
         # Enables a fast in-memory cache booster and sets the expiration time.
         "memcache_expire_seconds": int,
@@ -877,6 +1021,9 @@ VALID_OPTS = immutabletypes.freeze(
         # Thin and minimal Salt extra modules
         "thin_extra_mods": str,
         "min_extra_mods": str,
+        "thin_exclude_saltexts": bool,
+        "thin_saltext_allowlist": (type(None), list),
+        "thin_saltext_blocklist": list,
         # Default returners minion should use. List or comma-delimited string
         "return": (str, list),
         # TLS/SSL connection options. This could be set to a dictionary containing arguments
@@ -886,6 +1033,23 @@ VALID_OPTS = immutabletypes.freeze(
         # Note: to set enum arguments values like `cert_reqs` and `ssl_version` use constant names
         # without ssl module prefix: `CERT_REQUIRED` or `PROTOCOL_SSLv23`.
         "ssl": (dict, bool, type(None)),
+        # Disable redundant AES encryption when TLS is active with validated certificates
+        "disable_aes_with_tls": bool,
+        # Use the native OS certificate store instead of the bundled certifi CA bundle
+        "use_os_truststore": bool,
+        # Let salt-pip's pip subprocess inherit PYTHONPATH from the calling
+        # process instead of isolating it to just the onedir extras directory
+        "saltpip_use_pythonpath": bool,
+        # Force salt-pip to always pass --no-deps to pip (via PIP_NO_DEPS)
+        "saltpip_no_deps": bool,
+        # Force salt-pip to always pass --no-index to pip (via PIP_NO_INDEX)
+        "saltpip_no_index": bool,
+        # Force salt-pip to always pass --disable-pip-version-check to pip
+        # (via PIP_DISABLE_PIP_VERSION_CHECK)
+        "saltpip_disable_pip_version_check": bool,
+        # If False, strip any inherited PIP_FIND_LINKS from salt-pip's pip
+        # subprocess environment, independent of saltpip_no_index
+        "saltpip_allow_find_links": bool,
         # Controls how a multi-function job returns its data. If this is False,
         # it will return its data using a dictionary with the function name as
         # the key. This is compatible with legacy systems. If this is True, it
@@ -908,6 +1072,8 @@ VALID_OPTS = immutabletypes.freeze(
         # Number of times to try to auth with the master on a reconnect with the
         # tcp transport
         "tcp_authentication_retries": int,
+        # Backoff interval in seconds for minion reconnect with tcp transport
+        "tcp_reconnect_backoff": float,
         # Permit or deny allowing minions to request revoke of its own key
         "allow_minion_key_revoke": bool,
         # File chunk size for salt-cp
@@ -934,6 +1100,8 @@ VALID_OPTS = immutabletypes.freeze(
         "schedule": dict,
         # Whether to fire auth events
         "auth_events": bool,
+        # Specify auth events to add autosign_grains to
+        "auth_events_autosign_grains": list,
         # Whether to fire Minion data cache refresh events
         "minion_data_cache_events": bool,
         # Enable calling ssh minions from the salt master
@@ -945,9 +1113,61 @@ VALID_OPTS = immutabletypes.freeze(
         # Allow raw_shell option when using the ssh
         # client via the Salt API
         "netapi_allow_raw_shell": bool,
+        # Enable clients in the Salt API
+        "netapi_enable_clients": list,
         "disabled_requisites": (str, list),
+        "global_state_conditions": (type(None), dict),
         # Feature flag config
         "features": dict,
+        "fips_mode": bool,
+        # Feature flag to enable checking if master is connected to a host
+        # on a given port
+        "detect_remote_minions": bool,
+        # The port to be used when checking if a master is connected to a
+        # minion
+        "remote_minions_port": int,
+        # pass renderer: Fetch secrets only for the template variables matching the prefix
+        "pass_variable_prefix": str,
+        # pass renderer: Whether to error out when unable to fetch a secret
+        "pass_strict_fetch": bool,
+        # pass renderer: Set GNUPGHOME env for Pass
+        "pass_gnupghome": str,
+        # pass renderer: Set PASSWORD_STORE_DIR env for Pass
+        "pass_dir": str,
+        # Maintenence process restart interval
+        "maintenance_interval": int,
+        # Fileserver process restart interval
+        "fileserver_interval": int,
+        "request_channel_timeout": int,
+        "request_channel_tries": int,
+        # RSA encryption for minion
+        "encryption_algorithm": str,
+        # RSA signing for minion
+        "signing_algorithm": str,
+        # Master publish channel signing
+        "publish_signing_algorithm": str,
+        # RSA encryption used for cluster peer-to-peer messages
+        "cluster_encryption_algorithm": str,
+        # the cache driver to be used to manage keys for both minion and master
+        "keys.cache_driver": (type(None), str),
+        "request_server_ttl": int,
+        "request_server_aes_session": int,
+        # Minimum authentication protocol version to accept from minions
+        "minimum_auth_version": int,
+        # optional cache driver for pillar cache
+        "pillar.cache_driver": (type(None), str),
+        # optional cache driver for eauth_tokens cache
+        "eauth_tokens.cache_driver": (type(None), str),
+        # eauth tokens cluster id override
+        "eauth_tokens.cluster_id": (type(None), str),
+        # OpenTelemetry tracing configuration block.  Disabled by default;
+        # when enabled, salt daemons emit W3C-TraceContext-propagated spans
+        # via an OTLP exporter.
+        "tracing": dict,
+        # OpenTelemetry metrics configuration block.  Disabled by default;
+        # when enabled, salt daemons emit counters, histograms and
+        # observable gauges via OTLP push or a Prometheus pull endpoint.
+        "metrics": dict,
     }
 )
 
@@ -975,7 +1195,7 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "syndic_finger": "",
         "user": salt.utils.user.get_user(),
         "root_dir": salt.syspaths.ROOT_DIR,
-        "pki_dir": os.path.join(salt.syspaths.CONFIG_DIR, "pki", "minion"),
+        "pki_dir": os.path.join(salt.syspaths.LIB_STATE_DIR, "pki", "minion"),
         "id": "",
         "id_function": {},
         "cachedir": os.path.join(salt.syspaths.CACHE_DIR, "minion"),
@@ -1002,6 +1222,7 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "pillar_opts": False,
         "pillar_source_merging_strategy": "smart",
         "pillar_merge_lists": False,
+        "pillar_mask_output": True,
         "pillar_includes_override_sls": False,
         # ``pillar_cache``, ``pillar_cache_ttl``, ``pillar_cache_backend``,
         # ``gpg_cache``, ``gpg_cache_ttl`` and ``gpg_cache_backend``
@@ -1009,6 +1230,8 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "pillar_cache": False,
         "pillar_cache_ttl": 3600,
         "pillar_cache_backend": "disk",
+        "request_channel_timeout": 60,
+        "request_channel_tries": 3,
         "gpg_cache": False,
         "gpg_cache_ttl": 86400,
         "gpg_cache_backend": "disk",
@@ -1032,7 +1255,6 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "top_file_merging_strategy": "merge",
         "env_order": [],
         "default_top": "base",
-        "fileserver_limit_traversal": False,
         "file_recv": False,
         "file_recv_max_size": 100,
         "file_ignore_regex": [],
@@ -1048,9 +1270,9 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "decrypt_pillar_delimiter": ":",
         "decrypt_pillar_default": "gpg",
         "decrypt_pillar_renderers": ["gpg"],
+        "gpg_decrypt_must_succeed": True,
         # Update intervals
         "roots_update_interval": DEFAULT_INTERVAL,
-        "azurefs_update_interval": DEFAULT_INTERVAL,
         "gitfs_update_interval": DEFAULT_INTERVAL,
         "git_pillar_update_interval": DEFAULT_INTERVAL,
         "hgfs_update_interval": DEFAULT_INTERVAL,
@@ -1072,6 +1294,10 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "git_pillar_passphrase": "",
         "git_pillar_refspecs": _DFLT_REFSPECS,
         "git_pillar_includes": True,
+        "git_pillar_proxy": "",
+        "git_pillar_depth": 1,
+        "git_pillar_ref_types": ["branch", "tag", "sha"],
+        "git_pillar_disable_saltenv_mapping": False,
         "gitfs_remotes": [],
         "gitfs_mountpoint": "",
         "gitfs_root": "",
@@ -1091,12 +1317,15 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "gitfs_ref_types": ["branch", "tag", "sha"],
         "gitfs_refspecs": _DFLT_REFSPECS,
         "gitfs_disable_saltenv_mapping": False,
+        "gitfs_proxy": "",
+        "gitfs_depth": 1,
         "unique_jid": False,
-        "hash_type": "sha256",
+        "hash_type": DEFAULT_HASH_TYPE,
         "optimization_order": [0, 1, 2],
         "disable_modules": [],
         "disable_returners": [],
         "whitelist_modules": [],
+        "whitelist_state_modules": [],
         "module_dirs": [],
         "returner_dirs": [],
         "grains_dirs": [],
@@ -1123,19 +1352,21 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "tcp_pub_port": 4510,
         "tcp_pull_port": 4511,
         "tcp_authentication_retries": 5,
+        "tcp_reconnect_backoff": 1,
         "log_file": os.path.join(salt.syspaths.LOGS_DIR, "minion"),
         "log_level": "warning",
         "log_level_logfile": None,
-        "log_datefmt": _DFLT_LOG_DATEFMT,
-        "log_datefmt_logfile": _DFLT_LOG_DATEFMT_LOGFILE,
-        "log_fmt_console": _DFLT_LOG_FMT_CONSOLE,
-        "log_fmt_logfile": _DFLT_LOG_FMT_LOGFILE,
-        "log_fmt_jid": _DFLT_LOG_FMT_JID,
+        "log_datefmt": DFLT_LOG_DATEFMT,
+        "log_datefmt_logfile": DFLT_LOG_DATEFMT_LOGFILE,
+        "log_fmt_console": DFLT_LOG_FMT_CONSOLE,
+        "log_fmt_logfile": DFLT_LOG_FMT_LOGFILE,
+        "log_fmt_jid": DFLT_LOG_FMT_JID,
+        "log_fmt_minion_id": DFLT_LOG_FMT_MINION_ID,
         "log_granular_levels": {},
         "log_rotate_max_bytes": 0,
         "log_rotate_backup_count": 0,
         "max_event_size": 1048576,
-        "enable_legacy_startup_events": True,
+        "enable_legacy_startup_events": False,
         "test": False,
         "ext_job_cache": "",
         "cython_enable": False,
@@ -1145,9 +1376,12 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "state_verbose": True,
         "state_output": "full",
         "state_output_diff": False,
+        "state_output_profile": True,
         "state_auto_order": True,
         "state_events": False,
         "state_aggregate": False,
+        "state_queue": False,
+        "state_max_parallel": 0,
         "snapper_states": False,
         "snapper_states_config": "root",
         "acceptance_wait_time": 10,
@@ -1169,6 +1403,8 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "return_retry_timer": 5,
         "return_retry_timer_max": 10,
         "return_retry_tries": 3,
+        "resource_pillar_key": "resources",
+        "syndic_retries": 3,
         "random_reauth_delay": 10,
         "winrepo_source_dir": "salt://win/repo-ng/",
         "winrepo_dir": os.path.join(salt.syspaths.BASE_FILE_ROOTS_DIR, "win", "repo"),
@@ -1178,11 +1414,13 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "winrepo_cachefile": "winrepo.p",
         "winrepo_cache_expire_max": 604800,
         "winrepo_cache_expire_min": 1800,
+        "winrepo_installer_cache_expire": 0,
         "winrepo_remotes": ["https://github.com/saltstack/salt-winrepo.git"],
         "winrepo_remotes_ng": ["https://github.com/saltstack/salt-winrepo-ng.git"],
         "winrepo_branch": "master",
         "winrepo_fallback": "",
         "winrepo_ssl_verify": True,
+        "winrepo_proxy": "",
         "winrepo_user": "",
         "winrepo_password": "",
         "winrepo_insecure_auth": False,
@@ -1190,6 +1428,7 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "winrepo_pubkey": "",
         "winrepo_passphrase": "",
         "winrepo_refspecs": _DFLT_REFSPECS,
+        "winrepo_depth": 1,
         "pidfile": os.path.join(salt.syspaths.PIDFILE_DIR, "salt-minion.pid"),
         "range_server": "range:80",
         "reactor_refresh_interval": 60,
@@ -1209,6 +1448,7 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "transport": "zeromq",
         "auth_timeout": 5,
         "auth_tries": 7,
+        "auth_retries": 0,
         "master_tries": _MASTER_TRIES,
         "master_tops_first": False,
         "auth_safemode": False,
@@ -1219,7 +1459,7 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "username": None,
         "password": None,
         "zmq_filtering": False,
-        "zmq_monitor": False,
+        "zmq_monitor": True,
         "cache_sreqs": True,
         "cmd_safe": True,
         "sudo_user": "",
@@ -1235,6 +1475,7 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "proxy_port": 0,
         "minion_jid_queue_hwm": 100,
         "ssl": None,
+        "disable_aes_with_tls": False,
         "multifunc_ordered": False,
         "beacons_before_connect": False,
         "scheduler_before_connect": False,
@@ -1247,6 +1488,91 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "schedule": {},
         "ssh_merge_pillar": True,
         "disabled_requisites": [],
+        "global_state_conditions": None,
+        "reactor_niceness": None,
+        "fips_mode": False,
+        "use_os_truststore": False,
+        "saltpip_use_pythonpath": False,
+        "saltpip_no_deps": False,
+        "saltpip_no_index": False,
+        "saltpip_disable_pip_version_check": False,
+        "saltpip_allow_find_links": True,
+        "features": {},
+        "encryption_algorithm": "OAEP-SHA1",
+        "signing_algorithm": "PKCS1v15-SHA1",
+        "keys.cache_driver": "localfs_key",
+        "pillar.cache_driver": None,
+        "tracing": {
+            "enabled": False,
+            "exporter": "otlp-http",
+            "endpoint": "",
+            "service_name": "",
+            "sampler": "parent_based",
+            "sampler_arg": 1.0,
+            "resource_attributes": {},
+            "insecure": True,
+            "headers": {},
+        },
+        "metrics": {
+            "enabled": False,
+            "exporter": "otlp-http",
+            "endpoint": "",
+            "service_name": "",
+            "resource_attributes": {},
+            "insecure": True,
+            "headers": {},
+            "export_interval_seconds": 60,
+            "prometheus": {
+                "host": "127.0.0.1",
+                "port": 9464,
+            },
+            "histogram_boundaries": {
+                "salt.job.duration": [
+                    1,
+                    5,
+                    10,
+                    25,
+                    50,
+                    100,
+                    250,
+                    500,
+                    1000,
+                    2500,
+                    5000,
+                    10000,
+                    30000,
+                    60000,
+                ],
+                "salt.minion.exec.duration": [
+                    1,
+                    5,
+                    10,
+                    25,
+                    50,
+                    100,
+                    250,
+                    500,
+                    1000,
+                    2500,
+                    5000,
+                    10000,
+                ],
+                "salt.master.requests.duration": [
+                    1,
+                    5,
+                    10,
+                    25,
+                    50,
+                    100,
+                    250,
+                    500,
+                    1000,
+                    2500,
+                    5000,
+                    10000,
+                ],
+            },
+        },
     }
 )
 
@@ -1256,17 +1582,23 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "publish_port": 4505,
         "zmq_backlog": 1000,
         "pub_hwm": 1000,
+        "publish_drain_timeout": 60.0,
+        "pub_server_write_queue_size": 10000,
         "auth_mode": 1,
         "user": _MASTER_USER,
         "worker_threads": 5,
+        "worker_pools_enabled": True,
+        "worker_pools": {},
         "sock_dir": os.path.join(salt.syspaths.SOCK_DIR, "master"),
         "sock_pool_size": 1,
         "ret_port": 4506,
         "timeout": 5,
+        "publish_timeout": 30,
         "keep_jobs": 24,
+        "keep_jobs_seconds": 86400,
         "archive_jobs": False,
         "root_dir": salt.syspaths.ROOT_DIR,
-        "pki_dir": os.path.join(salt.syspaths.CONFIG_DIR, "pki", "master"),
+        "pki_dir": os.path.join(salt.syspaths.LIB_STATE_DIR, "pki", "master"),
         "key_cache": "",
         "cachedir": os.path.join(salt.syspaths.CACHE_DIR, "master"),
         "file_roots": {
@@ -1281,6 +1613,7 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "decrypt_pillar_delimiter": ":",
         "decrypt_pillar_default": "gpg",
         "decrypt_pillar_renderers": ["gpg"],
+        "gpg_decrypt_must_succeed": True,
         "thoriumenv": None,
         "thorium_top": "top.sls",
         "thorium_interval": 0.5,
@@ -1295,7 +1628,6 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "local": True,
         # Update intervals
         "roots_update_interval": DEFAULT_INTERVAL,
-        "azurefs_update_interval": DEFAULT_INTERVAL,
         "gitfs_update_interval": DEFAULT_INTERVAL,
         "git_pillar_update_interval": DEFAULT_INTERVAL,
         "hgfs_update_interval": DEFAULT_INTERVAL,
@@ -1318,6 +1650,10 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "git_pillar_refspecs": _DFLT_REFSPECS,
         "git_pillar_includes": True,
         "git_pillar_verify_config": True,
+        "git_pillar_proxy": "",
+        "git_pillar_depth": 1,
+        "git_pillar_ref_types": ["branch", "tag", "sha"],
+        "git_pillar_disable_saltenv_mapping": False,
         "gitfs_remotes": [],
         "gitfs_mountpoint": "",
         "gitfs_root": "",
@@ -1337,6 +1673,8 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "gitfs_ref_types": ["branch", "tag", "sha"],
         "gitfs_refspecs": _DFLT_REFSPECS,
         "gitfs_disable_saltenv_mapping": False,
+        "gitfs_proxy": "",
+        "gitfs_depth": 1,
         "hgfs_remotes": [],
         "hgfs_mountpoint": "",
         "hgfs_root": "",
@@ -1358,6 +1696,13 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "max_event_size": 1048576,
         "master_stats": False,
         "master_stats_event_iter": 60,
+        # LTS default: sync MWorker path preserved; async is opt-in.
+        # See DEFAULT_MASTER_OPTS type table for details.
+        "master_async_mworker": False,
+        # Default 0 = unlimited (backwards compatible).  See the
+        # DEFAULT_MASTER_OPTS type table for the semantics.  Only has
+        # effect when ``master_async_mworker`` is True.
+        "master_mworker_max_inflight": 0,
         "minionfs_env": "base",
         "minionfs_mountpoint": "",
         "minionfs_whitelist": [],
@@ -1368,6 +1713,7 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "pillar_safe_render_error": True,
         "pillar_source_merging_strategy": "smart",
         "pillar_merge_lists": False,
+        "pillar_mask_output": True,
         "pillar_includes_override_sls": False,
         "pillar_cache": False,
         "pillar_cache_ttl": 3600,
@@ -1407,10 +1753,9 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "fileserver_backend": ["roots"],
         "fileserver_followsymlinks": True,
         "fileserver_ignoresymlinks": False,
-        "fileserver_limit_traversal": False,
         "fileserver_verify_config": True,
         "max_open_files": 100000,
-        "hash_type": "sha256",
+        "hash_type": DEFAULT_HASH_TYPE,
         "optimization_order": [0, 1, 2],
         "conf_file": os.path.join(salt.syspaths.CONFIG_DIR, "master"),
         "open_mode": False,
@@ -1450,11 +1795,12 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "log_file": os.path.join(salt.syspaths.LOGS_DIR, "master"),
         "log_level": "warning",
         "log_level_logfile": None,
-        "log_datefmt": _DFLT_LOG_DATEFMT,
-        "log_datefmt_logfile": _DFLT_LOG_DATEFMT_LOGFILE,
-        "log_fmt_console": _DFLT_LOG_FMT_CONSOLE,
-        "log_fmt_logfile": _DFLT_LOG_FMT_LOGFILE,
-        "log_fmt_jid": _DFLT_LOG_FMT_JID,
+        "log_datefmt": DFLT_LOG_DATEFMT,
+        "log_datefmt_logfile": DFLT_LOG_DATEFMT_LOGFILE,
+        "log_fmt_console": DFLT_LOG_FMT_CONSOLE,
+        "log_fmt_logfile": DFLT_LOG_FMT_LOGFILE,
+        "log_fmt_jid": DFLT_LOG_FMT_JID,
+        "log_fmt_minion_id": DFLT_LOG_FMT_MINION_ID,
         "log_granular_levels": {},
         "log_rotate_max_bytes": 0,
         "log_rotate_backup_count": 0,
@@ -1477,9 +1823,11 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "state_verbose": True,
         "state_output": "full",
         "state_output_diff": False,
+        "state_output_profile": True,
         "state_auto_order": True,
         "state_events": False,
         "state_aggregate": False,
+        "state_max_parallel": 0,
         "search": "",
         "loop_interval": 60,
         "nodegroups": {},
@@ -1492,6 +1840,7 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "verify_env": True,
         "permissive_pki_access": False,
         "key_pass": None,
+        "cluster_key_pass": None,
         "signing_key_pass": None,
         "default_include": "master.d/*.conf",
         "winrepo_dir": os.path.join(salt.syspaths.BASE_FILE_ROOTS_DIR, "win", "repo"),
@@ -1504,6 +1853,7 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "winrepo_branch": "master",
         "winrepo_fallback": "",
         "winrepo_ssl_verify": True,
+        "winrepo_proxy": "",
         "winrepo_user": "",
         "winrepo_password": "",
         "winrepo_insecure_auth": False,
@@ -1511,6 +1861,7 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "winrepo_pubkey": "",
         "winrepo_passphrase": "",
         "winrepo_refspecs": _DFLT_REFSPECS,
+        "winrepo_depth": 1,
         "syndic_wait": 5,
         "jinja_env": {},
         "jinja_sls_env": {},
@@ -1533,6 +1884,9 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "ssh_sudo": False,
         "ssh_sudo_user": "",
         "ssh_timeout": 60,
+        "ssh_keepalive": True,
+        "ssh_keepalive_interval": 60,
+        "ssh_keepalive_count_max": 3,
         "ssh_user": "root",
         "ssh_scan_ports": "22",
         "ssh_scan_timeout": 0.01,
@@ -1546,7 +1900,7 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "max_minions": 0,
         "master_sign_key_name": "master_sign",
         "master_sign_pubkey": False,
-        "master_pubkey_signature": "master_pubkey_signature",
+        "master_pubkey_signature": None,
         "master_use_pubkey_signature": False,
         "zmq_filtering": False,
         "zmq_monitor": False,
@@ -1557,8 +1911,6 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "http_connect_timeout": 20.0,  # tornado default - 20 seconds
         "http_request_timeout": 1 * 60 * 60.0,  # 1 hour
         "http_max_body": 100 * 1024 * 1024 * 1024,  # 100GB
-        "python2_bin": "python2",
-        "python3_bin": "python3",
         "cache": "localfs",
         "memcache_expire_seconds": 0,
         "memcache_max_items": 1024,
@@ -1566,7 +1918,11 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "memcache_debug": False,
         "thin_extra_mods": "",
         "min_extra_mods": "",
+        "thin_exclude_saltexts": False,
+        "thin_saltext_allowlist": None,
+        "thin_saltext_blocklist": [],
         "ssl": None,
+        "disable_aes_with_tls": False,
         "extmod_whitelist": {},
         "extmod_blacklist": {},
         "clean_dynamic_modules": True,
@@ -1579,9 +1935,116 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "discovery": False,
         "schedule": {},
         "auth_events": True,
+        "auth_events_pend_autosign_grains": False,
         "minion_data_cache_events": True,
         "enable_ssh_minions": False,
         "netapi_allow_raw_shell": False,
+        "fips_mode": False,
+        "use_os_truststore": False,
+        "detect_remote_minions": False,
+        "remote_minions_port": 22,
+        "pass_variable_prefix": "",
+        "pass_strict_fetch": False,
+        "pass_gnupghome": "",
+        "pass_dir": "",
+        "netapi_enable_clients": [],
+        "maintenance_interval": 3600,
+        "fileserver_interval": 3600,
+        "cluster_id": None,
+        "cluster_peers": [],
+        "cluster_pki_dir": None,
+        "cluster_pool_port": 4520,
+        "cluster_pub_fingerprint": None,
+        "cluster_secret": None,
+        "cluster_isolated_filesystem": False,
+        "cluster_max_log_size": None,
+        "cluster_max_voters": None,
+        "cluster_voter_health_check_interval": 1.0,
+        "cluster_voter_timeout": 10.0,
+        "cluster_min_voters": 3,
+        "cluster_demote_cooldown": 60.0,
+        "cluster_auto_replace_voters": False,
+        "features": {},
+        "publish_signing_algorithm": "PKCS1v15-SHA1",
+        "cluster_encryption_algorithm": "OAEP-SHA1",
+        "keys.cache_driver": "localfs_key",
+        "request_server_aes_session": 0,
+        "request_server_ttl": 0,
+        "minimum_auth_version": 3,
+        "pillar.cache_driver": None,
+        "eauth_tokens.cache_driver": None,
+        "eauth_tokens.cluster_id": None,
+        "tracing": {
+            "enabled": False,
+            "exporter": "otlp-http",
+            "endpoint": "",
+            "service_name": "",
+            "sampler": "parent_based",
+            "sampler_arg": 1.0,
+            "resource_attributes": {},
+            "insecure": True,
+            "headers": {},
+        },
+        "metrics": {
+            "enabled": False,
+            "exporter": "otlp-http",
+            "endpoint": "",
+            "service_name": "",
+            "resource_attributes": {},
+            "insecure": True,
+            "headers": {},
+            "export_interval_seconds": 60,
+            "prometheus": {
+                "host": "127.0.0.1",
+                "port": 9464,
+            },
+            "histogram_boundaries": {
+                "salt.job.duration": [
+                    1,
+                    5,
+                    10,
+                    25,
+                    50,
+                    100,
+                    250,
+                    500,
+                    1000,
+                    2500,
+                    5000,
+                    10000,
+                    30000,
+                    60000,
+                ],
+                "salt.minion.exec.duration": [
+                    1,
+                    5,
+                    10,
+                    25,
+                    50,
+                    100,
+                    250,
+                    500,
+                    1000,
+                    2500,
+                    5000,
+                    10000,
+                ],
+                "salt.master.requests.duration": [
+                    1,
+                    5,
+                    10,
+                    25,
+                    50,
+                    100,
+                    250,
+                    500,
+                    1000,
+                    2500,
+                    5000,
+                    10000,
+                ],
+            },
+        },
     }
 )
 
@@ -1613,9 +2076,10 @@ DEFAULT_PROXY_MINION_OPTS = immutabletypes.freeze(
         "proxy_always_alive": True,
         "proxy_keep_alive": True,  # by default will try to keep alive the connection
         "proxy_keep_alive_interval": 1,  # frequency of the proxy keepalive in minutes
-        "pki_dir": os.path.join(salt.syspaths.CONFIG_DIR, "pki", "proxy"),
+        "pki_dir": os.path.join(salt.syspaths.LIB_STATE_DIR, "pki", "proxy"),
         "cachedir": os.path.join(salt.syspaths.CACHE_DIR, "proxy"),
         "sock_dir": os.path.join(salt.syspaths.SOCK_DIR, "proxy"),
+        "features": {},
     }
 )
 
@@ -1639,16 +2103,18 @@ DEFAULT_CLOUD_OPTS = immutabletypes.freeze(
         "log_file": os.path.join(salt.syspaths.LOGS_DIR, "cloud"),
         "log_level": "warning",
         "log_level_logfile": None,
-        "log_datefmt": _DFLT_LOG_DATEFMT,
-        "log_datefmt_logfile": _DFLT_LOG_DATEFMT_LOGFILE,
-        "log_fmt_console": _DFLT_LOG_FMT_CONSOLE,
-        "log_fmt_logfile": _DFLT_LOG_FMT_LOGFILE,
-        "log_fmt_jid": _DFLT_LOG_FMT_JID,
+        "log_datefmt": DFLT_LOG_DATEFMT,
+        "log_datefmt_logfile": DFLT_LOG_DATEFMT_LOGFILE,
+        "log_fmt_console": DFLT_LOG_FMT_CONSOLE,
+        "log_fmt_logfile": DFLT_LOG_FMT_LOGFILE,
+        "log_fmt_jid": DFLT_LOG_FMT_JID,
+        "log_fmt_minion_id": DFLT_LOG_FMT_MINION_ID,
         "log_granular_levels": {},
         "log_rotate_max_bytes": 0,
         "log_rotate_backup_count": 0,
-        "bootstrap_delay": None,
+        "bootstrap_delay": 0,
         "cache": "localfs",
+        "features": {},
     }
 )
 
@@ -1720,7 +2186,7 @@ def _validate_pillar_roots(pillar_roots):
     """
     if not isinstance(pillar_roots, dict):
         log.warning(
-            "The pillar_roots parameter is not properly formatted," " using defaults"
+            "The pillar_roots parameter is not properly formatted, using defaults"
         )
         return {"base": _expand_glob_path([salt.syspaths.BASE_PILLAR_ROOTS_DIR])}
     return _normalize_roots(pillar_roots)
@@ -1733,7 +2199,7 @@ def _validate_file_roots(file_roots):
     """
     if not isinstance(file_roots, dict):
         log.warning(
-            "The file_roots parameter is not properly formatted," " using defaults"
+            "The file_roots parameter is not properly formatted, using defaults"
         )
         return {"base": _expand_glob_path([salt.syspaths.BASE_FILE_ROOTS_DIR])}
     return _normalize_roots(file_roots)
@@ -1811,7 +2277,12 @@ def _validate_opts(opts):
                         # VALID_OPTS[key] is not iterable and not None
                         pass
 
-            if isinstance(val, VALID_OPTS[key]):
+            # int(True) evaluates to 1, int(False) evaluates to 0
+            # We want to make sure True and False are only valid for bool
+            if val is True or val is False:
+                if VALID_OPTS[key] is bool:
+                    continue
+            elif isinstance(val, VALID_OPTS[key]):
                 continue
 
             # We don't know what data type sdb will return at run-time so we
@@ -1819,33 +2290,80 @@ def _validate_opts(opts):
             if isinstance(val, str) and val.startswith("sdb://"):
                 continue
 
+            # Non-failing types that don't convert properly
+            nf_types = {
+                str: [list, tuple, dict],
+                list: [dict, str],
+                tuple: [dict, str],
+                bool: [list, tuple, str, int, float, dict, type(None)],
+                int: [bool, float],
+                float: [bool],
+            }
+
+            # Is this a single type (not a tuple of types)?
             if hasattr(VALID_OPTS[key], "__call__"):
+                # This config option has a single defined type
                 try:
+                    # This will try to evaluate the specified value type
                     VALID_OPTS[key](val)
-                    if isinstance(val, (list, dict)):
-                        # We'll only get here if VALID_OPTS[key] is str or
-                        # bool, and the passed value is a list/dict. Attempting
-                        # to run int() or float() on a list/dict will raise an
-                        # exception, but running str() or bool() on it will
-                        # pass despite not being the correct type.
-                        errors.append(
-                            err.format(
-                                key, val, type(val).__name__, VALID_OPTS[key].__name__
-                            )
-                        )
+
+                    # Since it evaluated properly, let's make sure it's valid
+                    # Some value types don't evaluate properly. For example,
+                    # running list on a string: `list("test")` will return
+                    # a list of individual characters:`['t', 'e', 's', 't']` and
+                    # therefore won't fail on evaluation
+                    for nf_type in nf_types:
+                        if VALID_OPTS[key] is nf_type:
+                            # Is it one of the non-failing types that we don't
+                            # want for this type
+                            if isinstance(val, tuple(nf_types[nf_type])):
+                                errors.append(
+                                    err.format(
+                                        key,
+                                        val,
+                                        type(val).__name__,
+                                        VALID_OPTS[key].__name__,
+                                    )
+                                )
                 except (TypeError, ValueError):
                     errors.append(
                         err.format(
                             key, val, type(val).__name__, VALID_OPTS[key].__name__
                         )
                     )
-                continue
+            else:
+                # This config option has multiple defined types (tuple of types)
+                if type(val) in VALID_OPTS[key]:
+                    continue
 
-            errors.append(
-                err.format(
-                    key, val, type(val).__name__, format_multi_opt(VALID_OPTS[key])
-                )
-            )
+                valid = []
+                for nf_type in nf_types:
+                    try:
+                        nf_type(val)
+
+                        if nf_type in VALID_OPTS[key]:
+                            nf = nf_types[nf_type]
+                            for item in VALID_OPTS[key]:
+                                if item in nf:
+                                    nf.remove(item)
+                            if isinstance(val, tuple(nf)):
+                                # Running str on any of the above types will succeed,
+                                # however, it will change the value in such a way
+                                # that it is invalid.
+                                valid.append(False)
+                            else:
+                                valid.append(True)
+                    except (TypeError, ValueError):
+                        valid.append(False)
+                if True not in valid:
+                    errors.append(
+                        err.format(
+                            key,
+                            val,
+                            type(val).__name__,
+                            format_multi_opt(VALID_OPTS[key]),
+                        )
+                    )
 
     # Convert list to comma-delimited string for 'return' config option
     if isinstance(opts.get("return"), list):
@@ -1905,7 +2423,7 @@ def _read_conf_file(path):
         try:
             conf_opts = salt.utils.yaml.safe_load(conf_file) or {}
         except salt.utils.yaml.YAMLError as err:
-            message = "Error parsing configuration file: {} - {}".format(path, err)
+            message = f"Error parsing configuration file: {path} - {err}"
             log.error(message)
             if path.endswith("_schedule.conf"):
                 # Create empty dictionary of config options
@@ -1952,7 +2470,7 @@ def _absolute_path(path, relative_to=None):
         _abspath = os.path.join(relative_to, path)
         if os.path.isfile(_abspath):
             log.debug(
-                "Relative path '%s' converted to existing absolute path " "'%s'",
+                "Relative path '%s' converted to existing absolute path '%s'",
                 path,
                 _abspath,
             )
@@ -2002,7 +2520,7 @@ def load_config(path, env_var, default_path=None, exit_on_config_errors=True):
     # If the configuration file is missing, attempt to copy the template,
     # after removing the first header line.
     if not os.path.isfile(path):
-        template = "{}.template".format(path)
+        template = f"{path}.template"
         if os.path.isfile(template):
             log.debug("Writing %s based on %s", path, template)
             with salt.utils.files.fopen(path, "w") as out:
@@ -2084,6 +2602,18 @@ def include_config(include, orig_path, verbose, exit_on_config_errors=False):
     return configuration
 
 
+def should_prepend_root_dir(key, opts):
+    """
+    Prepend root dir only when the key exists, has a value, and that value is
+    not a URI.
+    """
+    return (
+        key in opts
+        and opts[key] is not None
+        and urllib.parse.urlparse(os.path.splitdrive(opts[key])[1]).scheme == ""
+    )
+
+
 def prepend_root_dir(opts, path_options):
     """
     Prepends the options that represent filesystem paths with value of the
@@ -2135,6 +2665,14 @@ def prepend_root_dir(opts, path_options):
 def insert_system_path(opts, paths):
     """
     Inserts path into python path taking into consideration 'root_dir' option.
+
+    Paths are appended rather than prepended so that stdlib modules are never
+    shadowed by extension module directories (e.g. extmods/utils/).  In Python
+    3.14+ the ``forkserver`` start method spawns child processes with a fresh
+    interpreter and passes the parent's ``sys.path`` via preparation_data.  If
+    an extmods directory sits before the stdlib entries it can accidentally
+    shadow stdlib modules (e.g. ``platform``, ``functools``), triggering
+    circular imports that crash the child.
     """
     if isinstance(paths, str):
         paths = [paths]
@@ -2142,7 +2680,7 @@ def insert_system_path(opts, paths):
         path_options = {"path": path, "root_dir": opts["root_dir"]}
         prepend_root_dir(path_options, path_options)
         if os.path.isdir(path_options["path"]) and path_options["path"] not in sys.path:
-            sys.path.insert(0, path_options["path"])
+            sys.path.append(path_options["path"])
 
 
 def minion_config(
@@ -2168,6 +2706,8 @@ def minion_config(
     """
     if defaults is None:
         defaults = DEFAULT_MINION_OPTS.copy()
+        if role == "master":
+            defaults["default_include"] = DEFAULT_MASTER_OPTS["default_include"]
 
     if not os.environ.get(env_var, None):
         # No valid setting was given using the configuration variable.
@@ -2202,8 +2742,26 @@ def minion_config(
         overrides, defaults, cache_minion_id=cache_minion_id, minion_id=minion_id
     )
     opts["__role"] = role
+    if role != "master":
+        apply_sdb(opts)
+        _validate_opts(opts)
+    salt.features.setup_features(opts)
+    # Convert to OptsDict for memory efficiency
+    return salt.utils.optsdict.OptsDict.from_dict(
+        opts, name=f"minion_config:role={role}"
+    )
+
+
+def mminion_config(path, overrides, ignore_config_errors=True):
+    opts = minion_config(path, ignore_config_errors=ignore_config_errors, role="master")
+    opts.update(overrides)
     apply_sdb(opts)
+
     _validate_opts(opts)
+    if "grains" in opts and hasattr(opts["grains"], "destroy"):
+        opts["grains"].destroy()
+    opts["grains"] = salt.loader.grains(opts)
+    opts["pillar"] = {}
     return opts
 
 
@@ -2290,7 +2848,12 @@ def proxy_config(
 
     apply_sdb(opts)
     _validate_opts(opts)
-    return opts
+
+    salt.features.setup_features(opts)
+    # Convert to OptsDict for memory efficiency
+    return salt.utils.optsdict.OptsDict.from_dict(
+        opts, name="minion_config:role=master"
+    )
 
 
 def syndic_config(
@@ -2301,7 +2864,6 @@ def syndic_config(
     minion_defaults=None,
     master_defaults=None,
 ):
-
     if minion_defaults is None:
         minion_defaults = DEFAULT_MINION_OPTS.copy()
 
@@ -2342,7 +2904,7 @@ def syndic_config(
                 ),
             )
         ),
-        "user": opts.get("syndic_user", opts["user"]),
+        "user": opts.get("syndic_user", master_opts["user"]),
         "sock_dir": os.path.join(
             opts["cachedir"], opts.get("syndic_sock_dir", opts["sock_dir"])
         ),
@@ -2350,6 +2912,7 @@ def syndic_config(
         "cachedir": master_opts["cachedir"],
     }
     opts.update(syndic_opts)
+
     # Prepend root_dir to other paths
     prepend_root_dirs = [
         "pki_dir",
@@ -2363,34 +2926,59 @@ def syndic_config(
         "autosign_grains_dir",
     ]
     for config_key in ("log_file", "key_logfile", "syndic_log_file"):
-        # If this is not a URI and instead a local path
-        if urlparse(opts.get(config_key, "")).scheme == "":
+        if should_prepend_root_dir(config_key, opts):
             prepend_root_dirs.append(config_key)
     prepend_root_dir(opts, prepend_root_dirs)
     return opts
 
 
-def apply_sdb(opts, sdb_opts=None):
+def apply_sdb(opts, sdb_opts=None, _visited=None):
     """
     Recurse for sdb:// links for opts
     """
-    # Late load of SDB to keep CLI light
-    import salt.utils.sdb
-
     if sdb_opts is None:
         sdb_opts = opts
+    if _visited is None:
+        _visited = set()
+
+    # Track visited objects to prevent circular references
+    # For OptsDict proxies, track the parent OptsDict to avoid new proxy instances
+    # from being treated as new objects (which causes infinite recursion)
+    try:
+        from salt.utils.optsdict import DictProxy, ListProxy
+
+        if isinstance(sdb_opts, (DictProxy, ListProxy)):
+            # Track the parent OptsDict instead of the proxy
+            parent = object.__getattribute__(sdb_opts, "_parent")
+            obj_id = id(parent)
+        else:
+            obj_id = id(sdb_opts)
+    except (ImportError, AttributeError):
+        # Fallback if optsdict not available or not a proxy
+        obj_id = id(sdb_opts)
+
+    if obj_id in _visited:
+        return sdb_opts
+    _visited.add(obj_id)
+
     if isinstance(sdb_opts, str) and sdb_opts.startswith("sdb://"):
+        # Late load of SDB to keep CLI light
+        import salt.utils.sdb
+
         return salt.utils.sdb.sdb_get(sdb_opts, opts)
     elif isinstance(sdb_opts, dict):
-        for key, value in sdb_opts.items():
+        # Create a list of items to avoid modifying dict during iteration
+        # This is especially important for OptsDict which has special iteration behavior
+        items = list(sdb_opts.items())
+        for key, value in items:
             if value is None:
                 continue
-            sdb_opts[key] = apply_sdb(opts, value)
+            sdb_opts[key] = apply_sdb(opts, value, _visited)
     elif isinstance(sdb_opts, list):
         for key, value in enumerate(sdb_opts):
             if value is None:
                 continue
-            sdb_opts[key] = apply_sdb(opts, value)
+            sdb_opts[key] = apply_sdb(opts, value, _visited)
 
     return sdb_opts
 
@@ -2545,7 +3133,7 @@ def cloud_config(
 
     if providers_config_path is not None and providers_config is not None:
         raise salt.exceptions.SaltCloudConfigError(
-            "Only pass `providers_config` or `providers_config_path`, " "not both."
+            "Only pass `providers_config` or `providers_config_path`, not both."
         )
     elif providers_config_path is None and providers_config is None:
         providers_config_path = overrides.get(
@@ -2615,8 +3203,8 @@ def cloud_config(
 
     # prepend root_dir
     prepend_root_dirs = ["cachedir"]
-    if "log_file" in opts and urlparse(opts["log_file"]).scheme == "":
-        prepend_root_dirs.append(opts["log_file"])
+    if should_prepend_root_dir("log_file", opts):
+        prepend_root_dirs.append("log_file")
     prepend_root_dir(opts, prepend_root_dirs)
 
     # Return the final options
@@ -2660,7 +3248,7 @@ def apply_cloud_config(overrides, defaults=None):
                     if alias not in config["providers"]:
                         config["providers"][alias] = {}
 
-                    detail["provider"] = "{}:{}".format(alias, driver)
+                    detail["provider"] = f"{alias}:{driver}"
                     config["providers"][alias][driver] = detail
             elif isinstance(details, dict):
                 if "driver" not in details:
@@ -2677,7 +3265,7 @@ def apply_cloud_config(overrides, defaults=None):
                 if alias not in config["providers"]:
                     config["providers"][alias] = {}
 
-                details["provider"] = "{}:{}".format(alias, driver)
+                details["provider"] = f"{alias}:{driver}"
                 config["providers"][alias][driver] = details
 
     # Migrate old configuration
@@ -2703,7 +3291,6 @@ def old_to_new(opts):
     )
 
     for provider in providers:
-
         provider_config = {}
         for opt, val in opts.items():
             if provider in opt:
@@ -2946,9 +3533,8 @@ def apply_cloud_providers_config(overrides, defaults=None):
                 handled_providers.add(details["driver"])
 
         for entry in val:
-
             if "driver" not in entry:
-                entry["driver"] = "-only-extendable-{}".format(ext_count)
+                entry["driver"] = f"-only-extendable-{ext_count}"
                 ext_count += 1
 
             if key not in providers:
@@ -2991,7 +3577,7 @@ def apply_cloud_providers_config(overrides, defaults=None):
                                 details["driver"], provider_alias, alias, provider
                             )
                         )
-                    details["extends"] = "{}:{}".format(alias, provider)
+                    details["extends"] = f"{alias}:{provider}"
                     # change provider details '-only-extendable-' to extended
                     # provider name
                     details["driver"] = provider
@@ -3012,10 +3598,10 @@ def apply_cloud_providers_config(overrides, defaults=None):
                     )
                 else:
                     if driver in providers.get(extends):
-                        details["extends"] = "{}:{}".format(extends, driver)
+                        details["extends"] = f"{extends}:{driver}"
                     elif "-only-extendable-" in providers.get(extends):
                         details["extends"] = "{}:{}".format(
-                            extends, "-only-extendable-{}".format(ext_count)
+                            extends, f"-only-extendable-{ext_count}"
                         )
                     else:
                         # We're still not aware of what we're trying to extend
@@ -3106,7 +3692,9 @@ def get_cloud_config_value(name, vm_, opts, default=None, search_global=True):
         # Let's get the value from the profile, if present
         if "profile" in vm_ and vm_["profile"] is not None:
             if name in opts["profiles"][vm_["profile"]]:
-                if isinstance(value, dict):
+                if isinstance(value, dict) and isinstance(
+                    opts["profiles"][vm_["profile"]][name], dict
+                ):
                     value.update(opts["profiles"][vm_["profile"]][name].copy())
                 else:
                     value = deepcopy(opts["profiles"][vm_["profile"]][name])
@@ -3425,7 +4013,7 @@ def call_id_function(opts):
                 type(newid),
             )
             sys.exit(salt.defaults.exitcodes.EX_GENERIC)
-        log.info("Evaluated minion ID from module: %s", mod_fun)
+        log.info("Evaluated minion ID from module: %s %s", mod_fun, newid)
         return newid
     except TypeError:
         log.error(
@@ -3550,7 +4138,8 @@ def _update_ssl_config(opts):
             or not hasattr(ssl, val)
         ):
             message = "SSL option '{}' must be set to one of the following values: '{}'.".format(
-                key, "', '".join([val for val in dir(ssl) if val.startswith(prefix)])
+                key,
+                "', '".join([val for val in dir(ssl) if val.startswith(prefix)]),
             )
             log.error(message)
             raise salt.exceptions.SaltConfigurationError(message)
@@ -3619,7 +4208,9 @@ def apply_minion_config(
             )
             opts["fileserver_backend"][idx] = new_val
 
-    opts["__cli"] = salt.utils.stringutils.to_unicode(os.path.basename(sys.argv[0]))
+    opts["__cli"] = salt.utils.stringutils.to_unicode(
+        os.path.basename(salt.utils.path.expand(sys.argv[0]))
+    )
 
     # No ID provided. Will getfqdn save us?
     using_ip_for_id = False
@@ -3684,7 +4275,7 @@ def apply_minion_config(
 
     # These can be set to syslog, so, not actual paths on the system
     for config_key in ("log_file", "key_logfile"):
-        if urlparse(opts.get(config_key, "")).scheme == "":
+        if should_prepend_root_dir(config_key, opts):
             prepend_root_dirs.append(config_key)
 
     prepend_root_dir(opts, prepend_root_dirs)
@@ -3704,6 +4295,22 @@ def apply_minion_config(
     # Check and update TLS/SSL configuration
     _update_ssl_config(opts)
     _update_discovery_config(opts)
+
+    if opts["encryption_algorithm"] not in salt.crypt.VALID_ENCRYPTION_ALGORITHMS:
+        raise salt.exceptions.SaltConfigurationError(
+            f"The encryption algorithm '{opts['encryption_algorithm']}' is not valid. "
+            f"Please specify one of {','.join(salt.crypt.VALID_ENCRYPTION_ALGORITHMS)}."
+        )
+    if opts["signing_algorithm"] not in salt.crypt.VALID_SIGNING_ALGORITHMS:
+        raise salt.exceptions.SaltConfigurationError(
+            f"The signging algorithm '{opts['signing_algorithm']}' is not valid. "
+            f"Please specify one of {','.join(salt.crypt.VALID_SIGNING_ALGORITHMS)}."
+        )
+
+    # Store original `cachedir` value, before overriding,
+    # to make overriding more accurate.
+    if "__cachedir" not in opts:
+        opts["__cachedir"] = opts["cachedir"]
 
     return opts
 
@@ -3728,7 +4335,7 @@ def _update_discovery_config(opts):
         for key in opts["discovery"]:
             if key not in discovery_config:
                 raise salt.exceptions.SaltConfigurationError(
-                    "Unknown discovery option: {}".format(key)
+                    f"Unknown discovery option: {key}"
                 )
         if opts.get("__role") != "minion":
             for key in ["attempts", "pause", "match"]:
@@ -3791,7 +4398,9 @@ def master_config(
     if salt.utils.data.is_dictlist(opts["nodegroups"]):
         opts["nodegroups"] = salt.utils.data.repack_dictlist(opts["nodegroups"])
     apply_sdb(opts)
-    return opts
+    salt.features.setup_features(opts)
+    # Convert to OptsDict for memory efficiency
+    return salt.utils.optsdict.OptsDict.from_dict(opts, name="master_config")
 
 
 def apply_master_config(overrides=None, defaults=None):
@@ -3805,11 +4414,48 @@ def apply_master_config(overrides=None, defaults=None):
 
     opts = defaults.copy()
     opts["__role"] = "master"
+
+    # Suppress fileserver update in FSChan, for FSClient instances generated
+    # during Pillar compilation. The master daemon already handles FS updates
+    # in its maintenance thread. Refreshing during Pillar compilation slows
+    # down Pillar considerably (even to the point of timeout) when there are
+    # many gitfs remotes.
+    opts["__fs_update"] = True
+
     _adjust_log_file_override(overrides, defaults["log_file"])
+    # Soft-deprecation alias: the master-cluster Raft rewrite (introduced in
+    # 3008.0) accidentally read the peer-pool port from ``cluster_port``
+    # instead of the documented ``cluster_pool_port``. ``cluster_port`` was
+    # never registered in ``VALID_OPTS``/``DEFAULT_MASTER_OPTS``, so any
+    # operator who happened to set it silently overrode nothing. If an
+    # operator explicitly set ``cluster_port`` (and not
+    # ``cluster_pool_port``), honor their intent by aliasing it across, and
+    # warn that the alias will be removed in a future release. See #69877.
+    if "cluster_port" in overrides and "cluster_pool_port" not in overrides:
+        log.warning(
+            "The 'cluster_port' master opt is deprecated and will be "
+            "removed in Argon+1 / Potassium; use 'cluster_pool_port' "
+            "instead."
+        )
+        overrides["cluster_pool_port"] = overrides["cluster_port"]
     if overrides:
         opts.update(overrides)
+    # `keep_acl_in_token` will be forced to True when using external authentication
+    # for REST API (`rest` is present under `external_auth`). This is because the REST API
+    # does not store the password, and can therefore not retroactively fetch the ACL, so
+    # the ACL must be stored in the token.
+    if "rest" in opts.get("external_auth", {}):
+        # Check current value and print out warning
+        if opts["keep_acl_in_token"] is False:
+            log.warning(
+                "The 'rest' external_auth backend requires 'keep_acl_in_token' to be True. "
+                "Setting 'keep_acl_in_token' to True."
+            )
+        opts["keep_acl_in_token"] = True
 
-    opts["__cli"] = salt.utils.stringutils.to_unicode(os.path.basename(sys.argv[0]))
+    opts["__cli"] = salt.utils.stringutils.to_unicode(
+        os.path.basename(salt.utils.path.expand(sys.argv[0]))
+    )
 
     if "environment" in opts:
         if opts["saltenv"] is not None:
@@ -3888,14 +4534,31 @@ def apply_master_config(overrides=None, defaults=None):
 
     # These can be set to syslog, so, not actual paths on the system
     for config_key in ("log_file", "key_logfile", "ssh_log_file"):
-        log_setting = opts.get(config_key, "")
-        if log_setting is None:
-            continue
-
-        if urlparse(log_setting).scheme == "":
+        if should_prepend_root_dir(config_key, opts):
             prepend_root_dirs.append(config_key)
 
     prepend_root_dir(opts, prepend_root_dirs)
+
+    # When a cluster id is defined, make sure the other necessary bits are
+    # defined.
+    if "cluster_id" not in opts:
+        opts["cluster_id"] = None
+    if opts["cluster_id"] is not None:
+        if not opts.get("cluster_peers", None) and not opts.get("cluster_secret", None):
+            log.warning("Cluster id defined without defining cluster peers")
+            opts["cluster_peers"] = []
+        if not opts.get("cluster_pki_dir", None):
+            log.warning(
+                "Cluster id defined without defining cluster pki, falling back to pki_dir"
+            )
+            opts["cluster_pki_dir"] = opts["pki_dir"]
+    else:
+        if opts.get("cluster_peers", None):
+            log.warning("Cluster peers defined without a cluster_id, ignoring.")
+            opts["cluster_peers"] = []
+        if opts.get("cluster_pki_dir", None):
+            log.warning("Cluster pki dir defined without a cluster_id, ignoring.")
+            opts["cluster_pki_dir"] = None
 
     # Enabling open mode requires that the value be set to True, and
     # nothing else!
@@ -3937,6 +4600,25 @@ def apply_master_config(overrides=None, defaults=None):
         )
         opts["worker_threads"] = 3
 
+    # Handle worker pools configuration
+    if opts.get("worker_pools_enabled", True):
+        from salt.config.worker_pools import (
+            get_worker_pools_config,
+            validate_worker_pools_config,
+        )
+
+        # Get effective worker pools config (handles backward compat)
+        effective_pools = get_worker_pools_config(opts)
+        if effective_pools is not None:
+            opts["worker_pools"] = effective_pools
+
+            # Validate the configuration
+            try:
+                validate_worker_pools_config(opts)
+            except ValueError as exc:
+                log.error("Worker pools configuration error: %s", exc)
+                raise
+
     opts.setdefault("pillar_source_merging_strategy", "smart")
 
     # Make sure hash_type is lowercase
@@ -3946,6 +4628,22 @@ def apply_master_config(overrides=None, defaults=None):
     _update_ssl_config(opts)
     _update_discovery_config(opts)
 
+    if opts["publish_signing_algorithm"] not in salt.crypt.VALID_SIGNING_ALGORITHMS:
+        raise salt.exceptions.SaltConfigurationError(
+            f"The  publish signging algorithm '{opts['publish_signing_algorithm']}' is not valid. "
+            f"Please specify one of {','.join(salt.crypt.VALID_SIGNING_ALGORITHMS)}."
+        )
+
+    if (
+        opts["cluster_encryption_algorithm"]
+        not in salt.crypt.VALID_ENCRYPTION_ALGORITHMS
+    ):
+        raise salt.exceptions.SaltConfigurationError(
+            f"The cluster encryption algorithm '{opts['cluster_encryption_algorithm']}' is not valid. "
+            f"Please specify one of {','.join(salt.crypt.VALID_ENCRYPTION_ALGORITHMS)}."
+        )
+
+    salt.features.setup_features(opts)
     return opts
 
 
@@ -4007,16 +4705,19 @@ def client_config(path, env_var="SALT_CLIENT_CONFIG", defaults=None):
     # On some platforms, like OpenBSD, 0.0.0.0 won't catch a master running on localhost
     if opts["interface"] == "0.0.0.0":
         opts["interface"] = "127.0.0.1"
+    elif opts["interface"] == "::":
+        opts["interface"] = "::1"
 
     # Make sure the master_uri is set
     if "master_uri" not in opts:
         opts["master_uri"] = "tcp://{ip}:{port}".format(
-            ip=salt.utils.zeromq.ip_bracket(opts["interface"]), port=opts["ret_port"]
+            ip=salt.utils.network.ip_bracket(opts["interface"]), port=opts["ret_port"]
         )
 
     # Return the client options
     _validate_opts(opts)
-    return opts
+    salt.features.setup_features(opts)
+    return salt.utils.optsdict.OptsDict.from_dict(opts, name="client_config")
 
 
 def api_config(path):
@@ -4089,11 +4790,7 @@ def apply_spm_config(overrides, defaults):
 
     # These can be set to syslog, so, not actual paths on the system
     for config_key in ("spm_logfile",):
-        log_setting = opts.get(config_key, "")
-        if log_setting is None:
-            continue
-
-        if urlparse(log_setting).scheme == "":
+        if should_prepend_root_dir(config_key, opts):
             prepend_root_dirs.append(config_key)
 
     prepend_root_dir(opts, prepend_root_dirs)

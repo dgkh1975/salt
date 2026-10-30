@@ -1,28 +1,27 @@
-# -*- coding: utf-8 -*-
 """
     :codeauthor: Rupesh Tare <rupesht@saltstack.com>
 """
 
-# Import Python libs
-from __future__ import absolute_import, print_function, unicode_literals
+import subprocess
 
-# Import Salt Libs
+import pytest
+
 import salt.modules.localemod as localemod
 from salt.exceptions import CommandExecutionError
-from salt.ext import six
-
-# Import Salt Testing Libs
 from tests.support.mixins import LoaderModuleMockMixin
 from tests.support.mock import MagicMock, Mock, patch
-from tests.support.unit import TestCase, skipIf
-
-try:
-    import pytest
-except ImportError as import_error:
-    pytest = None
+from tests.support.unit import TestCase
 
 
-@skipIf(not pytest, False)
+def _check_localectl():
+    if not hasattr(_check_localectl, "memo"):
+        proc = subprocess.run(["localectl"], check=False, capture_output=True)
+        _check_localectl.memo = (
+            b"Failed to connect to bus: No such file or directory" in proc.stderr
+        )
+    return _check_localectl.memo
+
+
 class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
     """
     Test cases for salt.modules.localemod
@@ -67,6 +66,7 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
         ):
             assert localemod.list_avail() == ["A", "B"]
 
+    @pytest.mark.skipif(_check_localectl, reason="localectl is in degraded state")
     @patch("salt.utils.path.which", MagicMock(return_value="/usr/bin/localctl"))
     @patch(
         "salt.modules.localemod.__salt__",
@@ -99,6 +99,7 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
         assert "data" in out["x11_model"]
         assert out["x11_model"]["data"] == "pc105"
 
+    @pytest.mark.skipif(_check_localectl, reason="localectl is in degraded state")
     @patch("salt.utils.path.which", MagicMock(return_value="/usr/bin/localctl"))
     @patch(
         "salt.modules.localemod.__salt__",
@@ -159,9 +160,10 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
                 localemod.log.error.call_args[0][0]
                 % localemod.log.error.call_args[0][1]
             )
-            assert msg == (
-                'Odd locale parameter "Fatal error right in front of screen" detected in dbus locale output.'
-                " This should not happen. You should probably investigate what caused this."
+            assert (
+                msg == 'Odd locale parameter "Fatal error right in front of screen"'
+                " detected in dbus locale output. This should not happen. You should"
+                " probably investigate what caused this."
             )
 
     @patch("salt.utils.path.which", MagicMock(return_value=None))
@@ -173,9 +175,10 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
         """
         with pytest.raises(CommandExecutionError) as exc_info:
             localemod._localectl_status()
-        assert 'Unable to find "localectl"' in six.text_type(exc_info.value)
+        assert 'Unable to find "localectl"' in str(exc_info.value)
         assert not localemod.log.debug.called
 
+    @pytest.mark.skipif(_check_localectl, reason="localectl is in degraded state")
     @patch("salt.utils.path.which", MagicMock(return_value="/usr/bin/localctl"))
     @patch(
         "salt.modules.localemod.__salt__",
@@ -184,8 +187,9 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
     def test_localectl_status_parser_empty(self):
         with pytest.raises(CommandExecutionError) as exc_info:
             localemod._localectl_status()
-        assert 'Unable to parse result of "localectl"' in six.text_type(exc_info.value)
+        assert 'Unable to parse result of "localectl"' in str(exc_info.value)
 
+    @pytest.mark.skipif(_check_localectl, reason="localectl is in degraded state")
     @patch("salt.utils.path.which", MagicMock(return_value="/usr/bin/localctl"))
     @patch(
         "salt.modules.localemod.__salt__",
@@ -194,8 +198,9 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
     def test_localectl_status_parser_broken(self):
         with pytest.raises(CommandExecutionError) as exc_info:
             localemod._localectl_status()
-        assert 'Unable to parse result of "localectl"' in six.text_type(exc_info.value)
+        assert 'Unable to parse result of "localectl"' in str(exc_info.value)
 
+    @pytest.mark.skipif(_check_localectl, reason="localectl is in degraded state")
     @patch("salt.utils.path.which", MagicMock(return_value="/usr/bin/localctl"))
     @patch(
         "salt.modules.localemod.__salt__",
@@ -207,8 +212,8 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
         for key in ["main", "cow_say"]:
             assert isinstance(out[key], dict)
             for in_key in out[key]:
-                assert isinstance(out[key][in_key], six.text_type)
-        assert isinstance(out["reason"]["data"], six.text_type)
+                assert isinstance(out[key][in_key], str)
+        assert isinstance(out["reason"]["data"], str)
 
     @patch("salt.utils.path.which", MagicMock(return_value="/usr/bin/localctl"))
     @patch(
@@ -371,7 +376,7 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
         """
         with pytest.raises(CommandExecutionError) as exc_info:
             localemod.get_locale()
-        assert '"DrunkDragon" is unsupported' in six.text_type(exc_info.value)
+        assert '"DrunkDragon" is unsupported' in str(exc_info.value)
 
     @patch("salt.utils.path.which", MagicMock(return_value="/usr/bin/localctl"))
     @patch(
@@ -429,9 +434,7 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
             == "/etc/sysconfig/language"
         )
         assert localemod.__salt__["file.replace"].call_args[0][1] == "^RC_LANG=.*"
-        assert localemod.__salt__["file.replace"].call_args[0][
-            2
-        ] == 'RC_LANG="{}"'.format(loc)
+        assert localemod.__salt__["file.replace"].call_args[0][2] == f'RC_LANG="{loc}"'
 
     @patch("salt.utils.path.which", MagicMock(return_value=None))
     @patch(
@@ -504,7 +507,7 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
         with pytest.raises(CommandExecutionError) as exc_info:
             localemod.set_locale(loc)
         assert not localemod._localectl_set.called
-        assert 'Cannot set locale: "update-locale" was not found.' in six.text_type(
+        assert 'Cannot set locale: "update-locale" was not found.' in str(
             exc_info.value
         )
 
@@ -608,7 +611,7 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
         """
         with pytest.raises(CommandExecutionError) as exc_info:
             localemod.set_locale("de_DE.utf8")
-        assert "Unsupported platform" in six.text_type(exc_info.value)
+        assert "Unsupported platform" in str(exc_info.value)
 
     @patch(
         "salt.utils.locales.normalize_locale",
@@ -711,7 +714,7 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
             localemod.gen_locale("de_DE.utf8")
         assert (
             'Command "locale-gen" or "localedef" was not found on this system.'
-            in six.text_type(exc_info.value)
+            in str(exc_info.value)
         )
 
     def test_gen_locale_debian(self):
@@ -844,6 +847,7 @@ class LocalemodTestCase(TestCase, LoaderModuleMockMixin):
         ):
             assert localemod.gen_locale("en_US.UTF-8", verbose=True) == ret
 
+    @pytest.mark.skipif(_check_localectl, reason="localectl is in degraded state")
     @patch("salt.utils.path.which", MagicMock(return_value="/usr/bin/localctl"))
     def test_parse_localectl(self):
         localectl_out = (

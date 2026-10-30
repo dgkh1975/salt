@@ -1,20 +1,17 @@
-# -*- coding: utf-8 -*-
 """
 Execute orchestration functions
 """
-# Import Python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
 
-# Import salt libs
+import salt.client
 import salt.loader
 import salt.utils.event
 import salt.utils.functools
 import salt.utils.jid
 from salt.exceptions import SaltInvocationError
 
-LOGGER = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
 def pause(jid, state_id=None, duration=None):
@@ -90,7 +87,7 @@ def orchestrate(
 
         Runner uses the pillar variable
 
-    .. versionchanged:: develop
+    .. versionchanged:: 2017.5.0
 
         Runner uses the pillar_enc variable that allows renderers to render the pillar.
         This is usable when supplying the contents of a file as pillar, and the file contains
@@ -105,6 +102,18 @@ def orchestrate(
        salt-run state.orchestrate webserver pillar_enc=gpg pillar="$(cat somefile.json)"
 
     """
+
+    try:
+        orig_user = __opts__["user"]
+        __opts__["user"] = __user__
+        log.debug(
+            "changed opts user from original '%s' to global user '%s'",
+            orig_user,
+            __user__,
+        )
+    except NameError:
+        log.debug("unable to find global user __user__")
+
     if pillar is not None and not isinstance(pillar, dict):
         raise SaltInvocationError("Pillar data must be formatted as a dictionary")
     __opts__["file_client"] = "local"
@@ -154,12 +163,16 @@ def orchestrate_single(fun, name, test=None, queue=False, pillar=None, **kwargs)
 
         salt-run state.orchestrate_single fun=salt.wheel name=key.list_all
     """
-    if pillar is not None and not isinstance(pillar, dict):
-        raise SaltInvocationError("Pillar data must be formatted as a dictionary")
+    if pillar is not None:
+        if isinstance(pillar, dict):
+            kwargs["pillar"] = pillar
+        else:
+            raise SaltInvocationError("Pillar data must be formatted as a dictionary")
+
     __opts__["file_client"] = "local"
     minion = salt.minion.MasterMinion(__opts__)
     running = minion.functions["state.single"](
-        fun, name, test=None, queue=False, pillar=pillar, **kwargs
+        fun, name, test=None, queue=False, **kwargs
     )
     ret = {minion.opts["id"]: running}
     __jid_event__.fire_event({"data": ret, "outputter": "highstate"}, "progress")
@@ -215,6 +228,7 @@ def orchestrate_show_sls(
     .. seealso:: The state.show_sls module function
 
     CLI Example:
+
     .. code-block:: bash
 
         salt-run state.orch_show_sls my-orch-formula.my-orch-state 'pillar={ nodegroup: ng1 }'
@@ -241,6 +255,135 @@ def orchestrate_show_sls(
 orch_show_sls = salt.utils.functools.alias_function(
     orchestrate_show_sls, "orch_show_sls"
 )
+
+
+def graph(
+    mods,
+    tgt=None,
+    tgt_type="glob",
+    saltenv="base",
+    test=None,
+    pillar=None,
+    pillarenv=None,
+    pillar_enc=None,
+    timeout=None,
+):
+    """
+    Display the dependency graph from a specific sls or list of sls files.
+
+    If ``tgt`` is provided, the graph will be generated for the specified
+    minion(s) by calling the ``state.graph`` execution module on them.
+
+    If ``tgt`` is not provided, the graph will be generated for the master
+    minion (orchestration context).
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-run state.graph webserver
+        salt-run state.graph webserver tgt='*'
+        salt-run state.graph webserver tgt=minion1 timeout=60
+
+    **Generating an Image:**
+
+    The DOT output can be rendered to an image using Graphviz:
+
+    .. code-block:: bash
+
+        salt-run state.graph webserver | dot -Tpng -o state_graph.png
+    """
+    if pillar is not None and not isinstance(pillar, dict):
+        raise SaltInvocationError("Pillar data must be formatted as a dictionary")
+
+    if tgt:
+        client = salt.client.LocalClient(__opts__["conf_file"])
+        return client.cmd(
+            tgt,
+            "state.graph",
+            [mods],
+            kwarg={
+                "test": test,
+                "pillar": pillar,
+                "saltenv": saltenv,
+                "pillarenv": pillarenv,
+                "pillar_enc": pillar_enc,
+            },
+            tgt_type=tgt_type,
+            timeout=timeout or __opts__["timeout"],
+        )
+
+    __opts__["file_client"] = "local"
+    minion = salt.minion.MasterMinion(__opts__)
+
+    return minion.functions["state.graph"](
+        mods,
+        test=test,
+        pillar=pillar,
+        saltenv=saltenv,
+        pillarenv=pillarenv,
+        pillar_enc=pillar_enc,
+    )
+
+
+def graph_highstate(
+    tgt=None,
+    tgt_type="glob",
+    pillar=None,
+    pillarenv=None,
+    pillar_enc=None,
+    timeout=None,
+):
+    """
+    Display the dependency graph for the highstate.
+
+    If ``tgt`` is provided, the graph will be generated for the specified
+    minion(s) by calling the ``state.graph_highstate`` execution module on them.
+
+    If ``tgt`` is not provided, the graph will be generated for the master
+    minion (orchestration context).
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-run state.graph_highstate
+        salt-run state.graph_highstate tgt='*'
+        salt-run state.graph_highstate tgt=minion1 timeout=60
+
+    **Generating an Image:**
+
+    The DOT output can be rendered to an image using Graphviz:
+
+    .. code-block:: bash
+
+        salt-run state.graph_highstate | dot -Tpng -o highstate.png
+    """
+    if pillar is not None and not isinstance(pillar, dict):
+        raise SaltInvocationError("Pillar data must be formatted as a dictionary")
+
+    if tgt:
+        client = salt.client.LocalClient(__opts__["conf_file"])
+        return client.cmd(
+            tgt,
+            "state.graph_highstate",
+            kwarg={
+                "pillar": pillar,
+                "pillarenv": pillarenv,
+                "pillar_enc": pillar_enc,
+            },
+            tgt_type=tgt_type,
+            timeout=timeout or __opts__["timeout"],
+        )
+
+    __opts__["file_client"] = "local"
+    minion = salt.minion.MasterMinion(__opts__)
+
+    return minion.functions["state.graph_highstate"](
+        pillar=pillar,
+        pillarenv=pillarenv,
+        pillar_enc=pillar_enc,
+    )
 
 
 def event(

@@ -1,16 +1,17 @@
-# -*- coding: utf-8 -*-
 """
 In-memory caching used by Salt
 """
-# Import Python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
+import contextlib
+import functools
 import logging
 import os
 import re
+import shutil
+import stat
+import tempfile
 import time
 
-# Import salt libs
 import salt.config
 import salt.payload
 import salt.utils.atomicfile
@@ -18,15 +19,14 @@ import salt.utils.data
 import salt.utils.dictupdate
 import salt.utils.files
 import salt.utils.msgpack
-
-# Import third party libs
-from salt.ext.six.moves import range  # pylint: disable=import-error,redefined-builtin
+import salt.utils.path
+import salt.utils.versions
 from salt.utils.zeromq import zmq
 
 log = logging.getLogger(__name__)
 
 
-class CacheFactory(object):
+class CacheFactory:
     """
     Cache which can use a number of backends
     """
@@ -89,7 +89,7 @@ class CacheDisk(CacheDict):
     """
 
     def __init__(self, ttl, path, *args, **kwargs):
-        super(CacheDisk, self).__init__(ttl, *args, **kwargs)
+        super().__init__(ttl, *args, **kwargs)
         self._path = path
         self._dict = {}
         self._read()
@@ -102,7 +102,7 @@ class CacheDisk(CacheDict):
             return
         if time.time() - self._key_cache_time[key] > self._ttl:
             del self._key_cache_time[key]
-            self._dict.__delitem__(key)
+            del self._dict[key]
 
     def __contains__(self, key):
         self._enforce_ttl_key(key)
@@ -133,16 +133,40 @@ class CacheDisk(CacheDict):
         # Do the same as the parent but also persist
         self._write()
 
+    def clear(self):
+        """
+        Clear the cache
+        """
+        self._key_cache_time.clear()
+        self._dict.clear()
+        # Do the same as the parent but also persist
+        self._write()
+
     def _read(self):
         """
         Read in from disk
         """
-        if not salt.utils.msgpack.HAS_MSGPACK or not os.path.exists(self._path):
+        if not salt.utils.versions.reqs.msgpack or not os.path.exists(self._path):
             return
-        with salt.utils.files.fopen(self._path, "rb") as fp_:
-            cache = salt.utils.data.decode(
-                salt.utils.msgpack.load(fp_, encoding=__salt_system_encoding__)
-            )
+
+        if 0 == os.path.getsize(self._path):
+            # File exists but empty, treat as empty cache
+            return
+
+        try:
+            with salt.utils.files.fopen(self._path, "rb") as fp_:
+                cache = salt.utils.msgpack.load(
+                    fp_, encoding=__salt_system_encoding__, raw=False
+                )
+        except FileNotFoundError:
+            # File was deleted after os.path.exists call above, treat as empty cache
+            return
+        except (salt.utils.msgpack.exceptions.UnpackException, ValueError) as exc:
+            # File is unreadable, treat as empty cache
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("Error reading cache file at %r: %s", self._path, exc)
+            return
+
         if "CacheDisk_cachetime" in cache:  # new format
             self._dict = cache["CacheDisk_data"]
             self._key_cache_time = cache["CacheDisk_cachetime"]
@@ -158,7 +182,7 @@ class CacheDisk(CacheDict):
         """
         Write out to disk
         """
-        if not salt.utils.msgpack.HAS_MSGPACK:
+        if not salt.utils.versions.reqs.msgpack:
             return
         # TODO Add check into preflight to ensure dir exists
         # TODO Dir hashing?
@@ -167,10 +191,10 @@ class CacheDisk(CacheDict):
                 "CacheDisk_data": self._dict,
                 "CacheDisk_cachetime": self._key_cache_time,
             }
-            salt.utils.msgpack.dump(cache, fp_, use_bin_type=True)
+            salt.utils.msgpack.dump(cache, fp_)
 
 
-class CacheCli(object):
+class CacheCli:
     """
     Connection client for the ConCache. Should be used by all
     components that need the list of currently connected minions
@@ -181,7 +205,6 @@ class CacheCli(object):
         Sets up the zmq-connection to the ConCache
         """
         self.opts = opts
-        self.serial = salt.payload.Serial(self.opts.get("serial", ""))
         self.cache_sock = os.path.join(self.opts["sock_dir"], "con_cache.ipc")
         self.cache_upd_sock = os.path.join(self.opts["sock_dir"], "con_upd.ipc")
 
@@ -201,19 +224,19 @@ class CacheCli(object):
         """
         published the given minions to the ConCache
         """
-        self.cupd_out.send(self.serial.dumps(minions))
+        self.cupd_out.send(salt.payload.dumps(minions), track=False)
 
     def get_cached(self):
         """
         queries the ConCache for a list of currently connected minions
         """
-        msg = self.serial.dumps("minions")
-        self.creq_out.send(msg)
-        min_list = self.serial.loads(self.creq_out.recv())
+        msg = salt.payload.dumps("minions")
+        self.creq_out.send(msg, track=False)
+        min_list = salt.payload.loads(self.creq_out.recv())
         return min_list
 
 
-class CacheRegex(object):
+class CacheRegex:
     """
     Create a regular expression object cache for the most frequently
     used patterns to minimize compilation of the same patterns over
@@ -250,10 +273,10 @@ class CacheRegex(object):
             self.clear()
             self.timestamp = time.time()
         else:
-            paterns = list(self.cache.values())
-            paterns.sort()
+            patterns = list(self.cache.values())
+            patterns.sort(key=lambda x: x[0])
             for idx in range(self.clear_size):
-                del self.cache[paterns[idx][2]]
+                del self.cache[patterns[idx][2]]
 
     def get(self, pattern):
         """
@@ -267,37 +290,80 @@ class CacheRegex(object):
             pass
         if len(self.cache) > self.size:
             self.sweep()
-        regex = re.compile("{0}{1}{2}".format(self.prepend, pattern, self.append))
+        regex = re.compile(f"{self.prepend}{pattern}{self.append}")
         self.cache[pattern] = [1, regex, pattern, time.time()]
         return regex
 
 
-class ContextCache(object):
+class ContextCache:
     def __init__(self, opts, name):
         """
         Create a context cache
         """
         self.opts = opts
-        self.cache_path = os.path.join(
-            opts["cachedir"], "context", "{0}.p".format(name)
-        )
-        self.serial = salt.payload.Serial(self.opts)
+        self.cache_path = os.path.join(opts["cachedir"], "context", f"{name}.p")
 
     def cache_context(self, context):
         """
-        Cache the given context to disk
+        Cache the given context to disk.
+
+        Pillar context can carry credentials (passwords, tokens, vault
+        data, API keys sourced from external pillar backends). Both
+        the cache file and its parent directory are therefore created
+        with owner-only permissions:
+
+        - the parent ``context/`` directory is created with mode
+          ``0o700`` (``stat.S_IRWXU``). Without this it inherits the
+          process umask -- typically ``0o755`` -- so any local user
+          can ``ls`` the directory and observe filenames, which leak
+          which external-pillar backends and modules are in use.
+          Existing directories from earlier installs are left
+          untouched; operators upgrading may want to ``chmod 0700``
+          their cache context directory once.
+        - the cache file is written via ``tempfile.mkstemp`` + atomic
+          ``os.replace`` so that the file is created with mode
+          ``0o600`` from the first byte (``mkstemp`` documents this
+          as its default:
+          https://docs.python.org/3/library/tempfile.html#tempfile.mkstemp,
+          "the file is readable and writable only by the creating
+          user ID"), and so that readers consuming the cache
+          concurrently see either the old content or the new one,
+          never a partial write.
+
+        Note on hard crashes (``SIGKILL`` / OOM-killer / power loss):
+        if the process dies between ``mkstemp`` and ``os.replace``, the
+        ``.tmp_*`` file remains on disk. It carries mode ``0o600`` (no
+        information disclosure beyond what the legitimate cache file
+        would have exposed) and is bounded in size, so this is
+        operational hygiene rather than a security issue. Operators
+        can clean stale temporaries with e.g.
+        ``find <cachedir>/context/ -name '.tmp_*' -mtime +1 -delete``.
         """
-        if not os.path.isdir(os.path.dirname(self.cache_path)):
-            os.mkdir(os.path.dirname(self.cache_path))
-        with salt.utils.files.fopen(self.cache_path, "w+b") as cache:
-            self.serial.dump(context, cache)
+        parent = os.path.dirname(self.cache_path)
+        if not os.path.isdir(parent):
+            os.mkdir(parent, mode=stat.S_IRWXU)
+        fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp_")
+        try:
+            with os.fdopen(fd, "wb") as cache:
+                salt.payload.dump(context, cache)
+            os.replace(tmp_path, self.cache_path)
+        except BaseException:
+            # ``BaseException`` -- not just ``Exception`` -- so that
+            # KeyboardInterrupt and SystemExit also clean up. Any error
+            # reaching this handler means ``os.replace`` did not run,
+            # so the target ``cache_path`` is unchanged and the tmp
+            # file is now an orphan; remove it on a best-effort basis
+            # and re-raise the original error.
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
 
     def get_cache_context(self):
         """
         Retrieve a context cache from disk
         """
         with salt.utils.files.fopen(self.cache_path, "rb") as cache:
-            return salt.utils.data.decode(self.serial.load(cache))
+            return salt.utils.data.decode(salt.payload.load(cache))
 
 
 def context_cache(func):
@@ -309,9 +375,16 @@ def context_cache(func):
     is empty or contains no items, pass a list of keys to evaulate.
     """
 
+    @functools.wraps(func)
     def context_cache_wrap(*args, **kwargs):
-        func_context = func.__globals__["__context__"]
-        func_opts = func.__globals__["__opts__"]
+        try:
+            func_context = func.__globals__["__context__"].value()
+        except AttributeError:
+            func_context = func.__globals__["__context__"]
+        try:
+            func_opts = func.__globals__["__opts__"].value()
+        except AttributeError:
+            func_opts = func.__globals__["__opts__"]
         func_name = func.__globals__["__name__"]
 
         context_cache = ContextCache(func_opts, func_name)
@@ -326,15 +399,30 @@ def context_cache(func):
     return context_cache_wrap
 
 
-# test code for the CacheCli
-if __name__ == "__main__":
+def verify_cache_version(cache_path):
+    """
+    Check that the cached version matches the Salt version.
+    If the cached version does not match the Salt version, wipe the cache.
 
-    opts = salt.config.master_config("/etc/salt/master")
-
-    ccli = CacheCli(opts)
-
-    ccli.put_cache(["test1", "test10", "test34"])
-    ccli.put_cache(["test12"])
-    ccli.put_cache(["test18"])
-    ccli.put_cache(["test21"])
-    print("minions: {0}".format(ccli.get_cached()))
+    :return: ``True`` if cache version matches, otherwise ``False``
+    """
+    if not os.path.isdir(cache_path):
+        os.makedirs(cache_path)
+    with salt.utils.files.fopen(
+        salt.utils.path.join(cache_path, "cache_version"), "a+"
+    ) as file:
+        file.seek(0)
+        data = "\n".join(file.readlines())
+        if data != salt.version.__version__:
+            log.debug("Cache version mismatch clearing: %s", repr(cache_path))
+            file.truncate(0)
+            file.write(salt.version.__version__)
+            for item in os.listdir(cache_path):
+                if item != "cache_version":
+                    item_path = salt.utils.path.join(cache_path, item)
+                    if os.path.isfile(item_path):
+                        os.remove(item_path)
+                    else:
+                        shutil.rmtree(item_path)
+            return False
+        return True

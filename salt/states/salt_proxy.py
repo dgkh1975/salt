@@ -10,7 +10,7 @@
 
     Run the state as below
 
-    ..code-block:: yaml
+    .. code-block:: yaml
 
         salt-proxy-configure:
             salt_proxy.configure_proxy:
@@ -43,7 +43,7 @@ def configure_proxy(name, proxyname="p8000", start=True):
 
     Example:
 
-    ..code-block:: yaml
+    .. code-block:: yaml
 
         salt-proxy-configure:
             salt_proxy.configure_proxy:
@@ -52,5 +52,5 @@ def configure_proxy(name, proxyname="p8000", start=True):
 
     """
     ret = __salt__["salt_proxy.configure_proxy"](proxyname, start=start)
-    ret.update({"name": name, "comment": "{} config messages".format(name)})
+    ret.update({"name": name, "comment": f"{name} config messages"})
     return ret

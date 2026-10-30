@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
     salt.serializers.msgpack
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -6,24 +5,17 @@
     Implements MsgPack serializer.
 """
 
-# Import Python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
 import copy
 import logging
 
-# Import Salt Libs
 import salt.utils.msgpack
-
-# Import 3rd-party libs
-from salt.ext import six
+import salt.utils.versions
 from salt.serializers import DeserializationError, SerializationError
 
 log = logging.getLogger(__name__)
-available = salt.utils.msgpack.HAS_MSGPACK
 
 
-if not available:
+if not salt.utils.versions.reqs.msgpack:
 
     def _fail():
         raise RuntimeError("msgpack is not available")
@@ -34,8 +26,7 @@ if not available:
     def _deserialize(stream_or_string, **options):
         _fail()
 
-
-elif salt.utils.msgpack.version >= (1, 0, 0):
+elif salt.utils.versions.reqs.msgpack >= "1.0.0":
 
     def _serialize(obj, **options):
         try:
@@ -51,8 +42,7 @@ elif salt.utils.msgpack.version >= (1, 0, 0):
         except Exception as error:  # pylint: disable=broad-except
             raise DeserializationError(error)
 
-
-elif salt.utils.msgpack.version >= (0, 2, 0):
+elif salt.utils.versions.reqs.msgpack >= "0.2.0":
 
     def _serialize(obj, **options):
         try:
@@ -68,7 +58,6 @@ elif salt.utils.msgpack.version >= (0, 2, 0):
         except Exception as error:  # pylint: disable=broad-except
             raise DeserializationError(error)
 
-
 else:  # msgpack.version < 0.2.0
 
     def _encoder(obj):
@@ -80,7 +69,7 @@ else:  # msgpack.version < 0.2.0
         tuples.
         """
         if isinstance(obj, dict):
-            data = [(key, _encoder(value)) for key, value in six.iteritems(obj)]
+            data = [(key, _encoder(value)) for key, value in obj.items()]
             return dict(data)
         elif isinstance(obj, (list, tuple)):
             return [_encoder(value) for value in obj]
@@ -105,19 +94,21 @@ else:  # msgpack.version < 0.2.0
             raise DeserializationError(error)
 
 
-serialize = _serialize
-deserialize = _deserialize
-
-serialize.__doc__ = """
+def serialize(obj, **options):
+    """
     Serialize Python data to MsgPack.
 
     :param obj: the data structure to serialize
     :param options: options given to lower msgpack module.
-"""
+    """
+    return _serialize(obj, **options)
 
-deserialize.__doc__ = """
+
+def deserialize(stream_or_string, **options):
+    """
     Deserialize any string of stream like object into a Python data structure.
 
     :param stream_or_string: stream or string to deserialize.
     :param options: options given to lower msgpack module.
-"""
+    """
+    return _deserialize(stream_or_string, **options)

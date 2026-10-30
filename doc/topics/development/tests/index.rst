@@ -6,13 +6,10 @@ Salt's Test Suite
 
 Salt comes with a powerful integration and unit test suite allowing for
 the fully automated run of integration and/or unit tests from a single
-interface. It uses the combination of pytest, nox and `Kitchen Salt`_ to
-run these tests. Nox is used to manage all of the test python dependencies.
+interface. It uses the combination of pytest and nox to run these tests.
+Nox is used to manage all of the test python dependencies.
 When you run the test runner with nox, you will be installing the same
 python dependencies that we use to run our test suite on PRs and branch tests.
-`Kitchen Salt`_ is used to spin up our virtual machines based off of golden
-images. These virtual machines use the `salt-jenkins`_ sls states to configure
-any system dependencies.
 
 To learn the basics of how Salt's test suite works, be sure to check
 out the :ref:`Salt's Test Suite: An Introduction <tutorial-salt-testing>`
@@ -33,13 +30,27 @@ python3 you would need to specify the zeromq transport and python3.
 
 .. code-block:: bash
 
-    nox -e 'pytest-zeromq-3(coverage=False)'
+    nox -e 'test-zeromq-3(coverage=False)'
+
+And because zeromq is the default transport, the following nox session can also be used:
+
+.. code-block:: bash
+
+    nox -e 'test-zeromq-3(coverage=False)'
+
 
 To run all the tests but on the tcp transport, you would need to specify the tcp session.
 
 .. code-block:: bash
 
-    nox -e 'pytest-tcp-3(coverage=False)'
+    nox -e 'test-tcp-3(coverage=False)'
+
+As a contrast, when using the deprecated ``runtests.py`` test runner, the
+command would be:
+
+.. code-block:: bash
+
+    nox -e 'runtests-tcp-3(coverage=False)'
 
 You can view all available sessions by running:
 
@@ -50,28 +61,17 @@ You can view all available sessions by running:
 For the most part you will only need nox to run the test suite, as this tool
 will install the exact same python dependencies we use to run on our test runs.
 The exception to this is when a system dependency is required, for example ``mysql``.
-These system dependencies are installed with sls states managed in the `salt-jenkins`_
+These system dependencies are installed with sls states managed in the `salt-ci-images`_
 repo or you can manually install the dependency yourself.
 
 System Dependencies
 ===================
-The system dependencies are installed from the `salt-jenkins`_ repo. The
+The system dependencies are installed from the `salt-ci-images`_ repo. The
 ``golden-images-provision`` state is what is run to determine what dependencies
 to install on which platform.
 We run this state only when we want to update our current VM images with new
 dependencies.
 
-Kitchen Salt
-============
-We also use `Kitchen Salt`_ to spin up the VM's used for testing. You can view the
-kitchen-salt `getting started`_ for instructions on how to install and set it up.
-`Kitchen Salt`_ uses Test Kitchen to spin up the VM or container in the configured
-provider. Once the VM is spun up, `Kitchen Salt`_ can install salt and run a particular
-set of states. In the case of our branch and PR tests we create "Golden Images" which
-run the `salt-jenkins`_ states and install salt system dependencies beforehand. We only
-update these "Golden Images" when we need to upgrade or install a system dependency. You can
-view the `kitchen-salt jenkins setup`_ docs for instructions on how to set up `Kitchen Salt`_
-similar to the jenkins environment we use to run branch and PR tests.
 
 Test Directory Structure
 ========================
@@ -80,7 +80,7 @@ Salt's test suite is located in the ``tests/`` directory in the root of
 Salt's codebase.
 
 With the migration to PyTest, Salt has created a separate directory for tests
-that are written taking advantage of the full pottential of PyTest. These are
+that are written taking advantage of the full potential of PyTest. These are
 located under ``tests/pytests``.
 
 As for the old test suite, it is divided into two main groups:
@@ -160,14 +160,14 @@ all of the tests included in Salt's test suite:
 
 .. code-block:: bash
 
-    nox -e 'pytest-zeromq-3(coverage=False)'
+    nox -e 'test-3(coverage=False)'
 
 For more information about options you can pass the test runner, see the
 ``--help`` option:
 
 .. code-block:: bash
 
-    nox -e 'pytest-zeromq-3(coverage=False)' -- --help
+    nox -e 'test-3(coverage=False)' -- --help
 
 .. _running-test-subsections:
 
@@ -177,13 +177,19 @@ Running Test Subsections
 Instead of running the entire test suite all at once, which can take a long time,
 there are several ways to run only specific groups of tests or individual tests:
 
-* Run :ref:`unit tests only<running-unit-tests-no-daemons>`: ``nox -e 'pytest-zeromq-3(coverage=False)' -- tests/unit/``
-* Run unit and integration tests for states: ``nox -e 'pytest-zeromq-3(coverage=False)' -- tests/unit/states/ tests/integration/states/``
-* Run integration tests for an individual module: ``nox -e 'pytest-zeromq-3(coverage=False)' -- tests/integration/modules/test_virt.py``
-* Run unit tests for an individual module: ``nox -e 'pytest-zeromq-3(coverage=False)' -- tests/unit/modules/test_virt.py``
+* Run :ref:`unit tests only<running-unit-tests-no-daemons>`: ``nox -e
+  'test-3(coverage=False)' -- tests/unit/``.
+* Run unit and integration tests for states: ``nox -e
+  'test-3(coverage=False)' -- tests/unit/states/ tests/integration/states/``.
+* Run integration tests for an individual module: ``nox -e 'test-3(coverage=False)' --
+  tests/pytests/integration/modules/test_virt.py``.
+* Run unit tests for an individual module: ``nox -e 'test-3(coverage=False)' --
+  tests/unit/modules/test_virt.py``.
 * Run an individual test by using the class and test name (this example is for the
-  ``test_default_kvm_profile`` test in the ``tests/integration/module/test_virt.py``):
-  ``nox -e 'pytest-zeromq-3(coverage=False)' -- tests/integration/modules/test_virt.py::VirtTest::test_default_kvm_profile``
+  ``test_default_kvm_profile`` test in the ``tests/pytests/integration/module/test_virt.py``):
+  ``nox -e 'test-3(coverage=False)' --
+  tests/pytests/integration/modules/test_virt.py::VirtTest::test_default_kvm_profile``.
+
 
 For more specific examples of how to run various test subsections or individual
 tests, please see the `pytest`_ documentation on how to run specific tests or
@@ -205,7 +211,7 @@ integration test daemons, simply add the unit directory as an argument:
 
 .. code-block:: bash
 
-    nox -e 'pytest-zeromq-3(coverage=False)' -- tests/unit/
+    nox -e 'test-3(coverage=False)' -- tests/unit/
 
 All of the other options to run individual tests, entire classes of tests, or
 entire test modules still apply.
@@ -236,7 +242,7 @@ To run tests marked as destructive, set the ``--run-destructive`` flag:
 
 .. code-block:: bash
 
-    nox -e 'pytest-zeromq-3(coverage=False)' -- --run-destructive
+    nox -e 'test-3(coverage=False)' -- --run-destructive
 
 
 Running Cloud Provider Tests
@@ -279,11 +285,12 @@ must be provided:
     do not include the single quotes.
 
 Once all of the valid credentials for the cloud provider have been supplied, the
-cloud provider tests can be run by setting the ``--cloud-provider-tests`` flag:
+cloud provider tests can be run like:
 
 .. code-block:: bash
 
-    nox -e 'pytest-cloud-3(coverage=False)'
+    nox -e 'test-cloud-3(coverage=False)'
+
 
 Automated Test Runs
 ===================
@@ -316,18 +323,10 @@ failure is unrelated to the changes in question, core developers may merge
 the pull request despite the initial failure.
 
 As soon as the pull request is merged, the changes will be added to the
-next branch test run on Jenkins.
+next branch test run on the Salt CI pipelines.
 
-For a full list of currently running test environments, go to
-https://jenkinsci.saltstack.com.
-
-
-Using Salt-Cloud on Jenkins
----------------------------
-
-For testing Salt on Jenkins, SaltStack uses :ref:`Salt-Cloud<salt-cloud>` to
-spin up virtual machines. The script using Salt-Cloud to accomplish this is
-open source and can be found here: :blob:`tests/jenkins.py`
+For the current Salt CI configuration, see the workflows in
+:blob:`.github/workflows/`.
 
 
 Writing Tests
@@ -357,8 +356,7 @@ the actual testing, such as functions containing assertions, must start with
 
 .. code-block:: python
 
-    def test_user_present(self):
-        ...
+    def test_user_present(self): ...
 
 When functions in test files are not prepended with ``test_``, the function
 acts as a normal, helper function and is not run as a test by the test suite.
@@ -428,46 +426,88 @@ question if the path forward is unclear.
     that is untested.It would be wise to see if new functionality could use additional
     testing once the test file has propagated to newer release branches.
 
+Module/Global Level Variables
+-----------------------------
+
+If you need access to module or global level variables, please use a pytest fixture. The
+use of module and global variables can introduce mutable global objects and increases
+processing time because all globals are evaluated when collecting tests. If there is a use
+case where you cannot use a fixture and you are using a type of string, integer, or tuple
+you can use global/module level variables. Any mutable types such as lists and dictionaries must
+use pytest fixtures. For an example, if all of your tests need access to a string variable:
+
+.. code-block:: python
+
+    FOO = "bar"
+
+
+    def test_foo_bar():
+        assert FOO == "bar"
+
+
+    def test_foo_not():
+        assert not FOO == "foo"
+
+We recommend using a pytest fixture:
+
+.. code-block:: python
+
+    import pytest
+
+
+    @pytest.fixture()
+    def foo():
+        return "bar"
+
+
+    def test_foo_bar(foo):
+        assert foo == "bar"
+
+
+    def test_foo_not(foo):
+        assert not foo == "foo"
+
+
+If you need a class to mock something, it can be defined at the global scope,
+but it should only be initialized on the fixture:
+
+.. code-block:: python
+
+    class Foo:
+        def __init__(self):
+            self.bar = True
+
+
+    @pytest.fixture
+    def foo():
+        return Foo()
 
 Test Helpers
 ------------
 
 Several Salt-specific helpers are available. A full list is available by inspecting
-functions exported in `tests.support.helpers`.
+functions exported under `tests/support/*.py`.
 
-`@expensiveTest` -- Designates a test which typically requires a relatively costly
-external resource, like a cloud virtual machine. This decorator is not normally
-used by developers outside of the Salt core team.
+Test Markers
+------------
 
-`@destructiveTest` -- Marks a test as potentially destructive. It will not be run
-by the test runner unless the ``-run-destructive`` test is expressly passed.
+`@pytest.mark.expensive_test` -- Designates a test which typically requires a
+relatively costly external resource, like a cloud virtual machine. This decorator
+is not normally used by developers outside of the Salt core team.
 
-`@requires_network` -- Requires a network connection for the test to operate
-successfully. If a network connection is not detected, the test will not run.
+`@pytest.mark.destructive_test` -- Marks a test as potentially destructive. It
+will not be run unless the ``--run-destructive`` flag is expressly passed.
 
-`@requires_salt_modules` -- Requires all the modules in a list of modules in
-order for the test to be executed. Otherwise, the test is skipped.
+`@pytest.mark.requires_network` -- Requires a network connection for the test to
+operate successfully. If a network connection is not detected, the test will not run.
 
-`@requires_system_grains` -- Loads and passes the grains on the system as an
-keyword argument to the test function with the name `grains`.
+These are just a small preview of the supported marker. For a full listing, please
+run:
 
-`@skip_if_binaries_missing(['list', 'of', 'binaries'])` -- If called from inside a test,
-the test will be skipped if the binaries are not all present on the system.
+.. code-block:: bash
 
-`@skip_if_not_root` -- If the test is not executed as root, it will be skipped.
-
-`@with_system_user` -- Creates and optionally destroys a system user within a test case.
-See implementation details in `tests.support.helpers` for details.
-
-`@with_system_group` -- Creates and optionally destroys a system group within a test case.
-See implementation details in `tests.support.helpers` for details.
-
-`@with_system_user_and_group` -- Creates and optionally destroys a system user and group
-within a test case.  See implementation details in `tests.support.helpers` for details.
+    nox -e 'test-3(coverage=False)' -- --markers
 
 
-.. _kitchen-salt jenkins setup: https://kitchen.saltstack.com/docs/file/docs/jenkins.md
-.. _getting started: https://kitchen.saltstack.com/docs/file/docs/gettingstarted.md
-.. _salt-jenkins: https://github.com/saltstack/salt-jenkins
-.. _Kitchen Salt: https://kitchen.saltstack.com/
+.. _salt-ci-images: https://github.com/saltstack/salt-ci-images
 .. _pytest: https://docs.pytest.org/en/latest/usage.html#specifying-tests-selecting-tests

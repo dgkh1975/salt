@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Retrieve Pillar data by doing a postgres query
 
@@ -28,20 +27,15 @@ Complete Example
             as_list: True
             with_lists: [1,3]
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
-
-# Import python libs
 from contextlib import contextmanager
 
-# Import Salt libs
 from salt.pillar.sql_base import SqlBaseExtPillar
 
 # Set up logging
 log = logging.getLogger(__name__)
 
-# Import third party libs
 try:
     import psycopg2
 
@@ -75,6 +69,12 @@ class POSTGRESExtPillar(SqlBaseExtPillar):
             "pass": "salt",
             "db": "salt",
             "port": 5432,
+            "sslmode": "prefer",
+            "sslcert": None,
+            "sslkey": None,
+            "sslrootcert": None,
+            "sslcrl": None,
+            "kwargs": {},
         }
         _options = {}
         _opts = __opts__.get("postgres", {})
@@ -98,6 +98,12 @@ class POSTGRESExtPillar(SqlBaseExtPillar):
             password=_options["pass"],
             dbname=_options["db"],
             port=_options["port"],
+            sslmode=_options["sslmode"],
+            sslcert=_options["sslcert"],
+            sslkey=_options["sslkey"],
+            sslrootcert=_options["sslrootcert"],
+            sslcrl=_options["sslcrl"],
+            **_options["kwargs"],
         )
         cursor = conn.cursor()
         try:
@@ -110,10 +116,10 @@ class POSTGRESExtPillar(SqlBaseExtPillar):
 
     def extract_queries(self, args, kwargs):  # pylint: disable=useless-super-delegation
         """
-            This function normalizes the config block into a set of queries we
-            can use.  The return is a list of consistently laid out dicts.
+        This function normalizes the config block into a set of queries we
+        can use.  The return is a list of consistently laid out dicts.
         """
-        return super(POSTGRESExtPillar, self).extract_queries(args, kwargs)
+        return super().extract_queries(args, kwargs)
 
 
 def ext_pillar(minion_id, pillar, *args, **kwargs):

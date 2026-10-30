@@ -123,6 +123,11 @@ Default: ``None``
 Whether the master should be connected over IPv6. By default salt minion
 will try to automatically detect IPv6 connectivity to master.
 
+When set to ``True``, Salt also uses the IPv6 loopback address (``::1``) for
+internal IPC connections instead of ``127.0.0.1``. On Windows, this is
+required because Windows does not permit binding an ``AF_INET6`` socket to an
+IPv4 address.
+
 .. code-block:: yaml
 
     ipv6: True
@@ -172,6 +177,13 @@ Default: ``str``
 
 The type of the :conf_minion:`master` variable. Can be ``str``, ``failover``,
 ``func`` or ``disable``.
+
+.. code-block:: yaml
+
+    master_type: str
+
+If this option is ``str`` (default), multiple hot masters are configured.
+Minions can connect to multiple masters simultaneously (all master are "hot").
 
 .. code-block:: yaml
 
@@ -225,20 +237,23 @@ minion event bus. The value is expressed in bytes.
 
 .. versionadded:: 2019.2.0
 
-Default: ``True``
+.. versionchanged:: 3009.0
+
+    Default changed from ``True`` to ``False``.
+
+Default: ``False``
 
 When a minion starts up it sends a notification on the event bus with a tag
 that looks like this: ``salt/minion/<minion_id>/start``. For historical reasons
 the minion also sends a similar event with an event tag like this:
 ``minion_start``. This duplication can cause a lot of clutter on the event bus
-when there are many minions. Set ``enable_legacy_startup_events: False`` in the
-minion config to ensure only the ``salt/minion/<minion_id>/start`` events are
-sent. Beginning with the ``3001`` Salt release this option will default to
-``False``.
+when there are many minions. Set ``enable_legacy_startup_events: True`` in the
+minion config to restore the legacy ``minion_start`` events in addition to the
+``salt/minion/<minion_id>/start`` events.
 
 .. code-block:: yaml
 
-    enable_legacy_startup_events: True
+    enable_legacy_startup_events: False
 
 .. conf_minion:: master_failback
 
@@ -284,7 +299,9 @@ Default: ``0``
 
 Configures how often, in seconds, the minion will verify that the current
 master is alive and responding.  The minion will try to establish a connection
-to the next master in the list if it finds the existing one is dead.
+to the next master in the list if it finds the existing one is dead. This
+setting can also be used to detect master DNS record changes when a minion has
+been disconnected.
 
 .. code-block:: yaml
 
@@ -595,9 +612,14 @@ The path to the minion's configuration file.
 ``pki_dir``
 -----------
 
-Default: ``/etc/salt/pki/minion``
+Default: ``<LIB_STATE_DIR>/pki/minion``
 
 The directory used to store the minion's public and private keys.
+
+``<LIB_STATE_DIR>`` is the pre-configured variable state directory set during
+installation via ``--salt-lib-state-dir``. It defaults to ``/etc/salt``. Systems
+following the Filesystem Hierarchy Standard (FHS) might set it to
+``/var/lib/salt``.
 
 .. code-block:: yaml
 
@@ -927,6 +949,24 @@ A value of 10 minutes is a reasonable default.
 
     grains_refresh_every: 0
 
+.. conf_minion:: grains_refresh_pre_exec
+
+``grains_refresh_pre_exec``
+---------------------------
+
+.. versionadded:: 3005
+
+Default: ``False``
+
+The ``grains_refresh_pre_exec`` setting allows for a minion to check its grains
+prior to the execution of any operation to see if they have changed and, if
+so, to inform the master of the new grains. This operation is moderately
+expensive, therefore care should be taken before enabling this behavior.
+
+.. code-block:: yaml
+
+    grains_refresh_pre_exec: True
+
 .. conf_minion:: metadata_server_grains
 
 ``metadata_server_grains``
@@ -1079,8 +1119,9 @@ adds 5 seconds every time grains are generated if an IP does not resolve. In Win
 grains are regenerated each time a new process is spawned. Therefore, the default for
 Windows is ``False``. In many cases this value does not make sense to include for proxy
 minions as it will be FQDN for the host running the proxy minion process, so the default
-for proxy minions is ``False```. All other OSes default to ``True``. This options was
-added `here <https://github.com/saltstack/salt/pull/55581>`_.
+for proxy minions is ``False```. On macOS, FQDN resolution can be very slow, therefore
+the default for macOS is ``False`` as well. All other OSes default to ``True``.
+This option was added `here <https://github.com/saltstack/salt/pull/55581>`_.
 
 .. code-block:: yaml
 
@@ -1166,8 +1207,8 @@ seconds each iteration.
 
 Default: ``False``
 
-If the master rejects the minion's public key, retry instead of exiting.
-Rejected keys will be handled the same as waiting on acceptance.
+If the master denies or rejects the minion's public key, retry instead of
+exiting.  These keys will be handled the same as waiting on acceptance.
 
 .. code-block:: yaml
 
@@ -1241,7 +1282,7 @@ when trying to authenticate to the master.
 
 .. versionadded:: 2014.7.0
 
-Default: ``60``
+Default: ``5``
 
 When waiting for a master to accept the minion's public key, salt will
 continuously attempt to reconnect until successful. This is the timeout value,
@@ -1250,9 +1291,12 @@ will wait for :conf_minion:`acceptance_wait_time` seconds before trying again.
 Unless your master is under unusually heavy load, this should be left at the
 default.
 
+.. note::
+    For high latency networks try increasing this value
+
 .. code-block:: yaml
 
-    auth_timeout: 60
+    auth_timeout: 5
 
 .. conf_minion:: auth_safemode
 
@@ -1270,6 +1314,36 @@ restart.
 .. code-block:: yaml
 
     auth_safemode: False
+
+.. conf_minion:: request_channel_timeout
+
+``request_channel_timeout``
+---------------------------
+
+.. versionadded:: 3006.2
+
+Default: ``30``
+
+The default timeout timeout for request channel requests. This setting can be used to tune minions to better handle long running pillar and file client requests.
+
+.. code-block:: yaml
+
+    request_channel_timeout: 30
+
+``request_channel_tries``
+-------------------------
+
+.. versionadded:: 3006.2
+
+Default: ``3``
+
+The default number of times the minion will try request channel requests. This
+setting can be used to tune minions to better handle long running pillar and
+file client requests by retrying them after a timeout happens.
+
+.. code-block:: yaml
+
+    request_channel_tries: 3
 
 .. conf_minion:: ping_interval
 
@@ -1460,6 +1534,23 @@ process communications. ``ipc_mode`` is set to ``tcp`` on such systems.
 .. code-block:: yaml
 
     ipc_mode: ipc
+
+.. conf_minion:: ipc_write_buffer
+
+``ipc_write_buffer``
+-----------------------
+
+Default: ``0``
+
+The maximum size of a message sent via the IPC transport module can be limited
+dynamically or by sharing an integer value lower than the total memory size. When
+the value ``dynamic`` is set, salt will use 2.5% of the total memory as
+``ipc_write_buffer`` value (rounded to an integer). A value of ``0`` disables
+this option.
+
+.. code-block:: yaml
+
+    ipc_write_buffer: 10485760
 
 .. conf_minion:: tcp_pub_port
 
@@ -1724,6 +1815,33 @@ the priority of optimization level(s) Salt's module loader should prefer.
       - 0
       - 1
 
+.. conf_minion:: lazy_loader_strict_matching
+
+``lazy_loader_strict_matching``
+-------------------------------
+
+.. versionadded:: 3006.19
+
+Default: ``False``
+
+.. versionchanged:: 3008.0
+    The default will change to ``True`` in version 3008.0.
+
+Reduces memory usage by skipping expensive module file searches.
+
+When disabled (default), the loader searches for modules in three stages:
+
+1. Exact filename match (e.g., ``test.py`` for module ``test``)
+2. Partial filename matches (files containing "test" in the name)
+3. Expensive search through every module file
+
+When enabled, stage 3 is skipped. Virtual module names (``__virtualname__``)
+continue to work if stages 1 or 2 find the module file.
+
+.. code-block:: yaml
+
+    lazy_loader_strict_matching: True
+
 Minion Execution Module Management
 ==================================
 
@@ -1984,7 +2102,6 @@ Valid options:
 Top File Settings
 =================
 
-These parameters only have an effect if running a masterless minion.
 
 .. conf_minion:: state_top
 
@@ -2224,6 +2341,45 @@ aggregate just those types.
     state_aggregate:
       - pkg
 
+.. conf_minion:: state_queue
+
+``state_queue``
+---------------
+
+Default: ``False``
+
+Instead of failing immediately when another state run is in progress, a value
+of ``True`` will queue the new state run to begin running once the other has
+finished.
+
+The queue is implemented as a disk-based FIFO queue, minimizing memory usage
+regardless of queue depth. Jobs in the state queue are processed by a background
+thread and will bypass :conf_minion:`process_count_max` limits when they are
+ready to execute, ensuring they are not starved by other workloads.
+
+.. code-block:: yaml
+
+    state_queue: True
+
+Additionally, it can be set to an integer representing the maximum queue size
+which can be attained before the state runs will fail to be queued. This can
+prevent runaway conditions where new threads are started until system
+performance is hampered.
+
+.. code-block:: yaml
+
+    state_queue: 2
+
+.. conf_minion:: state_max_parallel
+
+``state_max_parallel``
+----------------------
+
+Default: ``0``
+
+Limit the number of ``parallel: true`` states that can be running at the same time.
+By default, there is no limit.
+
 .. conf_minion:: state_verbose
 
 ``state_verbose``
@@ -2255,9 +2411,19 @@ The state_output setting controls which results will be output full multi line:
 ``full_id``, ``mixed_id``, ``changes_id`` and ``terse_id`` are also allowed;
 when set, the state ID will be used as name in the output.
 
+Any of the above modes can be suffixed with ``_color`` (e.g. ``full_color``,
+``mixed_color``) to enable colorized unified diff output in the changes
+section. Added lines are shown in green, removed lines in red, hunk headers
+in cyan, and context lines in gray. All other output behavior is identical to
+the mode without the ``_color`` suffix.
+
 .. code-block:: yaml
 
     state_output: full
+
+.. code-block:: yaml
+
+    state_output: full_color
 
 .. conf_minion:: state_output_diff
 
@@ -2273,6 +2439,48 @@ states is cluttering the logs. Set it to True to ignore them.
 .. code-block:: yaml
 
     state_output_diff: False
+
+.. conf_minion:: state_output_profile
+
+``state_output_profile``
+------------------------
+
+Default: ``True``
+
+The ``state_output_profile`` setting changes whether profile information
+will be shown for each state run.
+
+.. code-block:: yaml
+
+    state_output_profile: True
+
+.. conf_minion:: state_output_pct
+
+``state_output_pct``
+--------------------
+
+Default: ``False``
+
+The ``state_output_pct`` setting changes whether success and failure information
+as a percent of total actions will be shown for each state run.
+
+.. code-block:: yaml
+
+    state_output_pct: False
+
+.. conf_minion:: state_compress_ids
+
+``state_compress_ids``
+----------------------
+
+Default: ``False``
+
+The ``state_compress_ids`` setting aggregates information about states which
+have multiple "names" under the same state ID in the highstate output.
+
+.. code-block:: yaml
+
+    state_compress_ids: False
 
 .. conf_minion:: autoload_dynamic_modules
 
@@ -2320,10 +2528,7 @@ enabled and can be disabled by changing this value to ``False``.
     ``saltenv`` will take its value. If both are used, ``environment`` will be
     ignored and ``saltenv`` will be used.
 
-Normally the minion is not isolated to any single environment on the master
-when running states, but the environment can be isolated on the minion side
-by statically setting it. Remember that the recommended way to manage
-environments is to isolate via the top file.
+The default fileserver environment to use when copying files and applying states.
 
 .. code-block:: yaml
 
@@ -2379,6 +2584,21 @@ default configuration set up at install time.
 .. code-block:: yaml
 
     snapper_states_config: root
+
+``global_state_conditions``
+---------------------------
+
+Default: ``None``
+
+If set, this parameter expects a dictionary of state module names as keys and a
+list of conditions which must be satisfied in order to run any functions in that
+state module.
+
+.. code-block:: yaml
+
+    global_state_conditions:
+      "*": ["G@global_noop:false"]
+      service: ["not G@virtual_subtype:chroot"]
 
 File Directory Settings
 =======================
@@ -2472,26 +2692,6 @@ Master will not be returned to the Minion.
 .. code-block:: yaml
 
     fileserver_ignoresymlinks: False
-
-.. conf_minion:: fileserver_limit_traversal
-
-``fileserver_limit_traversal``
-------------------------------
-
-.. versionadded:: 2014.1.0
-
-Default: ``False``
-
-By default, the Salt fileserver recurses fully into all defined environments
-to attempt to find files. To limit this behavior so that the fileserver only
-traverses directories with SLS files and special Salt directories like _modules,
-set ``fileserver_limit_traversal`` to ``True``. This might be useful for
-installations where a file root has a very large number of files and performance
-is impacted.
-
-.. code-block:: yaml
-
-    fileserver_limit_traversal: False
 
 .. conf_minion:: hash_type
 
@@ -2641,6 +2841,32 @@ List of renderers which are permitted to be used for pillar decryption.
     decrypt_pillar_renderers:
       - gpg
       - my_custom_renderer
+
+.. conf_minion:: gpg_decrypt_must_succeed
+
+``gpg_decrypt_must_succeed``
+----------------------------
+
+.. versionadded:: 3005
+
+Default: ``False``
+
+If this is ``True`` and the ciphertext could not be decrypted, then an error is
+raised.
+
+Sending the ciphertext through basically is *never* desired, for example if a
+state is setting a database password from pillar and gpg rendering fails, then
+the state will update the password to the ciphertext, which by definition is
+not encrypted.
+
+.. warning::
+
+    The value defaults to ``False`` for backwards compatibility.  In the
+    ``Chlorine`` release, this option will default to ``True``.
+
+.. code-block:: yaml
+
+    gpg_decrypt_must_succeed: False
 
 .. conf_minion:: pillarenv
 
@@ -2859,7 +3085,7 @@ Default: ``False``
 
 Enables verification of the master-public-signature returned by the master in
 auth-replies. Please see the tutorial on how to configure this properly
-`Multimaster-PKI with Failover Tutorial <http://docs.saltstack.com/en/latest/topics/tutorials/multimaster_pki.html>`_
+`Multimaster-PKI with Failover Tutorial <https://docs.saltproject.io/en/latest/topics/tutorials/multimaster_pki.html>`_
 
 .. versionadded:: 2014.7.0
 
@@ -2990,7 +3216,7 @@ Default: ``None``
 TLS/SSL connection options. This could be set to a dictionary containing
 arguments corresponding to python ``ssl.wrap_socket`` method. For details see
 `Tornado <http://www.tornadoweb.org/en/stable/tcpserver.html#tornado.tcpserver.TCPServer>`_
-and `Python <https://docs.python.org/2/library/ssl.html#ssl.wrap_socket>`_
+and `Python <https://docs.python.org/3/library/ssl.html#ssl.wrap_socket>`_
 documentation.
 
 Note: to set enum arguments values like ``cert_reqs`` and ``ssl_version`` use
@@ -3002,6 +3228,273 @@ constant names without ssl module prefix: ``CERT_REQUIRED`` or ``PROTOCOL_SSLv23
         keyfile: <path_to_keyfile>
         certfile: <path_to_certfile>
         ssl_version: PROTOCOL_TLSv1_2
+
+.. conf_minion:: disable_aes_with_tls
+
+``disable_aes_with_tls``
+------------------------
+
+.. versionadded:: 3008.0
+
+Default: ``False``
+
+When set to ``True``, Salt will skip application-layer AES encryption when TLS
+is active with validated certificates. This optimization can improve performance
+by eliminating redundant encryption, as TLS already provides encryption at the
+transport layer.
+
+**Requirements for optimization to activate:**
+
+1. ``disable_aes_with_tls: true`` on both master and minion
+2. Valid SSL configuration (``ssl`` option configured)
+3. Mutual TLS authentication (``cert_reqs: CERT_REQUIRED``)
+4. TCP or WebSocket transport (not ZeroMQ)
+5. Valid peer certificates
+6. Minion certificate must contain minion ID in CN or SAN
+
+If any requirement is not met, Salt automatically falls back to standard AES
+encryption. This ensures the feature is safe to enable and maintains backward
+compatibility.
+
+.. code-block:: yaml
+
+    transport: tcp
+    ssl:
+        certfile: /etc/pki/tls/certs/minion.crt
+        keyfile: /etc/pki/tls/private/minion.key
+        ca_certs: /etc/pki/tls/certs/ca-bundle.crt
+        cert_reqs: CERT_REQUIRED
+    disable_aes_with_tls: true
+
+.. important::
+    The minion certificate **must** contain the minion ID in either the Common
+    Name (CN) or Subject Alternative Name (SAN) field to prevent impersonation
+    attacks. See :ref:`tls-encryption-optimization` for certificate generation
+    instructions.
+
+See :ref:`tls-encryption-optimization` for detailed configuration and security
+information.
+
+.. conf_minion:: use_os_truststore
+
+``use_os_truststore``
+----------------------
+
+.. versionadded:: 3008.0
+
+Default: ``False``
+
+If ``True``, Salt will use the native operating system certificate store for
+SSL/TLS verification instead of the bundled ``certifi`` CA bundle.  This is
+the recommended setting for environments with transparent proxies or internal
+root CAs deployed via Group Policy or a device-management system.
+
+Platform mapping:
+
+- **Windows** — Local Machine Certificate Store (CryptoAPI)
+- **macOS** — Keychain
+- **Linux** — ``/etc/ssl/certs`` or ``/etc/pki/tls``
+
+.. code-block:: yaml
+
+    use_os_truststore: True
+
+.. rubric:: Requirements
+
+The ``truststore`` package must be installed (Python 3.10 or newer).
+If the package is not present, Salt logs a warning and falls back to
+``certifi``.  The ``ca_truststore`` grain reports which store is active.
+
+.. warning::
+
+    Do **not** install ``pip-system-certs`` into the Salt Python environment.
+    That package ships a ``.pth`` file that unconditionally activates the OS
+    trust store on every Python startup, before Salt reads its configuration,
+    completely bypassing this setting.
+
+.. rubric:: Interaction with ``ca_bundle``
+
+An explicit ``ca_bundle: /path/to/bundle.pem`` setting always takes
+precedence over ``use_os_truststore``.  Use ``ca_bundle`` when you need to
+pin a specific certificate file regardless of the OS store.
+
+.. rubric:: PKI architecture
+
+This setting has **no effect** on Salt's master/minion key authentication
+system (``pki_dir``, AES session keys, minion key acceptance).  It only
+affects outbound HTTPS/TLS connections made by Salt — HTTP runner, gitfs,
+fileserver backends, cloud drivers, and similar components.
+
+.. note::
+
+    On Windows, the ``LocalSystem`` service account (the default account
+    for the salt-minion Windows service) only has access to the **Local
+    Machine** certificate store, not the Current User store.  Certificates
+    must be deployed to the Local Machine store, for example via Group
+    Policy, to be visible to Salt.
+
+.. note::
+
+    On Windows, certificate verification is performed via a CryptoAPI service
+    call rather than a simple file read.  This may add a small amount of
+    latency on the first TLS connection made by a new process compared with
+    the simple file read used with ``certifi``.  On Linux and macOS the
+    performance difference is negligible.
+
+.. conf_minion:: saltpip_use_pythonpath
+
+``saltpip_use_pythonpath``
+---------------------------
+
+.. versionadded:: 3008.3
+
+Default: ``False``
+
+By default, ``salt-pip`` (see :ref:`salt-pip-onedir`) isolates the pip
+subprocess it spawns from any ``PYTHONPATH`` set in the calling
+environment, so it only ever sees the onedir's own ``extras`` directory.
+Set this to ``True`` to restore the older behavior of prepending
+``extras`` onto whatever ``PYTHONPATH`` was already set, making anything
+on that inherited ``PYTHONPATH`` visible to ``salt-pip``'s pip subprocess
+as well.
+
+Only enable this if you specifically need ``salt-pip`` to see packages
+from an inherited ``PYTHONPATH``. Leaving it ``False`` (the default)
+avoids the failure mode described in `issue #70151
+<https://github.com/saltstack/salt/issues/70151>`_, where a ``PYTHONPATH``
+leaked from an unrelated Python installation caused ``salt-pip install
+--force-reinstall`` to delete packages belonging to that unrelated
+installation.
+
+.. code-block:: yaml
+
+    saltpip_use_pythonpath: True
+
+.. conf_minion:: saltpip_no_deps
+
+``saltpip_no_deps``
+---------------------
+
+.. versionadded:: 3008.3
+
+Default: ``False``
+
+If ``True``, ``salt-pip`` always runs pip with ``PIP_NO_DEPS=1``
+(equivalent to passing ``--no-deps`` to every ``salt-pip install``), so it
+never resolves or fetches a package's dependencies. Use this to lock a
+minion down so ``salt-pip`` can only ever install exactly the package(s)
+named on the command line.
+
+.. code-block:: yaml
+
+    saltpip_no_deps: True
+
+.. conf_minion:: saltpip_no_index
+
+``saltpip_no_index``
+----------------------
+
+.. versionadded:: 3008.3
+
+Default: ``False``
+
+If ``True``, ``salt-pip`` always runs pip with ``PIP_NO_INDEX=1``
+(equivalent to passing ``--no-index``), so it never queries PyPI or any
+other package index. Combine with :conf_minion:`saltpip_no_deps` to
+guarantee ``salt-pip`` only ever installs from locally-provided wheels/
+sdists (for example, packages pushed to the minion ahead of time) and
+never reaches out to the network.
+
+.. code-block:: yaml
+
+    saltpip_no_index: True
+
+.. conf_minion:: saltpip_disable_pip_version_check
+
+``saltpip_disable_pip_version_check``
+---------------------------------------
+
+.. versionadded:: 3008.3
+
+Default: ``False``
+
+If ``True``, ``salt-pip`` always runs pip with
+``PIP_DISABLE_PIP_VERSION_CHECK=1``, suppressing pip's periodic outbound
+check for a newer pip release. The onedir bundles a packager-pinned pip,
+so that check is generally noise; enabling this also avoids an unwanted
+network call on minions that should never talk to PyPI.
+
+.. code-block:: yaml
+
+    saltpip_disable_pip_version_check: True
+
+.. note::
+
+    ``saltpip_no_deps``, ``saltpip_no_index``, and
+    ``saltpip_disable_pip_version_check`` are implemented as environment
+    variables set on the pip subprocess ``salt-pip`` spawns, not as CLI
+    flags, since ``salt-pip`` proxies arbitrary pip subcommands
+    (``install``, ``list``, ``show``, ``uninstall``, ...) and pip silently
+    ignores these variables on subcommands that don't use them. They only
+    affect that one subprocess call -- they are never set in, or visible
+    to, the calling shell or any other process.
+
+.. conf_minion:: saltpip_allow_find_links
+
+``saltpip_allow_find_links``
+------------------------------
+
+.. versionadded:: 3008.3
+
+Default: ``True``
+
+Controls whether an inherited ``PIP_FIND_LINKS`` (pip's own mechanism for
+installing from a local or internal mirror instead of an index) is passed
+through to ``salt-pip``'s pip subprocess (``True``, the default, matching
+current behavior) or stripped from it (``False``).
+
+This is independent of :conf_minion:`saltpip_no_index`: ``--find-links``
+is meaningful, and commonly used, together with disabling the index for
+air-gapped installs, so it is left alone by default even when
+``saltpip_no_index`` is ``True``. Set ``saltpip_allow_find_links: False``
+if you need to guarantee ``salt-pip`` never uses a find-links location,
+regardless of what any calling process's environment happens to have set.
+
+.. code-block:: yaml
+
+    saltpip_allow_find_links: False
+
+.. note::
+
+    An inherited ``PIP_INDEX_URL``/``PIP_EXTRA_INDEX_URL`` is deliberately
+    left untouched by all of the ``saltpip_*`` options above. pip already
+    ignores both entirely whenever ``PIP_NO_INDEX=1``
+    (:conf_minion:`saltpip_no_index`) is in effect, so stripping them in
+    that case would have no effect; filtering them when
+    ``saltpip_no_index`` is *not* set is a separate, currently
+    unaddressed gap.
+
+``encryption_algorithm``
+------------------------
+
+.. versionadded:: 3006.9
+
+Default: OAEP-SHA1
+
+The RSA encryption algorithm used by this minion when connecting to the
+master's request channel. Valid values are ``OAEP-SHA1`` and ``OAEP-SHA224``
+
+
+``signing_algorithm``
+------------------------
+
+.. versionadded:: 3006.9
+
+Default: PKCS1v15-SHA1
+
+The RSA signing algorithm used by this minion when connecting to the
+master's request channel. Valid values are ``PKCS1v15-SHA1`` and
+``PKCS1v15-SHA224``
 
 
 Reactor Settings
@@ -3092,8 +3585,14 @@ Default: ``-1``
 
 Limit the maximum amount of processes or threads created by ``salt-minion``.
 This is useful to avoid resource exhaustion in case the minion receives more
-publications than it is able to handle, as it limits the number of spawned
-processes or threads. ``-1`` is the default and disables the limit.
+publications than it is able to handle.
+
+When this limit is reached, new jobs are queued to a disk-based FIFO queue and
+processed as slots become available. ``-1`` is the default and disables the limit.
+
+.. note::
+    State runs managed by :conf_minion:`state_queue` will bypass this limit
+    once they are released from the state queue.
 
 .. code-block:: yaml
 
@@ -3142,6 +3641,12 @@ The level of messages to send to the console. See also :conf_log:`log_level`.
 
     log_level: warning
 
+Any log level below the `info` level is INSECURE and may log sensitive data. This currently includes:
+#. profile
+#. debug
+#. trace
+#. garbage
+#. all
 
 .. conf_minion:: log_level_logfile
 
@@ -3158,6 +3663,12 @@ it will inherit the level set by :conf_log:`log_level` option.
 
     log_level_logfile: warning
 
+Any log level below the `info` level is INSECURE and may log sensitive data. This currently includes:
+#. profile
+#. debug
+#. trace
+#. garbage
+#. all
 
 .. conf_minion:: log_datefmt
 
@@ -3301,7 +3812,7 @@ should be logged as the minion starts up and initially connects to the
 master. If not, check for debug log level and that the necessary version of
 ZeroMQ is installed.
 
-.. conf_minion:: failhard
+.. conf_minion:: tcp_authentication_retries
 
 ``tcp_authentication_retries``
 ------------------------------
@@ -3316,6 +3827,18 @@ reauthenticate. The tcp transport should try to connect with a new connection
 if the old one times out on reauthenticating.
 
 `-1` for infinite tries.
+
+.. conf_minion:: tcp_reconnect_backoff
+
+``tcp_reconnect_backoff``
+------------------------------
+
+Default: ``1``
+
+The time in seconds to wait before attempting another connection with salt master
+when the previous connection fails while on TCP transport.
+
+.. conf_minion:: failhard
 
 ``failhard``
 ------------
@@ -3531,6 +4054,31 @@ the metadata will be refreshed.
 .. code-block:: yaml
 
     winrepo_cache_expire_max: 86400
+
+.. conf_minion:: winrepo_installer_cache_expire
+
+``winrepo_installer_cache_expire``
+-----------------------------------
+
+.. versionadded:: 3006.28
+
+Default: ``0``
+
+Every time :py:func:`pkg.refresh_db <salt.modules.win_pkg.refresh_db>` runs,
+installer/uninstaller files cached on the minion by
+:py:func:`pkg.install <salt.modules.win_pkg.install>` and
+:py:func:`pkg.remove <salt.modules.win_pkg.remove>` that are older than this
+many seconds will be removed, to keep them from accumulating indefinitely on
+the minion's disk. If set to ``0`` (the default), no cached installer files
+are ever removed.
+
+This is separate from ``winrepo_cache_expire_min``/``winrepo_cache_expire_max``
+above, which only control refresh timing of the windows repo metadata
+database, not the downloaded installer/uninstaller files themselves.
+
+.. code-block:: yaml
+
+    winrepo_installer_cache_expire: 2592000  # 30 days
 
 .. conf_minion:: winrepo_source_dir
 

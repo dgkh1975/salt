@@ -6,7 +6,6 @@ Module for getting information about network addresses.
 :depends: netaddr
 """
 
-
 __virtualname__ = "netaddress"
 
 try:
@@ -34,7 +33,9 @@ def list_cidr_ips(cidr):
     """
     Get a list of IP addresses from a CIDR.
 
-    CLI example::
+    CLI Example:
+
+    .. code-block:: bash
 
         salt myminion netaddress.list_cidr_ips 192.168.0.0/20
     """
@@ -46,7 +47,9 @@ def list_cidr_ips_ipv6(cidr):
     """
     Get a list of IPv6 addresses from a CIDR.
 
-    CLI example::
+    CLI Example:
+
+    .. code-block:: bash
 
         salt myminion netaddress.list_cidr_ips_ipv6 192.168.0.0/20
     """
@@ -58,7 +61,9 @@ def cidr_netmask(cidr):
     """
     Get the netmask address associated with a CIDR address.
 
-    CLI example::
+    CLI Example:
+
+    .. code-block:: bash
 
         salt myminion netaddress.cidr_netmask 192.168.0.0/20
     """
@@ -70,7 +75,9 @@ def cidr_broadcast(cidr):
     """
     Get the broadcast address associated with a CIDR address.
 
-    CLI example::
+    CLI Example:
+
+    .. code-block:: bash
 
         salt myminion netaddress.cidr_netmask 192.168.0.0/20
     """

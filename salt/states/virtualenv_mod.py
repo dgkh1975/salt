@@ -1,12 +1,14 @@
-# -*- coding: utf-8 -*-
 """
 Setup of Python virtualenv sandboxes.
 
 .. versionadded:: 0.17.0
-"""
 
-# Import Python libs
-from __future__ import absolute_import, print_function, unicode_literals
+.. note::
+
+    This state module is loaded under the ``virtualenv`` virtual name. Use
+    ``virtualenv.managed`` (and not ``virtualenv_mod.managed``) in your
+    state SLS files.
+"""
 
 import logging
 import os
@@ -14,13 +16,8 @@ import os
 import salt.utils.functools
 import salt.utils.platform
 import salt.utils.versions
-
-# Import Salt libs
 import salt.version
 from salt.exceptions import CommandExecutionError, CommandNotFoundError
-
-# Import 3rd-party libs
-from salt.ext import six
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +63,7 @@ def managed(
     pip_cache_dir=None,
     process_dependency_links=False,
     no_binary=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Create a virtualenv and optionally manage it with pip
@@ -77,6 +74,13 @@ def managed(
     venv_bin: virtualenv
         The name (and optionally path) of the virtualenv command. This can also
         be set globally in the minion config file as ``virtualenv.venv_bin``.
+        The special value ``venv`` selects the python standard library
+        ``venv`` module instead of a virtualenv binary; a python interpreter
+        (e.g. ``/usr/bin/python3.11``) may also be given, in which case the
+        environment is created with ``<interpreter> -m venv``.
+
+        .. versionchanged:: 3006.28
+            A python interpreter is now accepted as ``venv_bin``.
 
     requirements: None
         Path to a pip requirements file. If the path begins with ``salt://``
@@ -86,7 +90,15 @@ def managed(
         Prefer wheel archives (requires pip >= 1.4).
 
     python: None
-        Python executable used to build the virtualenv
+        Python executable used to build the virtualenv. When Salt is installed
+        from a onedir package. You will likely want to specify which python
+        interperter should be used.
+
+        .. versionchanged:: 3006.28
+            Also honoured with ``venv_bin: venv``: the environment is created
+            by running ``<python> -m venv``, so distros whose virtualenv
+            binary is outdated (e.g. EL8) can still build environments for
+            any installed interpreter.
 
     user: None
         The user under which to run virtualenv and pip.
@@ -129,8 +141,15 @@ def managed(
 
         .. versionadded:: 2017.7.0
 
-    Also accepts any kwargs that the virtualenv module will. However, some
-    kwargs, such as the ``pip`` option, require ``- distribute: True``.
+    Also accepts any keyword argument accepted by
+    :py:func:`virtualenv.create <salt.modules.virtualenv_mod.create>` --
+    including ``system_site_packages``, ``distribute``, ``clear``,
+    ``extra_search_dir``, ``never_download``, ``prompt``, ``index_url``,
+    ``extra_index_url``, ``pre_releases``, ``pip_download``,
+    ``pip_download_cache``, ``pip_ignore_installed``, ``use_vt``,
+    ``pip_no_cache_dir`` and ``pip_cache_dir``. Refer to that execution
+    module for argument semantics. Some kwargs, such as the ``pip`` option,
+    require ``- distribute: True``.
 
     .. code-block:: yaml
 
@@ -140,6 +159,12 @@ def managed(
             - requirements: salt://REQUIREMENTS.txt
             - env_vars:
                 PATH_VAR: '/usr/local/bin/'
+
+    Current versions of Salt use onedir packages and will use onedir python
+    interpreter by default. If you've installed Salt via out package
+    repository. You will likely want to provide the path to the interpreter
+    with which you would like to be used to create the virtual environment. The
+    interpreter can be specified by providing the `python` option.
     """
     ret = {"name": name, "result": True, "comment": "", "changes": {}}
 
@@ -169,7 +194,7 @@ def managed(
             ret.update(
                 {
                     "result": False,
-                    "comment": "pip requirements file '{0}' not found".format(
+                    "comment": "pip requirements file '{}' not found".format(
                         requirements
                     ),
                 }
@@ -180,21 +205,19 @@ def managed(
     # If it already exists, grab the version for posterity
     if venv_exists and clear:
         ret["changes"]["cleared_packages"] = __salt__["pip.freeze"](bin_env=name)
-        ret["changes"]["old"] = __salt__["cmd.run_stderr"](
-            "{0} -V".format(venv_py)
-        ).strip("\n")
+        ret["changes"]["old"] = __salt__["cmd.run_stderr"](f"{venv_py} -V").strip("\n")
 
     # Create (or clear) the virtualenv
     if __opts__["test"]:
         if venv_exists and clear:
             ret["result"] = None
-            ret["comment"] = "Virtualenv {0} is set to be cleared".format(name)
+            ret["comment"] = f"Virtualenv {name} is set to be cleared"
             return ret
         if venv_exists and not clear:
-            ret["comment"] = "Virtualenv {0} is already created".format(name)
+            ret["comment"] = f"Virtualenv {name} is already created"
             return ret
         ret["result"] = None
-        ret["comment"] = "Virtualenv {0} is set to be created".format(name)
+        ret["comment"] = f"Virtualenv {name} is set to be created"
         return ret
 
     if not venv_exists or (venv_exists and clear):
@@ -211,11 +234,11 @@ def managed(
                 prompt=prompt,
                 user=user,
                 use_vt=use_vt,
-                **kwargs
+                **kwargs,
             )
         except CommandNotFoundError as err:
             ret["result"] = False
-            ret["comment"] = "Failed to create virtualenv: {0}".format(err)
+            ret["comment"] = f"Failed to create virtualenv: {err}"
             return ret
 
         if venv_ret["retcode"] != 0:
@@ -224,9 +247,7 @@ def managed(
             return ret
 
         ret["result"] = True
-        ret["changes"]["new"] = __salt__["cmd.run_stderr"](
-            "{0} -V".format(venv_py)
-        ).strip("\n")
+        ret["changes"]["new"] = __salt__["cmd.run_stderr"](f"{venv_py} -V").strip("\n")
 
         if clear:
             ret["comment"] = "Cleared existing virtualenv"
@@ -251,9 +272,9 @@ def managed(
             ret["result"] = False
             ret["comment"] = (
                 "The 'use_wheel' option is only supported in "
-                "pip between {0} and {1}. The version of pip detected "
-                "was {2}."
-            ).format(min_version, max_version, cur_version)
+                "pip between {} and {}. The version of pip detected "
+                "was {}.".format(min_version, max_version, cur_version)
+            )
             return ret
 
     # Check that the pip binary supports the 'no_use_wheel' option
@@ -271,9 +292,9 @@ def managed(
             ret["result"] = False
             ret["comment"] = (
                 "The 'no_use_wheel' option is only supported in "
-                "pip between {0} and {1}. The version of pip detected "
-                "was {2}."
-            ).format(min_version, max_version, cur_version)
+                "pip between {} and {}. The version of pip detected "
+                "was {}.".format(min_version, max_version, cur_version)
+            )
             return ret
 
     # Check that the pip binary supports the 'no_binary' option
@@ -287,9 +308,9 @@ def managed(
             ret["result"] = False
             ret["comment"] = (
                 "The 'no_binary' option is only supported in "
-                "pip {0} and newer. The version of pip detected "
-                "was {1}."
-            ).format(min_version, cur_version)
+                "pip {} and newer. The version of pip detected "
+                "was {}.".format(min_version, cur_version)
+            )
             return ret
 
     # Populate the venv via a requirements file
@@ -303,7 +324,7 @@ def managed(
 
         if requirements:
 
-            if isinstance(requirements, six.string_types):
+            if isinstance(requirements, str):
                 req_canary = requirements.split(",")[0]
             elif isinstance(requirements, list):
                 req_canary = requirements[0]
@@ -337,11 +358,11 @@ def managed(
             env_vars=env_vars,
             no_cache_dir=pip_no_cache_dir,
             cache_dir=pip_cache_dir,
-            **kwargs
+            **kwargs,
         )
         ret["result"] &= pip_ret["retcode"] == 0
         if pip_ret["retcode"] > 0:
-            ret["comment"] = "{0}\n{1}\n{2}".format(
+            ret["comment"] = "{}\n{}\n{}".format(
                 ret["comment"], pip_ret["stdout"], pip_ret["stderr"]
             )
 

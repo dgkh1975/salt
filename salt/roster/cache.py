@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 The ``cache`` roster provides a flexible interface to the Salt Masters' minion cache
 to access regular minions over ``salt-ssh``.
@@ -94,20 +93,14 @@ This should be especially useful for the other roster keys:
 
 """
 
-# Import Python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
 import copy
 import logging
 import re
 
 import salt.cache
-
-# Import Salt libs
 import salt.utils.data
 import salt.utils.minions
 from salt._compat import ipaddress
-from salt.ext import six
 
 log = logging.getLogger(__name__)
 
@@ -180,17 +173,17 @@ def _load_minion(minion_id, cache):
         pillar = {}
 
     addrs = {
-        4: sorted([ipaddress.IPv4Address(addr) for addr in grains.get("ipv4", [])]),
-        6: sorted([ipaddress.IPv6Address(addr) for addr in grains.get("ipv6", [])]),
+        4: sorted(ipaddress.IPv4Address(addr) for addr in grains.get("ipv4", [])),
+        6: sorted(ipaddress.IPv6Address(addr) for addr in grains.get("ipv6", [])),
     }
 
-    mine = cache.fetch("minions/{0}".format(minion_id), "mine")
+    mine = cache.fetch("mine", minion_id)
 
     return grains, pillar, addrs, mine
 
 
 def _data_lookup(ref, lookup):
-    if isinstance(lookup, six.string_types):
+    if isinstance(lookup, str):
         lookup = [lookup]
 
     res = []
@@ -212,9 +205,9 @@ def _minion_lookup(minion_id, key, minion):
     elif isinstance(key, dict):
         # Lookup the key in the dict
         for data_id, lookup in key.items():
-            ref = {"pillar": pillar, "grain": grains, "mine": mine}[data_id]
+            ref = {"pillar": pillar, "grain": grains, "mine": mine}
 
-            for k in _data_lookup(ref, lookup):
+            for k in _data_lookup(ref[data_id], lookup):
                 if k:
                     return k
 
@@ -227,18 +220,18 @@ def _minion_lookup(minion_id, key, minion):
         try:
             net = ipaddress.ip_network(key, strict=True)
         except ValueError:
-            log.error("%s is an invalid CIDR network", net)
+            log.error("%s is an invalid CIDR network", key)
             return None
 
         for addr in addrs[net.version]:
             if addr in net:
-                return six.text_type(addr)
+                return str(addr)
     else:
         # Take the addresses from the grains and filter them
         filters = {
-            "global": lambda addr: addr.is_global
-            if addr.version == 6
-            else not addr.is_private,
+            "global": lambda addr: (
+                addr.is_global if addr.version == 6 else not addr.is_private
+            ),
             "public": lambda addr: not addr.is_private,
             "private": lambda addr: addr.is_private
             and not addr.is_loopback
@@ -255,8 +248,6 @@ def _minion_lookup(minion_id, key, minion):
             try:
                 for addr in addrs[ip_ver]:
                     if filters[key](addr):
-                        return six.text_type(addr)
+                        return str(addr)
             except KeyError:
-                raise KeyError(
-                    "Invalid filter {0} specified in roster_order".format(key)
-                )
+                raise KeyError(f"Invalid filter {key} specified in roster_order")

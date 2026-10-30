@@ -1,12 +1,8 @@
-# -*- coding: utf-8 -*-
 """
 Create virtualenv environments.
 
 .. versionadded:: 0.17.0
 """
-
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
 import glob
 import logging
@@ -15,25 +11,23 @@ import re
 import shutil
 import sys
 
-# Import salt libs
 import salt.utils.files
 import salt.utils.path
 import salt.utils.platform
 import salt.utils.verify
 from salt.exceptions import CommandExecutionError, SaltInvocationError
-from salt.ext.six import string_types
 
 KNOWN_BINARY_NAMES = frozenset(
     [
-        "virtualenv-{0}.{1}".format(*sys.version_info[:2]),
-        "virtualenv{0}".format(sys.version_info[0]),
+        "virtualenv-{}.{}".format(*sys.version_info[:2]),
+        f"virtualenv{sys.version_info[0]}",
         "virtualenv",
     ]
 )
 
 log = logging.getLogger(__name__)
 
-__opts__ = {"venv_bin": salt.utils.path.which_bin(KNOWN_BINARY_NAMES) or "virtualenv"}
+__opts__ = {"venv_bin": salt.utils.path.which_bin(KNOWN_BINARY_NAMES) or "venv"}
 
 __pillar__ = {}
 
@@ -43,6 +37,21 @@ __virtualname__ = "virtualenv"
 
 def __virtual__():
     return __virtualname__
+
+
+def _is_python_binary(venv_bin):
+    """
+    Return True when venv_bin points at a python interpreter (e.g.
+    ``python3``, ``/usr/bin/python3.11``, ``pypy3``, ``python.exe``), which
+    selects environment creation through ``<interpreter> -m venv``.
+    """
+    return bool(
+        re.fullmatch(
+            r"(python|pypy)[0-9.]*(\.exe)?",
+            os.path.basename(venv_bin),
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def virtualenv_ver(venv_bin, user=None, **kwargs):
@@ -64,15 +73,15 @@ def virtualenv_ver(venv_bin, user=None, **kwargs):
         )
         if ret["retcode"] > 0 or not ret["stdout"].strip():
             raise CommandExecutionError(
-                "Unable to get the virtualenv version output using '{0}'. "
-                "Returned data: {1}".format(version_cmd, ret)
+                "Unable to get the virtualenv version output using '{}'. "
+                "Returned data: {}".format(version_cmd, ret)
             )
         # 20.0.0 virtualenv changed the --version output. find version number
         version = "".join(
             [x for x in ret["stdout"].strip().split() if re.search(r"^\d.\d*", x)]
         )
     virtualenv_version_info = tuple(
-        [int(i) for i in re.sub(r"(rc|\+ds).*$", "", version).split(".")]
+        int(i) for i in re.sub(r"(rc|\+ds).*$", "", version).split(".")
     )
     return virtualenv_version_info
 
@@ -93,7 +102,7 @@ def create(
     user=None,
     use_vt=False,
     saltenv="base",
-    **kwargs
+    **kwargs,
 ):
     """
     Create a virtualenv
@@ -104,10 +113,19 @@ def create(
     venv_bin
         The name (and optionally path) of the virtualenv command. This can also
         be set globally in the minion config file as ``virtualenv.venv_bin``.
-        Defaults to ``virtualenv``.
+        Defaults to the first virtualenv binary found in the PATH, falling
+        back to ``venv`` when none is installed. The special value ``venv``
+        selects the
+        python standard library ``venv`` module instead of a virtualenv
+        binary; a python interpreter (e.g. ``/usr/bin/python3.11``) may also
+        be given, in which case the environment is created with
+        ``<interpreter> -m venv``.
+
+        .. versionchanged:: 3006.28
+            A python interpreter is now accepted as ``venv_bin``.
 
     system_site_packages : False
-        Passthrough argument given to virtualenv or pyvenv
+        Passthrough argument given to virtualenv or venv
 
     distribute : False
         Passthrough argument given to virtualenv
@@ -117,10 +135,19 @@ def create(
         ``distribute=True``
 
     clear : False
-        Passthrough argument given to virtualenv or pyvenv
+        Passthrough argument given to virtualenv or venv
 
     python : None (default)
-        Passthrough argument given to virtualenv
+        The python interpreter to create the environment with. With a
+        virtualenv binary this is passed as ``--python``; with
+        ``venv_bin: venv`` the environment is created by running
+        ``<python> -m venv``, so the environment belongs to that
+        interpreter rather than the one running the Salt minion.
+
+        .. versionchanged:: 3006.28
+            With ``venv_bin: venv`` this argument used to be rejected; it
+            now selects the interpreter that runs ``-m venv``. It remains
+            unsupported for other venv-style binaries such as ``pyvenv``.
 
     extra_search_dir : None (default)
         Passthrough argument given to virtualenv
@@ -129,13 +156,18 @@ def create(
         Passthrough argument given to virtualenv if True
 
     prompt : None (default)
-        Passthrough argument given to virtualenv if not None
+        Passthrough argument given to virtualenv or venv if not None
+
+        .. versionchanged:: 3006.28
+            Previously rejected when ``venv_bin`` selected the ``venv``
+            module; the ``venv`` module has supported ``--prompt`` since
+            Python 3.6.
 
     symlinks : None
-        Passthrough argument given to pyvenv if True
+        Passthrough argument given to venv if True
 
     upgrade : None
-        Passthrough argument given to pyvenv if True
+        Passthrough argument given to venv if True
 
     user : None
         Set ownership for the virtualenv
@@ -180,25 +212,50 @@ def create(
            - VIRTUALENV_ALWAYS_COPY: 1
     """
     if venv_bin is None:
-        venv_bin = __opts__.get("venv_bin") or __pillar__.get("venv_bin")
+        venv_bin = __pillar__.get("venv_bin") or __opts__.get("venv_bin")
 
-    cmd = [venv_bin]
+    # The "venv" magic value and an interpreter passed as venv_bin both
+    # select the python standard library venv module; any other value
+    # containing "venv" (e.g. the historical pyvenv script) is run as-is
+    # but treated as venv for option handling.
+    venv_via_interpreter = venv_bin == "venv" or _is_python_binary(venv_bin)
 
-    if "pyvenv" not in venv_bin:
-        # ----- Stop the user if pyvenv only options are used --------------->
+    if venv_bin == "venv":
+        interpreter = sys.executable
+        if python is not None and python.strip() != "":
+            if not salt.utils.path.which(python):
+                raise CommandExecutionError(f"Cannot find requested python ({python}).")
+            interpreter = python
+        cmd = [interpreter, "-m", "venv"]
+    elif _is_python_binary(venv_bin):
+        if python is not None and python.strip() != "":
+            raise CommandExecutionError(
+                "Pass the target interpreter either as `venv_bin` or as "
+                "`python`, not both."
+            )
+        if not salt.utils.path.which(venv_bin):
+            raise CommandExecutionError(f"Cannot find requested python ({venv_bin}).")
+        cmd = [venv_bin, "-m", "venv"]
+    else:
+        cmd = [venv_bin]
+
+    if not venv_via_interpreter and "venv" not in venv_bin:
+        # ----- Stop the user if venv only options are used ----------------->
         # If any of the following values are not None, it means that the user
         # is actually passing a True or False value. Stop Him!
         if upgrade is not None:
             raise CommandExecutionError(
-                "The `upgrade`(`--upgrade`) option is not supported "
-                "by '{0}'".format(venv_bin)
+                "The `upgrade`(`--upgrade`) option is not supported by '{}'".format(
+                    venv_bin
+                )
             )
         elif symlinks is not None:
             raise CommandExecutionError(
-                "The `symlinks`(`--symlinks`) option is not supported "
-                "by '{0}'".format(venv_bin)
+                "The `symlinks`(`--symlinks`) option is not supported by '{}'".format(
+                    venv_bin
+                )
             )
-        # <---- Stop the user if pyvenv only options are used ----------------
+        # <---- Stop the user if venv only options are used ------------------
 
         virtualenv_version_info = virtualenv_ver(venv_bin, user=user, **kwargs)
 
@@ -215,53 +272,49 @@ def create(
 
         if python is not None and python.strip() != "":
             if not salt.utils.path.which(python):
-                raise CommandExecutionError(
-                    "Cannot find requested python ({0}).".format(python)
-                )
-            cmd.append("--python={0}".format(python))
+                raise CommandExecutionError(f"Cannot find requested python ({python}).")
+            cmd.append(f"--python={python}")
         if extra_search_dir is not None:
-            if (
-                isinstance(extra_search_dir, string_types)
-                and extra_search_dir.strip() != ""
-            ):
+            if isinstance(extra_search_dir, str) and extra_search_dir.strip() != "":
                 extra_search_dir = [e.strip() for e in extra_search_dir.split(",")]
             for entry in extra_search_dir:
-                cmd.append("--extra-search-dir={0}".format(entry))
+                cmd.append(f"--extra-search-dir={entry}")
         if never_download is True:
             if (1, 10) <= virtualenv_version_info < (14, 0, 0):
                 log.info(
-                    "--never-download was deprecated in 1.10.0, but reimplemented in 14.0.0. "
-                    "If this feature is needed, please install a supported virtualenv version."
+                    "--never-download was deprecated in 1.10.0, but reimplemented in"
+                    " 14.0.0. If this feature is needed, please install a supported"
+                    " virtualenv version."
                 )
             else:
                 cmd.append("--never-download")
+        elif never_download is False and virtualenv_version_info >= (20, 0):
+            cmd.append("--download")
         if prompt is not None and prompt.strip() != "":
-            cmd.append("--prompt='{0}'".format(prompt))
+            cmd.append(f"--prompt='{prompt}'")
     else:
         # venv module from the Python >= 3.3 standard library
 
         # ----- Stop the user if virtualenv only options are being used ----->
         # If any of the following values are not None, it means that the user
         # is actually passing a True or False value. Stop Him!
-        if python is not None and python.strip() != "":
+        if not venv_via_interpreter and python is not None and python.strip() != "":
             raise CommandExecutionError(
-                "The `python`(`--python`) option is not supported "
-                "by '{0}'".format(venv_bin)
+                "The `python`(`--python`) option is not supported by '{}'".format(
+                    venv_bin
+                )
             )
-        elif extra_search_dir is not None and extra_search_dir.strip() != "":
+        elif extra_search_dir is not None and (
+            not isinstance(extra_search_dir, str) or extra_search_dir.strip() != ""
+        ):
             raise CommandExecutionError(
                 "The `extra_search_dir`(`--extra-search-dir`) option is not "
-                "supported by '{0}'".format(venv_bin)
+                "supported by '{}'".format(venv_bin)
             )
         elif never_download is not None:
             raise CommandExecutionError(
                 "The `never_download`(`--never-download`) option is not "
-                "supported by '{0}'".format(venv_bin)
-            )
-        elif prompt is not None and prompt.strip() != "":
-            raise CommandExecutionError(
-                "The `prompt`(`--prompt`) option is not supported "
-                "by '{0}'".format(venv_bin)
+                "supported by '{}'".format(venv_bin)
             )
         # <---- Stop the user if virtualenv only options are being used ------
 
@@ -269,8 +322,11 @@ def create(
             cmd.append("--upgrade")
         if symlinks is True:
             cmd.append("--symlinks")
+        if prompt is not None and prompt.strip() != "":
+            # venv has supported --prompt since Python 3.6
+            cmd.extend(["--prompt", prompt])
 
-    # Common options to virtualenv and pyvenv
+    # Common options to virtualenv and venv
     if clear is True:
         cmd.append("--clear")
     if system_site_packages is True:
@@ -280,9 +336,15 @@ def create(
     cmd.append(path)
 
     # Let's create the virtualenv
+    path_preexisting = os.path.exists(path)
     ret = __salt__["cmd.run_all"](cmd, runas=user, python_shell=False, **kwargs)
     if ret["retcode"] != 0:
-        # Something went wrong. Let's bail out now!
+        # Something went wrong. Remove a partially created environment so a
+        # later run (or the virtualenv.managed state, which keys existence
+        # off bin/python) does not mistake it for a working one, then bail.
+        if not path_preexisting and os.path.isdir(path):
+            log.debug("Removing partially created virtualenv %s", path)
+            shutil.rmtree(path, ignore_errors=True)
         return ret
 
     # Check if distribute and pip are already installed
@@ -295,10 +357,19 @@ def create(
         venv_pip = os.path.join(path, "bin", "pip")
         venv_setuptools = os.path.join(path, "bin", "easy_install")
 
+    # ensurepip already provides pip in venv-module environments, and the
+    # easy_install/ez_setup bootstrap is long obsolete, so skip it there;
+    # the get-pip step below is skipped through os.path.exists(venv_pip).
+    use_venv_module = venv_via_interpreter or "venv" in venv_bin
+
     # Install setuptools
-    if (pip or distribute) and not os.path.exists(venv_setuptools):
+    if (
+        (pip or distribute)
+        and not use_venv_module
+        and not os.path.exists(venv_setuptools)
+    ):
         _install_script(
-            "https://bitbucket.org/pypa/setuptools/raw/default/ez_setup.py",
+            "https://bootstrap.pypa.io/ez_setup.py",
             path,
             venv_python,
             user,
@@ -328,8 +399,8 @@ def create(
         # installation
         ret.update(
             retcode=_ret["retcode"],
-            stdout="{0}\n{1}".format(ret["stdout"], _ret["stdout"]).strip(),
-            stderr="{0}\n{1}".format(ret["stderr"], _ret["stderr"]).strip(),
+            stdout="{}\n{}".format(ret["stdout"], _ret["stdout"]).strip(),
+            stderr="{}\n{}".format(ret["stderr"], _ret["stderr"]).strip(),
         )
 
     return ret
@@ -350,9 +421,10 @@ def get_site_packages(venv):
     """
     bin_path = _verify_virtualenv(venv)
 
+    # note: platlib and purelib could differ
     ret = __salt__["cmd.exec_code_all"](
         bin_path,
-        "from distutils import sysconfig; " "print(sysconfig.get_python_lib())",
+        'import sysconfig; print(sysconfig.get_path("purelib"))',
     )
 
     if ret["retcode"] != 0:
@@ -382,11 +454,23 @@ def get_distribution_path(venv, distribution):
     _verify_safe_py_code(distribution)
     bin_path = _verify_virtualenv(venv)
 
-    ret = __salt__["cmd.exec_code_all"](
-        bin_path,
-        "import pkg_resources; "
-        "print(pkg_resources.get_distribution('{0}').location)".format(distribution),
-    )
+    # pkg_resources still references pkgutil.ImpImporter, removed in Python 3.12.
+    # Tests that need the site-packages root (e.g. to remove the pip package dir)
+    # can use purelib, which matches typical wheel layouts for the pip package.
+    dist_repr = repr(distribution)
+    code = f"""import sys
+if sys.version_info >= (3, 12):
+    import importlib.metadata as _im
+    import sysconfig
+
+    _im.distribution({dist_repr})
+    print(sysconfig.get_path("purelib"))
+else:
+    import pkg_resources
+
+    print(pkg_resources.get_distribution({dist_repr}).location)
+"""
+    ret = __salt__["cmd.exec_code_all"](bin_path, code)
 
     if ret["retcode"] != 0:
         raise CommandExecutionError("{stdout}\n{stderr}".format(**ret))
@@ -425,9 +509,7 @@ def get_resource_path(venv, package=None, resource=None):
     ret = __salt__["cmd.exec_code_all"](
         bin_path,
         "import pkg_resources; "
-        "print(pkg_resources.resource_filename('{0}', '{1}'))".format(
-            package, resource
-        ),
+        "print(pkg_resources.resource_filename('{}', '{}'))".format(package, resource),
     )
 
     if ret["retcode"] != 0:
@@ -466,8 +548,9 @@ def get_resource_content(venv, package=None, resource=None):
 
     ret = __salt__["cmd.exec_code_all"](
         bin_path,
-        "import pkg_resources; "
-        "print(pkg_resources.resource_string('{0}', '{1}'))".format(package, resource),
+        "import pkg_resources; print(pkg_resources.resource_string('{}', '{}'))".format(
+            package, resource
+        ),
     )
 
     if ret["retcode"] != 0:
@@ -503,17 +586,17 @@ def _install_script(source, cwd, python, user, saltenv="base", use_vt=False):
 def _verify_safe_py_code(*args):
     for arg in args:
         if not salt.utils.verify.safe_py_code(arg):
-            raise SaltInvocationError(
-                "Unsafe python code detected in '{0}'".format(arg)
-            )
+            raise SaltInvocationError(f"Unsafe python code detected in '{arg}'")
 
 
 def _verify_virtualenv(venv_path):
-    bin_path = os.path.join(venv_path, "bin/python")
+    if salt.utils.platform.is_windows():
+        bin_path = os.path.join(venv_path, "Scripts", "python.exe")
+    else:
+        bin_path = os.path.join(venv_path, "bin", "python")
+
     if not os.path.exists(bin_path):
         raise CommandExecutionError(
-            "Path '{0}' does not appear to be a virtualenv: bin/python not found.".format(
-                venv_path
-            )
+            f"Path '{venv_path}' does not appear to be a virtualenv: '{bin_path}' not found."
         )
     return bin_path

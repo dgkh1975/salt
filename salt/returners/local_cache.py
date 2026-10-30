@@ -1,34 +1,26 @@
-# -*- coding: utf-8 -*-
 """
 Return data to local job cache
 
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
 import bisect
-
-# Import python libs
 import errno
 import glob
 import logging
 import os
+import pathlib
 import shutil
 import time
 
 import salt.exceptions
-
-# Import salt libs
 import salt.payload
 import salt.utils.atomicfile
 import salt.utils.files
 import salt.utils.jid
+import salt.utils.job
 import salt.utils.minions
 import salt.utils.msgpack
 import salt.utils.stringutils
-
-# Import 3rd-party libs
-from salt.ext import six
-from salt.ext.six.moves import range  # pylint: disable=import-error,redefined-builtin
 
 log = logging.getLogger(__name__)
 
@@ -55,11 +47,88 @@ def _job_dir():
     return os.path.join(__opts__["cachedir"], "jobs")
 
 
+def _log_duplicate_return(hn_dir, load):
+    """
+    Helper for :func:`returner`.
+
+    The per-minion return directory for this jid already exists.  Read
+    the cached return and compare it with the incoming one to decide
+    how loud the log line should be:
+
+    * identical payload -> ``debug`` (benign retry-after-timeout, or a
+      syndic forwarding the same return twice).
+    * differing payload -> ``warning`` (something genuinely odd; could
+      be two minions sharing an id, a misconfiguration, or in rare
+      cases an actual replay).  We name what differs but no longer
+      lead with "this could be a replay attack" because in practice
+      that wording sends operators down the wrong path.
+    * cached return unreadable (partial write, missing file) ->
+      ``warning`` with a clear "could not verify" message.
+    """
+    new_record = {
+        key: load[key] for key in ("return", "retcode", "success") if key in load
+    }
+    if "out" in load:
+        new_record["out"] = load["out"]
+    cached_record_path = os.path.join(hn_dir, RETURN_P)
+    cached = None
+    cached_out_path = os.path.join(hn_dir, OUT_P)
+    try:
+        with salt.utils.files.fopen(cached_record_path, "rb") as rfh:
+            cached = salt.payload.load(rfh)
+        if "out" in load and os.path.isfile(cached_out_path):
+            with salt.utils.files.fopen(cached_out_path, "rb") as rfh:
+                cached_out = salt.payload.load(rfh)
+            if isinstance(cached, dict):
+                cached.setdefault("out", cached_out)
+    except OSError as exc:
+        log.warning(
+            "Duplicate return from minion %s for jid %s; cached return "
+            "could not be read for comparison (%s).",
+            load["id"],
+            load["jid"],
+            exc,
+        )
+        return
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "Duplicate return from minion %s for jid %s; cached return "
+            "could not be deserialized for comparison (%s).",
+            load["id"],
+            load["jid"],
+            exc,
+        )
+        return
+
+    if cached == new_record:
+        log.debug(
+            "Duplicate return from minion %s for jid %s; payload matches "
+            "the cached return, ignoring (likely a retry after a master "
+            "timeout or a syndic re-forward).",
+            load["id"],
+            load["jid"],
+        )
+        return
+
+    log.warning(
+        "Duplicate return from minion %s for jid %s with a *differing* "
+        "payload; ignoring the second return. This may indicate two "
+        "minions sharing the same id, a misconfigured returner, or in "
+        "rare cases a replay attempt. Cached retcode=%r success=%r; new "
+        "retcode=%r success=%r.",
+        load["id"],
+        load["jid"],
+        cached.get("retcode") if isinstance(cached, dict) else None,
+        cached.get("success") if isinstance(cached, dict) else None,
+        new_record.get("retcode"),
+        new_record.get("success"),
+    )
+
+
 def _walk_through(job_dir):
     """
     Walk though the jid dir and look for jobs
     """
-    serial = salt.payload.Serial(__opts__)
 
     for top in os.listdir(job_dir):
         t_path = os.path.join(job_dir, top)
@@ -75,7 +144,7 @@ def _walk_through(job_dir):
 
             with salt.utils.files.fopen(load_path, "rb") as rfh:
                 try:
-                    job = serial.load(rfh)
+                    job = salt.payload.load(rfh)
                 except Exception:  # pylint: disable=broad-except
                     log.exception("Failed to deserialize %s", load_path)
                     continue
@@ -99,7 +168,7 @@ def prep_jid(nocache=False, passed_jid=None, recurse_count=0):
     So do what you have to do to make sure that stays the case
     """
     if recurse_count >= 5:
-        err = "prep_jid could not store a jid after {0} tries.".format(recurse_count)
+        err = f"prep_jid could not store a jid after {recurse_count} tries."
         log.error(err)
         raise salt.exceptions.SaltCacheError(err)
     if passed_jid is None:  # this can be a None or an empty string.
@@ -125,7 +194,7 @@ def prep_jid(nocache=False, passed_jid=None, recurse_count=0):
         if nocache:
             with salt.utils.files.fopen(os.path.join(jid_dir, "nocache"), "wb+"):
                 pass
-    except IOError:
+    except OSError:
         log.warning("Could not write out jid file for job %s. Retrying.", jid)
         time.sleep(0.1)
         return prep_jid(
@@ -139,7 +208,6 @@ def returner(load):
     """
     Return data to the local job cache
     """
-    serial = salt.payload.Serial(__opts__)
 
     # if a minion is returning a standalone job, get a jobid
     if load["jid"] == "req":
@@ -155,12 +223,20 @@ def returner(load):
         os.makedirs(hn_dir)
     except OSError as err:
         if err.errno == errno.EEXIST:
-            # Minion has already returned this jid and it should be dropped
-            log.error(
-                "An extra return was detected from minion %s, please verify "
-                "the minion, this could be a replay attack",
-                load["id"],
-            )
+            # The minion's per-jid return directory already exists.  In the
+            # overwhelming majority of cases this is *not* a replay attack;
+            # it is a benign duplicate return caused by:
+            #
+            #   * the minion retrying the return after a transient master
+            #     timeout (``return_retry_tries`` defaults to 3), or
+            #   * multiple syndic masters forwarding the same return to a
+            #     master-of-masters, or
+            #   * another race where ``_return`` runs more than once for
+            #     the same ``(jid, minion_id)``.
+            #
+            # Compare the incoming return to the cached one and log
+            # accordingly so operators are not misled.  See #65301.
+            _log_duplicate_return(hn_dir, load)
             return False
         elif err.errno == errno.ENOENT:
             log.error(
@@ -171,17 +247,15 @@ def returner(load):
             return False
         raise
 
-    serial.dump(
-        dict(
-            (key, load[key]) for key in ["return", "retcode", "success"] if key in load
-        ),
+    salt.payload.dump(
+        {key: load[key] for key in ["return", "retcode", "success"] if key in load},
         # Use atomic open here to avoid the file being read before it's
         # completely written to. Refs #1935
         salt.utils.atomicfile.atomic_open(os.path.join(hn_dir, RETURN_P), "w+b"),
     )
 
     if "out" in load:
-        serial.dump(
+        salt.payload.dump(
             load["out"],
             # Use atomic open here to avoid the file being read before
             # it's completely written to. Refs #1935
@@ -198,15 +272,13 @@ def save_load(jid, clear_load, minions=None, recurse_count=0):
     as for salt-ssh)
     """
     if recurse_count >= 5:
-        err = "save_load could not write job cache file after {0} retries.".format(
+        err = "save_load could not write job cache file after {} retries.".format(
             recurse_count
         )
         log.error(err)
         raise salt.exceptions.SaltCacheError(err)
 
     jid_dir = salt.utils.jid.jid_dir(jid, _job_dir(), __opts__["hash_type"])
-
-    serial = salt.payload.Serial(__opts__)
 
     # Save the invocation information
     try:
@@ -220,9 +292,12 @@ def save_load(jid, clear_load, minions=None, recurse_count=0):
         else:
             raise
     try:
-        with salt.utils.files.fopen(os.path.join(jid_dir, LOAD_P), "w+b") as wfh:
-            serial.dump(clear_load, wfh)
-    except IOError as exc:
+        # When multiple Salt Syndic masters return, a race condition can occur when writing to this same file.
+        with salt.utils.atomicfile.atomic_open(
+            os.path.join(jid_dir, LOAD_P), "w+b"
+        ) as wfh:
+            salt.payload.dump(clear_load, wfh)
+    except OSError as exc:
         log.warning("Could not write job invocation cache file: %s", exc)
         time.sleep(0.1)
         return save_load(
@@ -246,16 +321,17 @@ def save_minions(jid, minions, syndic_id=None):
     """
     Save/update the serialized list of minions for a given job
     """
+    import salt.utils.verify
+
     # Ensure we have a list for Python 3 compatibility
     minions = list(minions)
 
     log.debug(
         "Adding minions for job %s%s: %s",
         jid,
-        " from syndic master '{0}'".format(syndic_id) if syndic_id else "",
+        f" from syndic master '{syndic_id}'" if syndic_id else "",
         minions,
     )
-    serial = salt.payload.Serial(__opts__)
 
     jid_dir = salt.utils.jid.jid_dir(jid, _job_dir(), __opts__["hash_type"])
 
@@ -270,10 +346,20 @@ def save_minions(jid, minions, syndic_id=None):
         else:
             raise
 
-    if syndic_id is not None:
-        minions_path = os.path.join(jid_dir, SYNDIC_MINIONS_P.format(syndic_id))
-    else:
-        minions_path = os.path.join(jid_dir, MINIONS_P)
+    try:
+        if syndic_id is not None:
+            name = SYNDIC_MINIONS_P.format(syndic_id)
+        else:
+            name = MINIONS_P
+        minions_path = salt.utils.verify.clean_join(jid_dir, name)
+        target_name = pathlib.Path(minions_path).resolve().name
+        if name != target_name:
+            raise salt.exceptions.SaltValidationError(
+                f"Filenames do not match: {name} != {target_name}"
+            )
+    except salt.exceptions.SaltValidationError as exc:
+        log.error("Error %s", exc)
+        return
 
     try:
         if not os.path.exists(jid_dir):
@@ -281,9 +367,27 @@ def save_minions(jid, minions, syndic_id=None):
                 os.makedirs(jid_dir)
             except OSError:
                 pass
-        with salt.utils.files.fopen(minions_path, "w+b") as wfh:
-            serial.dump(minions, wfh)
-    except IOError as exc:
+
+        # Merge with any existing minion list (e.g. from prior batch
+        # iterations sharing the same JID, or syndic masters).
+        existing_minions = set()
+        if os.path.isfile(minions_path):
+            try:
+                with salt.utils.files.fopen(minions_path, "rb") as rfh:
+                    existing_data = salt.payload.load(rfh)
+                    if existing_data is not None:
+                        try:
+                            existing_minions.update(existing_data)
+                        except (TypeError, ValueError):
+                            pass
+            except (OSError, salt.exceptions.SaltDeserializationError):
+                pass
+
+        merged_minions = sorted(existing_minions.union(minions))
+
+        with salt.utils.atomicfile.atomic_open(minions_path, "w+b") as wfh:
+            salt.payload.dump(merged_minions, wfh)
+    except OSError as exc:
         log.error(
             "Failed to write minion list %s to job cache file %s: %s",
             minions,
@@ -300,21 +404,23 @@ def get_load(jid):
     load_fn = os.path.join(jid_dir, LOAD_P)
     if not os.path.exists(jid_dir) or not os.path.exists(load_fn):
         return {}
-    serial = salt.payload.Serial(__opts__)
     ret = {}
     load_p = os.path.join(jid_dir, LOAD_P)
     num_tries = 5
+    exc = None
     for index in range(1, num_tries + 1):
         with salt.utils.files.fopen(load_p, "rb") as rfh:
             try:
-                ret = serial.load(rfh)
+                ret = salt.payload.load(rfh)
                 break
-            except Exception as exc:  # pylint: disable=broad-except
-                if index == num_tries:
+            except Exception as e:  # pylint: disable=broad-except
+                exc = e
+                if index < num_tries:
                     time.sleep(0.25)
     else:
         log.critical("Failed to unpack %s", load_p)
-        raise exc
+        if exc is not None:
+            raise exc
     if ret is None:
         ret = {}
     minions_cache = [os.path.join(jid_dir, MINIONS_P)]
@@ -324,8 +430,16 @@ def get_load(jid):
         log.debug("Reading minion list from %s", minions_path)
         try:
             with salt.utils.files.fopen(minions_path, "rb") as rfh:
-                all_minions.update(serial.load(rfh))
-        except IOError as exc:
+                minions_data = salt.payload.load(rfh)
+                if minions_data is not None:
+                    try:
+                        all_minions.update(minions_data)
+                    except (TypeError, ValueError) as e:
+                        log.warning(
+                            "Job cache file %s contains invalid minion data, skipping.",
+                            minions_path,
+                        )
+        except OSError as exc:
             salt.utils.files.process_read_exception(exc, minions_path)
 
     if all_minions:
@@ -339,7 +453,6 @@ def get_jid(jid):
     Return the information returned when the specified job id was executed
     """
     jid_dir = salt.utils.jid.jid_dir(jid, _job_dir(), __opts__["hash_type"])
-    serial = salt.payload.Serial(__opts__)
 
     ret = {}
     # Check to see if the jid is real, if not return the empty dict
@@ -356,7 +469,7 @@ def get_jid(jid):
             while fn_ not in ret:
                 try:
                     with salt.utils.files.fopen(retp, "rb") as rfh:
-                        ret_data = serial.load(rfh)
+                        ret_data = salt.payload.load(rfh)
                     if not isinstance(ret_data, dict) or "return" not in ret_data:
                         # Convert the old format in which return.p contains the only return data to
                         # the new that is dict containing 'return' and optionally 'retcode' and
@@ -365,9 +478,9 @@ def get_jid(jid):
                     ret[fn_] = ret_data
                     if os.path.isfile(outp):
                         with salt.utils.files.fopen(outp, "rb") as rfh:
-                            ret[fn_]["out"] = serial.load(rfh)
+                            ret[fn_]["out"] = salt.payload.load(rfh)
                 except Exception as exc:  # pylint: disable=broad-except
-                    if "Permission denied:" in six.text_type(exc):
+                    if "Permission denied:" in str(exc):
                         raise
     return ret
 
@@ -411,11 +524,26 @@ def get_jids_filter(count, filter_find_job=True):
     return ret
 
 
+def _remove_job_dir(job_path):
+    """
+    Try to remove job dir. In rare cases NotADirectoryError can raise because node corruption.
+    :param job_path: Path to job
+    """
+    # Remove job dir
+    try:
+        shutil.rmtree(job_path)
+    except (NotADirectoryError, OSError) as err:
+        log.error("Unable to remove %s: %s", job_path, err)
+        return False
+    return True
+
+
 def clean_old_jobs():
     """
     Clean out the old jobs from the job cache
     """
-    if __opts__["keep_jobs"] != 0:
+    keep_jobs_seconds = salt.utils.job.get_keep_jobs_seconds(__opts__)
+    if keep_jobs_seconds != 0:
         jid_root = _job_dir()
 
         if not os.path.exists(jid_root):
@@ -442,18 +570,22 @@ def clean_old_jobs():
                 if not os.path.isfile(jid_file) and os.path.exists(f_path):
                     # No jid file means corrupted cache entry, scrub it
                     # by removing the entire f_path directory
-                    shutil.rmtree(f_path)
+                    _remove_job_dir(f_path)
                 elif os.path.isfile(jid_file):
-                    jid_ctime = os.stat(jid_file).st_ctime
-                    hours_difference = (time.time() - jid_ctime) / 3600.0
-                    if hours_difference > __opts__["keep_jobs"] and os.path.exists(
+                    # Use mtime instead of ctime: a package upgrade's
+                    # `chown -R /var/cache/salt/master` resets ctime on every
+                    # existing jid file, which otherwise makes pre-upgrade
+                    # jobs look freshly created and prevents cleanup until
+                    # keep_jobs_seconds elapses (see #68351). mtime is
+                    # written once when the jid file is created and is
+                    # preserved across chown/chmod.
+                    jid_mtime = os.stat(jid_file).st_mtime
+                    seconds_difference = time.time() - jid_mtime
+                    if seconds_difference > keep_jobs_seconds and os.path.exists(
                         t_path
                     ):
                         # Remove the entire f_path from the original JID dir
-                        try:
-                            shutil.rmtree(f_path)
-                        except OSError as err:
-                            log.error("Unable to remove %s: %s", f_path, err)
+                        _remove_job_dir(f_path)
 
         # Remove empty JID dirs from job cache, if they're old enough.
         # JID dirs may be empty either from a previous cache-clean with the bug
@@ -463,10 +595,11 @@ def clean_old_jobs():
             for t_path in dirs_to_remove:
                 # Checking the time again prevents a possible race condition where
                 # t_path JID dirs were created, but not yet populated by a jid file.
-                t_path_ctime = os.stat(t_path).st_ctime
-                hours_difference = (time.time() - t_path_ctime) / 3600.0
-                if hours_difference > __opts__["keep_jobs"]:
-                    shutil.rmtree(t_path)
+                # Use mtime for the same reason as above (#68351).
+                t_path_mtime = os.stat(t_path).st_mtime
+                seconds_difference = time.time() - t_path_mtime
+                if seconds_difference > keep_jobs_seconds:
+                    _remove_job_dir(t_path)
 
 
 def update_endtime(jid, time):
@@ -481,7 +614,7 @@ def update_endtime(jid, time):
             os.makedirs(jid_dir)
         with salt.utils.files.fopen(os.path.join(jid_dir, ENDTIME), "w") as etfile:
             etfile.write(salt.utils.stringutils.to_str(time))
-    except IOError as exc:
+    except OSError as exc:
         log.warning("Could not write job invocation cache file: %s", exc)
 
 

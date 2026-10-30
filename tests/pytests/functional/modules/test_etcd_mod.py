@@ -1,0 +1,120 @@
+import logging
+import threading
+import time
+
+import pytest
+
+import salt.modules.etcd_mod as etcd_mod
+from salt.utils.etcd_util import get_conn
+from tests.support.pytest.etcd import *  # pylint: disable=wildcard-import,unused-wildcard-import
+
+docker = pytest.importorskip("docker")
+
+log = logging.getLogger(__name__)
+
+pytestmark = [
+    pytest.mark.skip_if_binaries_missing("docker", "dockerd", check_all=False),
+    pytest.mark.slow_test,
+]
+
+
+@pytest.fixture
+def configure_loader_modules(minion_opts):
+    return {
+        etcd_mod: {
+            "__opts__": minion_opts,
+            "__utils__": {
+                "etcd_util.get_conn": get_conn,
+            },
+        },
+    }
+
+
+@pytest.fixture(scope="module")
+def minion_config_overrides(etcd_profile):
+    return etcd_profile
+
+
+@pytest.fixture(scope="module")
+def etcd_client(minion_opts, profile_name):
+    return get_conn(minion_opts, profile=profile_name)
+
+
+@pytest.fixture(scope="module")
+def prefix():
+    return "/salt/util/test"
+
+
+@pytest.fixture(autouse=True)
+def cleanup_prefixed_entries(etcd_client, prefix):
+    """
+    Cleanup after each test to ensure a consistent starting state.
+    """
+    try:
+        assert etcd_client.get(prefix, recurse=True) is None
+        yield
+    finally:
+        etcd_client.delete(prefix, recurse=True)
+
+
+def test_basic_operations(subtests, profile_name, prefix):
+    """
+    Make sure we can do the basics
+    """
+    with subtests.test("There should be no entries at the start with our prefix."):
+        assert etcd_mod.get_(prefix, recurse=True, profile=profile_name) is None
+    with subtests.test("We should be able to set and retrieve simple values"):
+        etcd_mod.set_(f"{prefix}/1", "one", profile=profile_name)
+        assert (
+            etcd_mod.get_(f"{prefix}/1", recurse=False, profile=profile_name) == "one"
+        )
+    with subtests.test("We should be able to update and retrieve those values"):
+        updated = {
+            "1": "not one",
+            "2": {
+                "3": "two-three",
+                "4": "two-four",
+            },
+        }
+        etcd_mod.update(updated, path=prefix, profile=profile_name)
+        assert etcd_mod.get_(prefix, recurse=True, profile=profile_name) == updated
+    with subtests.test("We should be list all top level values at a directory"):
+        expected = {
+            prefix: {
+                f"{prefix}/1": "not one",
+                f"{prefix}/2/": {},
+            },
+        }
+        assert etcd_mod.ls_(path=prefix, profile=profile_name) == expected
+    with subtests.test("We should be able to remove values and get a tree hierarchy"):
+        updated = {
+            "2": {
+                "3": "two-three",
+                "4": "two-four",
+            },
+        }
+        etcd_mod.rm_(f"{prefix}/1", profile=profile_name)
+        assert etcd_mod.tree(path=prefix, profile=profile_name) == updated
+    with subtests.test("updates should be able to be caught by waiting in read"):
+        return_list = []
+
+        def wait_func(return_list):
+            return_list.append(
+                etcd_mod.watch(f"{prefix}/1", timeout=30, profile=profile_name)
+            )
+
+        wait_thread = threading.Thread(target=wait_func, args=(return_list,))
+        wait_thread.start()
+        time.sleep(1)
+        etcd_mod.set_(f"{prefix}/1", "one", profile=profile_name)
+        wait_thread.join()
+        modified = return_list.pop()
+        assert modified["key"] == f"{prefix}/1"
+        assert modified["value"] == "one"
+
+
+# NOTE: The former ``test_with_missing_profile`` validated python-etcd (v2)
+# lazy-connect behavior where a missing profile + bad connection silently
+# returned ``None``. etcd3-py (v3) raises eagerly during client construction,
+# so there is no v3-equivalent contract to assert; the test was removed with
+# the v2 API in 3009.0.

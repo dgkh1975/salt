@@ -21,6 +21,7 @@ node and the local ``salt-master`` daemon.  This gives the Master node control
 over the Minion nodes attached to the ``salt-master`` daemon running on the
 Syndic node.
 
+
 Configuring the Syndic
 ======================
 
@@ -61,6 +62,10 @@ the Syndic just as with a Minion.
 The :conf_master:`order_masters` option configures the Master node to send
 extra information with its publications that is needed by Syndic nodes
 connected directly to it.
+
+.. warning::
+   The syndic process must be run as the same user as the syndic master.
+
 
 .. note::
 
@@ -175,7 +180,7 @@ lists of expected minions before giving up. This value defaults to ``5`` seconds
 The ``syndic_wait`` setting is necessary because the higher-level master does not
 have a way of knowing which minions are below the syndics. The higher-level master
 has its own list of expected minions and the masters below them have their own lists
-as well, so the Salt client does not how long to wait for all returns. The
+as well, so the Salt client does not know how long to wait for all returns. The
 ``syndic_wait`` option allows time for all minions to return to the Salt client.
 
 .. note::
@@ -204,7 +209,34 @@ are below their Syndics, the CLI requires a short wait time in order to allow
 the Syndics to gather responses from their Minions. This value is defined in
 the :conf_master:`syndic_wait` config option and has a default of five seconds.
 
-Syndic config options
+Syndic Modes
+============
+
+The Syndic can operate in two different modes, controlled by the ``syndic_mode`` configuration option:
+
+sync
+----
+This is the default mode. In this mode, the Syndic will synchronize all events, job publish and return events between the
+local master and higher level masters. This provides complete visibility of all events across all masters.
+
+cluster
+-------
+In cluster mode, the Syndic will only synchronize job publish and return events between the local master and higher level masters.
+This mode is more efficient in terms of the amount of events propagated to higher level masters, but provides less visibility since
+not all events are propagated.
+
+.. important::
+
+    When using ``cluster`` mode, you **must** set a unique ``master_id`` in the configuration of both:
+
+    - The syndic master (the lower-level masters)
+    - The higher-level master(s) (the master of masters)
+
+Choose the mode based on your needs:
+- Use ``sync`` mode when you need complete event visibility across your entire Salt infrastructure
+- Use ``cluster`` mode when you want to optimize for performance and only need job-related information synchronized
+
+Syndic Config Options
 =====================
 
 These are the options that can be used to configure a Syndic node.  Note that
@@ -218,6 +250,7 @@ Syndic node.
     - :conf_master:`syndic_log_file`: path to the logfile (absolute or not)
     - :conf_master:`syndic_pidfile`: path to the pidfile (absolute or not)
     - :conf_master:`syndic_wait`: time in seconds to wait on returns from this syndic
+    - :conf_master:`syndic_mode`: The mode in which the syndic operates. Can be either ``sync`` (default) or ``cluster``
 
 Minion Data Cache
 =================

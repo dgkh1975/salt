@@ -12,10 +12,10 @@ Module to manage filesystem snapshots with snapper
 :platform:      Linux
 """
 
-
 import difflib
 import logging
 import os
+import subprocess
 import time
 
 import salt.utils.files
@@ -153,7 +153,7 @@ def list_snapshots(config="root"):
     """
     List available snapshots
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -174,7 +174,7 @@ def get_snapshot(number=0, config="root"):
     """
     Get detailed information about a given snapshot
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -195,7 +195,7 @@ def list_configs():
     """
     List all available configs
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -222,7 +222,7 @@ def set_config(name="root", **kwargs):
     """
     Set configuration values
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -288,7 +288,7 @@ def get_config(name="root"):
     """
     Retrieves all values from a given configuration
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -323,7 +323,7 @@ def create_config(
         Extra Snapper configuration opts dictionary. It will override the values provided
         by the given template (if any).
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -334,7 +334,7 @@ def create_config(
 
     def raise_arg_error(argname):
         raise CommandExecutionError(
-            'You must provide a "{}" for the new configuration'.format(argname)
+            f'You must provide a "{argname}" for the new configuration'
         )
 
     if not name:
@@ -366,7 +366,7 @@ def create_snapshot(
     description=None,
     cleanup_algorithm="number",
     userdata=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Creates an snapshot
@@ -397,7 +397,7 @@ def create_snapshot(
 
     Returns the number of the created snapshot.
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -408,7 +408,7 @@ def create_snapshot(
 
     jid = kwargs.get("__pub_jid")
     if description is None and jid is not None:
-        description = "salt job {}".format(jid)
+        description = f"salt job {jid}"
 
     if jid is not None:
         userdata["salt_jid"] = jid
@@ -433,9 +433,7 @@ def create_snapshot(
                 config, pre_number, description, cleanup_algorithm, userdata
             )
         else:
-            raise CommandExecutionError(
-                "Invalid snapshot type '{}'".format(snapshot_type)
-            )
+            raise CommandExecutionError(f"Invalid snapshot type '{snapshot_type}'")
     except dbus.DBusException as exc:
         raise CommandExecutionError(
             "Error encountered while listing changed files: {}".format(
@@ -455,7 +453,7 @@ def delete_snapshot(snapshots_ids=None, config="root"):
     snapshots_ids
         List of the snapshots IDs to be deleted.
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -509,7 +507,7 @@ def modify_snapshot(
     userdata
         Change the userdata dictionary of the snapshot. (dict)
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -525,9 +523,9 @@ def modify_snapshot(
     try:
         # Updating only the explicitly provided attributes by the user
         updated_opts = {
-            "description": description
-            if description is not None
-            else snapshot["description"],
+            "description": (
+                description if description is not None else snapshot["description"]
+            ),
             "cleanup": cleanup if cleanup is not None else snapshot["cleanup"],
             "userdata": userdata if userdata is not None else snapshot["userdata"],
         }
@@ -556,7 +554,12 @@ def _is_text_file(filename):
     """
     Checks if a file is a text file
     """
-    type_of_file = os.popen("file -bi {}".format(filename), "r").read()
+    type_of_file = subprocess.run(
+        ["file", "-bi", filename],
+        check=False,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout
     return type_of_file.startswith("text")
 
 
@@ -601,7 +604,7 @@ def run(function, *args, **kwargs):
         salt '*' snapper.run file.append args='["/etc/motd", "some text"]'
     """
     config = kwargs.pop("config", "root")
-    description = kwargs.pop("description", "snapper.run[{}]".format(function))
+    description = kwargs.pop("description", f"snapper.run[{function}]")
     cleanup_algorithm = kwargs.pop("cleanup_algorithm", "number")
     userdata = kwargs.pop("userdata", {})
 
@@ -614,11 +617,11 @@ def run(function, *args, **kwargs):
         description=description,
         cleanup_algorithm=cleanup_algorithm,
         userdata=userdata,
-        **kwargs
+        **kwargs,
     )
 
     if function not in __salt__:
-        raise CommandExecutionError('function "{}" does not exist'.format(function))
+        raise CommandExecutionError(f'function "{function}" does not exist')
 
     try:
         ret = __salt__[function](*args, **func_kwargs)
@@ -632,7 +635,7 @@ def run(function, *args, **kwargs):
         description=description,
         cleanup_algorithm=cleanup_algorithm,
         userdata=userdata,
-        **kwargs
+        **kwargs,
     )
     return ret
 
@@ -650,7 +653,7 @@ def status(config="root", num_pre=None, num_post=None):
     num_post
         last snapshot ID to compare. Default is 0 (current state)
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -694,7 +697,7 @@ def changed_files(config="root", num_pre=None, num_post=None):
     num_post
         last snapshot ID to compare. Default is 0 (current state)
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -750,7 +753,7 @@ def undo(config="root", files=None, num_pre=None, num_post=None):
         return ret
     except ValueError as exc:
         raise CommandExecutionError(
-            "Error while processing Snapper response: {}".format(cmdret)
+            f"Error while processing Snapper response: {cmdret}"
         )
 
 
@@ -768,7 +771,7 @@ def _get_jid_snapshots(jid, config="root"):
     post_snapshot = [x for x in jid_snapshots if x["type"] == "post"]
 
     if not pre_snapshot or not post_snapshot:
-        raise CommandExecutionError("Jid '{}' snapshots not found".format(jid))
+        raise CommandExecutionError(f"Jid '{jid}' snapshots not found")
 
     return (pre_snapshot[0]["id"], post_snapshot[0]["id"])
 

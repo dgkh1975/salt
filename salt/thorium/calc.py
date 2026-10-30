@@ -1,15 +1,14 @@
-# -*- coding: utf-8 -*-
 """
-Used to manage the thorium register. The thorium register is where compound
-values are stored and computed, such as averages etc.
+Perform calculations against values stored in the Thorium register.
+
+These states are useful when Thorium should react to trends in recent event
+data instead of reacting to a single event. They are most often paired with
+``reg.list`` so that a rolling window of values can be evaluated.
 
 .. versionadded:: 2016.11.0
 
 :depends: statistics PyPi module
 """
-
-# import python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
 try:
     import statistics
@@ -44,15 +43,17 @@ def calc(name, num, oper, minimum=0, maximum=0, ref=None):
 
     .. code-block:: yaml
 
-        foo:
+        load_samples:
           calc.calc:
-            - name: myregentry
+            - name: load_samples
             - num: 5
             - oper: mean
+            - ref: load
+            - minimum: 4
     """
     ret = {"name": name, "changes": {}, "comment": "", "result": True}
     if name not in __reg__:
-        ret["comment"] = "{0} not found in register".format(name)
+        ret["comment"] = f"{name} not found in register"
         ret["result"] = False
 
     def opadd(vals):
@@ -146,14 +147,19 @@ def mean(name, num, minimum=0, maximum=0, ref=None):
     """
     Calculates the mean of the ``num`` most recent values. Requires a list.
 
+    When the register contains dictionaries from ``reg.list``, use ``ref`` to
+    select the field to evaluate.
+
     USAGE:
 
     .. code-block:: yaml
 
-        foo:
+        load_samples:
           calc.mean:
-            - name: myregentry
+            - name: load_samples
             - num: 5
+            - ref: load
+            - minimum: 4
     """
     return calc(
         name=name, num=num, oper="mean", minimum=minimum, maximum=maximum, ref=ref

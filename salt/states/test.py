@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Test States
 ===========
@@ -63,15 +62,11 @@ pillar or grains do not apply. The following state definition will fail with a m
     {% endif %}
 
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
-# Import Python libs
 import random
 
-# Import Salt libs
 import salt.utils.data
 from salt.exceptions import SaltInvocationError
-from salt.ext import six
 from salt.state import _gen_tag
 
 
@@ -124,7 +119,7 @@ def fail_without_changes(name, **kwargs):  # pylint: disable=unused-argument
     return ret
 
 
-def succeed_with_changes(name, **kwargs):  # pylint: disable=unused-argument
+def succeed_with_changes(name, **kwargs):
     """
     .. versionadded:: 2014.7.0
 
@@ -133,16 +128,25 @@ def succeed_with_changes(name, **kwargs):  # pylint: disable=unused-argument
 
     name
         A unique string to serve as the state's ID
+
+    force_mod_watch : False
+        If ``True``, sets ``force_mod_watch: True`` on the return so the
+        state system invokes ``mod_watch`` even though the normal run
+        already produced changes. Useful for testing the ``watch``
+        requisite opt-in.
     """
     comment = kwargs.get("comment", "Success!")
 
     ret = {"name": name, "changes": {}, "result": True, "comment": comment}
 
     # Following the docs as written here
-    # http://docs.saltstack.com/ref/states/writing.html#return-data
+    # https://docs.saltproject.io/ref/states/writing.html#return-data
     ret["changes"] = {
         "testing": {"old": "Unchanged", "new": "Something pretended to change"}
     }
+
+    if kwargs.get("force_mod_watch"):
+        ret["force_mod_watch"] = True
 
     if __opts__["test"]:
         ret["result"] = None
@@ -166,7 +170,7 @@ def fail_with_changes(name, **kwargs):  # pylint: disable=unused-argument
     ret = {"name": name, "changes": {}, "result": False, "comment": comment}
 
     # Following the docs as written here
-    # http://docs.saltstack.com/ref/states/writing.html#return-data
+    # https://docs.saltproject.io/ref/states/writing.html#return-data
     ret["changes"] = {
         "testing": {"old": "Unchanged", "new": "Something pretended to change"}
     }
@@ -178,7 +182,14 @@ def fail_with_changes(name, **kwargs):  # pylint: disable=unused-argument
     return ret
 
 
-def configurable_test_state(name, changes=True, result=True, comment="", warnings=None):
+def configurable_test_state(
+    name,
+    changes=True,
+    result=True,
+    comment="",
+    warnings=None,
+    allow_test_mode_failure=False,
+):
     """
     .. versionadded:: 2014.7.0
 
@@ -226,6 +237,13 @@ def configurable_test_state(name, changes=True, result=True, comment="", warning
         Default is None
 
         .. versionadded:: 3000
+
+    allow_test_mode_failure
+        When False, running this state in test mode can only return a True
+        or None result. When set to True and result is set to False, the
+        test mode result will be False. Default is False
+
+        .. versionadded:: 3007.0
     """
     ret = {"name": name, "changes": {}, "result": False, "comment": comment}
     change_data = {
@@ -235,16 +253,16 @@ def configurable_test_state(name, changes=True, result=True, comment="", warning
     if changes is True:
         # If changes is True we place our dummy change dictionary into it.
         # Following the docs as written here
-        # http://docs.saltstack.com/ref/states/writing.html#return-data
+        # https://docs.saltproject.io/ref/states/writing.html#return-data
         ret["changes"] = change_data
     elif changes is False:
         # Don't modify changes from the "ret" dict set above
         pass
     else:
-        if six.text_type(changes).lower() == "random":
+        if str(changes).lower() == "random":
             if random.choice((True, False)):
                 # Following the docs as written here
-                # http://docs.saltstack.com/ref/states/writing.html#return-data
+                # https://docs.saltproject.io/ref/states/writing.html#return-data
                 ret["changes"] = change_data
         else:
             err = (
@@ -257,7 +275,7 @@ def configurable_test_state(name, changes=True, result=True, comment="", warning
     if isinstance(result, bool):
         ret["result"] = result
     else:
-        if six.text_type(result).lower() == "random":
+        if str(result).lower() == "random":
             ret["result"] = random.choice((True, False))
         else:
             raise SaltInvocationError(
@@ -269,7 +287,7 @@ def configurable_test_state(name, changes=True, result=True, comment="", warning
 
     if warnings is None:
         pass
-    elif isinstance(warnings, six.string_types):
+    elif isinstance(warnings, str):
         ret["warnings"] = [warnings]
     elif isinstance(warnings, list):
         ret["warnings"] = warnings
@@ -281,7 +299,11 @@ def configurable_test_state(name, changes=True, result=True, comment="", warning
         )
 
     if __opts__["test"]:
-        ret["result"] = True if changes is False else None
+        if allow_test_mode_failure and result is False:
+            test_result = result
+        else:
+            test_result = True if changes is False else None
+        ret["result"] = test_result
         ret["comment"] = "This is a test" if not comment else comment
 
     return ret
@@ -339,7 +361,7 @@ def mod_watch(name, sfun=None, **kwargs):
     """
     has_changes = []
     if "__reqs__" in __low__:
-        for req in __low__["__reqs__"]["watch"]:
+        for req in __low__["__reqs__"].get("watch", []):
             tag = _gen_tag(req)
             if __running__[tag]["changes"]:
                 has_changes.append("{state}: {__id__}".format(**req))
@@ -379,7 +401,7 @@ def _if_str_then_list(listing):
     A str will be turned into a list with the
     str as its only element.
     """
-    if isinstance(listing, six.string_types):
+    if isinstance(listing, str):
         return [salt.utils.stringutils.to_unicode(listing)]
     elif not isinstance(listing, list):
         raise TypeError
@@ -444,7 +466,7 @@ def check_pillar(
     checks[int] = integer
     # those should be str:
     string = _if_str_then_list(string)
-    checks[six.string_types] = string
+    checks[(str,)] = string
     # those should be list:
     listing = _if_str_then_list(listing)
     checks[list] = listing
@@ -465,17 +487,17 @@ def check_pillar(
                 fine[key] = key_type
 
     for key, key_type in failed.items():
-        comment = 'Pillar key "{0}" '.format(key)
+        comment = f'Pillar key "{key}" '
         if key_type is None:
             comment += "is missing.\n"
         else:
-            comment += "is not {0}.\n".format(key_type)
+            comment += f"is not {key_type}.\n"
         ret["comment"] += comment
 
     if verbose and fine:
         comment = "Those keys passed the check:\n"
         for key, key_type in fine.items():
-            comment += "- {0} ({1})\n".format(key, key_type)
+            comment += f"- {key} ({key_type})\n"
         ret["comment"] += comment
 
     return ret

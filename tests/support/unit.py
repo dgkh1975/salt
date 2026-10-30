@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
     :codeauthor: Pedro Algarvio (pedro@algarvio.me)
 
@@ -19,10 +18,11 @@
 
     .. _`unittest2`: https://pypi.python.org/pypi/unittest2
 """
+
 # pylint: disable=unused-import,blacklisted-module,deprecated-method
 
-from __future__ import absolute_import, print_function, unicode_literals
 
+import collections.abc
 import inspect
 import logging
 import os
@@ -36,8 +36,7 @@ from unittest import TextTestResult as _TextTestResult
 from unittest import TextTestRunner as _TextTestRunner
 from unittest import expectedFailure, skip, skipIf
 from unittest.case import SkipTest, _id
-
-from salt.ext import six
+from unittest.util import safe_repr
 
 try:
     import psutil
@@ -73,11 +72,11 @@ class TestSuite(_TestSuite):
             currentClass == previousClass
             or getattr(currentClass, "setUpClass", None) is None
         ):
-            return super(TestSuite, self)._handleClassSetUp(test, result)
+            return super()._handleClassSetUp(test, result)
 
         # Store a reference to all class attributes before running the setUpClass method
         initial_class_attributes = dir(test.__class__)
-        super(TestSuite, self)._handleClassSetUp(test, result)
+        super()._handleClassSetUp(test, result)
         # Store the difference in in a variable in order to check later if they were deleted
         test.__class__._prerun_class_attributes = [
             attr for attr in dir(test.__class__) if attr not in initial_class_attributes
@@ -85,7 +84,7 @@ class TestSuite(_TestSuite):
 
     def _tearDownPreviousClass(self, test, result):
         # Run any tearDownClass code defined
-        super(TestSuite, self)._tearDownPreviousClass(test, result)
+        super()._tearDownPreviousClass(test, result)
         previousClass = getattr(result, "_previousTestClass", None)
         currentClass = test.__class__
         if currentClass == previousClass:
@@ -103,9 +102,7 @@ class TestSuite(_TestSuite):
                         attr_value = getattr(previousClass, attr, None)
                         if attr_value is None:
                             continue
-                        if isinstance(
-                            attr_value, (bool,) + six.string_types + six.integer_types
-                        ):
+                        if isinstance(attr_value, (bool, str, int)):
                             setattr(previousClass, attr, None)
                             continue
                         log.warning(
@@ -154,7 +151,7 @@ class TestSuite(_TestSuite):
                     break
             if skip_klass is True:
                 klass.__unittest_skip__ = True
-        return super(TestSuite, self)._handleModuleFixture(test, result)
+        return super()._handleModuleFixture(test, result)
 
 
 class TestLoader(_TestLoader):
@@ -164,7 +161,6 @@ class TestLoader(_TestLoader):
 
 class TestCase(_TestCase):
 
-    # pylint: disable=expected-an-indented-block-comment,too-many-leading-hastag-for-block-comment
     ##   Commented out because it may be causing tests to hang
     ##   at the end of the run
     #
@@ -184,12 +180,11 @@ class TestCase(_TestCase):
     #            print('\nWARNING: A misbehaving test has modified the working directory!\nThe test suite has reset the working directory '
     #                    'on tearDown() to {0}\n'.format(cls._cwd))
     #            cls._chdir_counter += 1
-    # pylint: enable=expected-an-indented-block-comment,too-many-leading-hastag-for-block-comment
 
     def run(self, result=None):
         self._prerun_instance_attributes = dir(self)
         self.maxDiff = None
-        outcome = super(TestCase, self).run(result=result)
+        outcome = super().run(result=result)
         for attr in dir(self):
             if attr == "_prerun_instance_attributes":
                 continue
@@ -199,9 +194,7 @@ class TestCase(_TestCase):
                 attr_value = getattr(self, attr, None)
                 if attr_value is None:
                     continue
-                if isinstance(
-                    attr_value, (bool,) + six.string_types + six.integer_types
-                ):
+                if isinstance(attr_value, (bool, str, int)):
                     setattr(self, attr, None)
                     continue
                 log.warning(
@@ -218,11 +211,44 @@ class TestCase(_TestCase):
         del self._prerun_instance_attributes
         return outcome
 
+    def assertDictContainsSubset(self, subset, dictionary, msg=None):
+        """
+        ``unittest.TestCase.assertDictContainsSubset`` was removed in Python 3.12;
+        keep the same checks for tests that still rely on it.
+        """
+        if not isinstance(subset, collections.abc.Mapping):
+            self.fail(self._formatMessage(msg, "First argument is not a mapping"))
+        if not isinstance(dictionary, collections.abc.Mapping):
+            self.fail(self._formatMessage(msg, "Second argument is not a mapping"))
+        missing = []
+        mismatched = []
+        for key, value in subset.items():
+            if key not in dictionary:
+                missing.append(key)
+            elif value != dictionary[key]:
+                mismatched.append(
+                    "{}, expected: {}, actual: {}".format(
+                        safe_repr(key),
+                        safe_repr(value),
+                        safe_repr(dictionary[key]),
+                    )
+                )
+        if not (missing or mismatched):
+            return
+        standard_msg = ""
+        if missing:
+            standard_msg = "Missing: {}".format(",".join(safe_repr(m) for m in missing))
+        if mismatched:
+            if standard_msg:
+                standard_msg += "; "
+            standard_msg += "Mismatched values: {}".format(",".join(mismatched))
+        self.fail(self._formatMessage(msg, standard_msg))
+
     def shortDescription(self):
         desc = _TestCase.shortDescription(self)
         if HAS_PSUTIL and SHOW_PROC:
             show_zombie_processes = "SHOW_PROC_ZOMBIES" in os.environ
-            proc_info = "[CPU:{0}%|MEM:{1}%".format(
+            proc_info = "[CPU:{}%|MEM:{}%".format(
                 psutil.cpu_percent(), psutil.virtual_memory().percent
             )
             if show_zombie_processes:
@@ -233,48 +259,11 @@ class TestCase(_TestCase):
                             found_zombies += 1
                 except Exception:  # pylint: disable=broad-except
                     pass
-                proc_info += "|Z:{0}".format(found_zombies)
+                proc_info += f"|Z:{found_zombies}"
             proc_info += "] {short_desc}".format(short_desc=desc if desc else "")
             return proc_info
         else:
             return _TestCase.shortDescription(self)
-
-    def assertEquals(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("assertEquals", "assertEqual")
-        )
-        # return _TestCase.assertEquals(self, *args, **kwargs)
-
-    def assertNotEquals(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("assertNotEquals", "assertNotEqual")
-        )
-        # return _TestCase.assertNotEquals(self, *args, **kwargs)
-
-    def assert_(self, *args, **kwargs):
-        # The unittest2 library uses this deprecated method, we can't raise
-        # the exception.
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("assert_", "assertTrue")
-        )
-        # return _TestCase.assert_(self, *args, **kwargs)
-
-    def assertAlmostEquals(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("assertAlmostEquals", "assertAlmostEqual")
-        )
-        # return _TestCase.assertAlmostEquals(self, *args, **kwargs)
-
-    def assertNotAlmostEquals(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("assertNotAlmostEquals", "assertNotAlmostEqual")
-        )
-        # return _TestCase.assertNotAlmostEquals(self, *args, **kwargs)
 
     def repack_state_returns(self, state_ret):
         """
@@ -287,126 +276,7 @@ class TestCase(_TestCase):
         after running states.
         """
         assert isinstance(state_ret, dict), state_ret
-        return {x.split("_|-")[1]: y for x, y in six.iteritems(state_ret)}
-
-    def failUnlessEqual(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("failUnlessEqual", "assertEqual")
-        )
-        # return _TestCase.failUnlessEqual(self, *args, **kwargs)
-
-    def failIfEqual(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("failIfEqual", "assertNotEqual")
-        )
-        # return _TestCase.failIfEqual(self, *args, **kwargs)
-
-    def failUnless(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("failUnless", "assertTrue")
-        )
-        # return _TestCase.failUnless(self, *args, **kwargs)
-
-    def failIf(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("failIf", "assertFalse")
-        )
-        # return _TestCase.failIf(self, *args, **kwargs)
-
-    def failUnlessRaises(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("failUnlessRaises", "assertRaises")
-        )
-        # return _TestCase.failUnlessRaises(self, *args, **kwargs)
-
-    def failUnlessAlmostEqual(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("failUnlessAlmostEqual", "assertAlmostEqual")
-        )
-        # return _TestCase.failUnlessAlmostEqual(self, *args, **kwargs)
-
-    def failIfAlmostEqual(self, *args, **kwargs):
-        raise DeprecationWarning(
-            "The {0}() function is deprecated. Please start using {1}() "
-            "instead.".format("failIfAlmostEqual", "assertNotAlmostEqual")
-        )
-        # return _TestCase.failIfAlmostEqual(self, *args, **kwargs)
-
-    @staticmethod
-    def assert_called_once(mock):
-        """
-        mock.assert_called_once only exists in PY3 in 3.6 and newer
-        """
-        try:
-            mock.assert_called_once()
-        except AttributeError:
-            log.warning("assert_called_once invoked, but not available")
-
-    if six.PY2:
-
-        def assertRegexpMatches(self, *args, **kwds):
-            raise DeprecationWarning(
-                "The {0}() function will be deprecated in python 3. Please start "
-                "using {1}() instead.".format("assertRegexpMatches", "assertRegex")
-            )
-
-        def assertRegex(
-            self, text, regex, msg=None
-        ):  # pylint: disable=arguments-differ
-            # In python 2, alias to the future python 3 function
-            return _TestCase.assertRegexpMatches(self, text, regex, msg=msg)
-
-        def assertNotRegexpMatches(self, *args, **kwds):
-            raise DeprecationWarning(
-                "The {0}() function will be deprecated in python 3. Please start "
-                "using {1}() instead.".format(
-                    "assertNotRegexpMatches", "assertNotRegex"
-                )
-            )
-
-        def assertNotRegex(
-            self, text, regex, msg=None
-        ):  # pylint: disable=arguments-differ
-            # In python 2, alias to the future python 3 function
-            return _TestCase.assertNotRegexpMatches(self, text, regex, msg=msg)
-
-        def assertRaisesRegexp(self, *args, **kwds):
-            raise DeprecationWarning(
-                "The {0}() function will be deprecated in python 3. Please start "
-                "using {1}() instead.".format("assertRaisesRegexp", "assertRaisesRegex")
-            )
-
-        def assertRaisesRegex(
-            self, exception, regexp, *args, **kwds
-        ):  # pylint: disable=arguments-differ
-            # In python 2, alias to the future python 3 function
-            return _TestCase.assertRaisesRegexp(self, exception, regexp, *args, **kwds)
-
-    else:
-
-        def assertRegexpMatches(self, *args, **kwds):
-            raise DeprecationWarning(
-                "The {0}() function is deprecated. Please start using {1}() "
-                "instead.".format("assertRegexpMatches", "assertRegex")
-            )
-
-        def assertNotRegexpMatches(self, *args, **kwds):
-            raise DeprecationWarning(
-                "The {0}() function is deprecated. Please start using {1}() "
-                "instead.".format("assertNotRegexpMatches", "assertNotRegex")
-            )
-
-        def assertRaisesRegexp(self, *args, **kwds):
-            raise DeprecationWarning(
-                "The {0}() function is deprecated. Please start using {1}() "
-                "instead.".format("assertRaisesRegexp", "assertRaisesRegex")
-            )
+        return {x.split("_|-")[1]: y for x, y in state_ret.items()}
 
 
 class TextTestResult(_TextTestResult):
@@ -415,12 +285,12 @@ class TextTestResult(_TextTestResult):
     """
 
     def startTest(self, test):
-        log.debug(">>>>> START >>>>> {0}".format(test.id()))
-        return super(TextTestResult, self).startTest(test)
+        log.debug(">>>>> START >>>>> %s", test.id())
+        return super().startTest(test)
 
     def stopTest(self, test):
-        log.debug("<<<<< END <<<<<<< {0}".format(test.id()))
-        return super(TextTestResult, self).stopTest(test)
+        log.debug("<<<<< END <<<<<<< %s", test.id())
+        return super().stopTest(test)
 
 
 class TextTestRunner(_TextTestRunner):

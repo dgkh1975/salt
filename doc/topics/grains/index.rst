@@ -125,6 +125,8 @@ For this example to work, you would need to have defined the grain
 Writing Grains
 ==============
 
+.. include:: ../../_incl/grains_passwords.rst
+
 The grains are derived by executing all of the "public" functions (i.e. those
 which do not begin with an underscore) found in the modules located in the
 Salt's core grains code, followed by those in any custom grains modules. The
@@ -138,7 +140,8 @@ file. The default path would be ``/srv/salt/_grains``. Custom grains modules
 will be distributed to the minions when :mod:`state.highstate
 <salt.modules.state.highstate>` is run, or by executing the
 :mod:`saltutil.sync_grains <salt.modules.saltutil.sync_grains>` or
-:mod:`saltutil.sync_all <salt.modules.saltutil.sync_all>` functions.
+:mod:`saltutil.sync_all <salt.modules.saltutil.sync_all>` functions. For best
+practices on naming grains module files, see :ref:`module-naming-best-practices`.
 
 Grains modules are easy to write, and (as noted above) only need to return a
 dictionary. For example:

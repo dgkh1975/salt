@@ -69,6 +69,20 @@ Options
     an explicit number of minions to execute at once, or a percentage of
     minions to execute on.
 
+.. option:: --batch-wait=BATCH_WAIT
+
+   Wait the specified time in seconds after each job is done before
+   freeing the slot in the batch of the next one.
+
+.. option:: --batch-safe-limit=BATCH_SAFE_LIMIT
+
+   Execute the salt job in batch mode if the job would have executed
+   on at least this many minions.
+
+.. option:: --batch-safe-size=BATCH_SAFE_SIZE
+
+   Batch size to use for batch jobs created by --batch-safe-limit.
+
 .. option:: -a EAUTH, --auth=EAUTH
 
     Pass in an external authentication medium to validate against. The
@@ -90,7 +104,7 @@ Options
     The options are `carbon`, `cassandra`, `couchbase`, `couchdb`,
     `elasticsearch`, `etcd`, `hipchat`, `local`, `local_cache`,
     `memcache`, `mongo`, `mysql`, `odbc`, `postgres`, `redis`,
-    `sentry`, `slack`, `sms`, `smtp`, `sqlite3`, `syslog`, and `xmpp`.
+    `sentry`, `sms`, `smtp`, `sqlite3`, `syslog`, and `xmpp`.
 
 .. option:: -d, --doc, --documentation
 

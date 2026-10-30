@@ -1,27 +1,17 @@
-# -*- coding: utf-8 -*-
 """
 Manage and query NPM packages.
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
-# Import python libs
 import logging
+import shlex
+import tempfile
 
 import salt.modules.cmdmod
-
-# Import salt libs
 import salt.utils.json
 import salt.utils.path
 import salt.utils.user
 from salt.exceptions import CommandExecutionError
-from salt.ext import six
-from salt.utils.versions import LooseVersion as _LooseVersion
-
-try:
-    from shlex import quote as _cmd_quote  # pylint: disable=E0611
-except ImportError:
-    from pipes import quote as _cmd_quote
-
+from salt.utils.versions import Version
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +34,7 @@ def __virtual__():
                 "because the npm binary could not be located",
             )
     except CommandExecutionError as exc:
-        return (False, six.text_type(exc))
+        return (False, str(exc))
 
 
 def _check_valid_version():
@@ -57,14 +47,21 @@ def _check_valid_version():
     npm_path = salt.utils.path.which("npm")
 
     # pylint: disable=no-member
+    # NO_UPDATE_NOTIFIER stops npm from contacting the registry to check for
+    # updates. Since this runs at module-load time from __virtual__, a blocked
+    # registry (e.g. behind a corporate firewall/proxy) would otherwise stall
+    # every salt-call for minutes while npm's update-notifier times out.
     res = salt.modules.cmdmod.run(
-        "{npm} --version".format(npm=npm_path), output_loglevel="quiet"
+        f"{npm_path} --version",
+        output_loglevel="quiet",
+        env={"NO_UPDATE_NOTIFIER": "1"},
     )
-    npm_version, valid_version = _LooseVersion(res), _LooseVersion("1.2")
+    npm_version = Version(res)
+    valid_version = Version("1.2")
     # pylint: enable=no-member
     if npm_version < valid_version:
         raise CommandExecutionError(
-            "'npm' is not recent enough({0} < {1}). Please Upgrade.".format(
+            "'npm' is not recent enough({} < {}). Please Upgrade.".format(
                 npm_version, valid_version
             )
         )
@@ -141,23 +138,26 @@ def install(
     """
     # Protect against injection
     if pkg:
-        pkgs = [_cmd_quote(pkg)]
+        pkgs = [shlex.quote(pkg)]
     elif pkgs:
-        pkgs = [_cmd_quote(v) for v in pkgs]
+        pkgs = [shlex.quote(v) for v in pkgs]
     else:
         pkgs = []
     if registry:
-        registry = _cmd_quote(registry)
+        registry = shlex.quote(registry)
 
     cmd = ["npm", "install", "--json"]
     if silent:
         cmd.append("--silent")
 
     if not dir:
+        cwd = tempfile.gettempdir()
         cmd.append("--global")
+    else:
+        cwd = dir
 
     if registry:
-        cmd.append('--registry="{0}"'.format(registry))
+        cmd.append(f'--registry="{registry}"')
 
     if dry_run:
         cmd.append("--dry-run")
@@ -173,7 +173,7 @@ def install(
 
     cmd = " ".join(cmd)
     result = __salt__["cmd.run_all"](
-        cmd, python_shell=True, cwd=dir, runas=runas, env=env
+        cmd, python_shell=True, cwd=cwd, runas=runas, env=env
     )
 
     if result["retcode"] != 0:
@@ -219,7 +219,7 @@ def uninstall(pkg, dir=None, runas=None, env=None):
     """
     # Protect against injection
     if pkg:
-        pkg = _cmd_quote(pkg)
+        pkg = shlex.quote(pkg)
 
     env = env or {}
 
@@ -228,7 +228,7 @@ def uninstall(pkg, dir=None, runas=None, env=None):
         if uid:
             env.update({"SUDO_UID": uid, "SUDO_USER": ""})
 
-    cmd = ["npm", "uninstall", '"{0}"'.format(pkg)]
+    cmd = ["npm", "uninstall", f'"{pkg}"']
     if not dir:
         cmd.append("--global")
 
@@ -297,14 +297,14 @@ def list_(pkg=None, dir=None, runas=None, env=None, depth=None):
     if depth is not None:
         if not isinstance(depth, (int, float)):
             raise salt.exceptions.SaltInvocationError(
-                "Error: depth {0} must be a number".format(depth)
+                f"Error: depth {depth} must be a number"
             )
-        cmd.append("--depth={0}".format(int(depth)))
+        cmd.append(f"--depth={int(depth)}")
 
     if pkg:
         # Protect against injection
-        pkg = _cmd_quote(pkg)
-        cmd.append('"{0}"'.format(pkg))
+        pkg = shlex.quote(pkg)
+        cmd.append(f'"{pkg}"')
     cmd = " ".join(cmd)
 
     result = __salt__["cmd.run_all"](

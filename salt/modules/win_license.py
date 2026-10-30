@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 This module allows you to manage windows licensing via slmgr.vbs
 
@@ -7,13 +6,9 @@ This module allows you to manage windows licensing via slmgr.vbs
     salt '*' license.install XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
 """
 
-# Import Python Libs
-from __future__ import absolute_import, print_function, unicode_literals
-
 import logging
 import re
 
-# Import Salt Libs
 import salt.utils.platform
 
 log = logging.getLogger(__name__)
@@ -36,6 +31,14 @@ def installed(product_key):
     Note: This is not 100% accurate as we can only see the last
      5 digits of the license.
 
+    Args:
+
+        product_key (str): The product key to check.
+
+    Returns:
+        bool: ``True`` if the last 5 digits match the current product key,
+            otherwise ``False``.
+
     CLI Example:
 
     .. code-block:: bash
@@ -51,13 +54,20 @@ def install(product_key):
     """
     Install the given product key
 
+    Args:
+
+        product_key (str): The product key to install.
+
+    Returns:
+        str: The output of the ``slmgr.vbs`` script
+
     CLI Example:
 
     .. code-block:: bash
 
         salt '*' license.install XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
     """
-    cmd = r"cscript C:\Windows\System32\slmgr.vbs /ipk {0}".format(product_key)
+    cmd = rf"cscript C:\Windows\System32\slmgr.vbs /ipk {product_key}"
     return __salt__["cmd.run"](cmd)
 
 
@@ -119,7 +129,8 @@ def info():
     out = __salt__["cmd.run"](cmd)
 
     match = re.search(
-        r"Name: (.*)\r\nDescription: (.*)\r\nPartial Product Key: (.*)\r\nLicense Status: (.*)",
+        r"Name: (.*)\r\nDescription: (.*)\r\nPartial Product Key: (.*)\r\nLicense"
+        r" Status: (.*)",
         out,
         re.MULTILINE,
     )

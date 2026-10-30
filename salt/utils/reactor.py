@@ -2,7 +2,6 @@
 Functions which implement running reactor jobs
 """
 
-
 import fnmatch
 import glob
 import logging
@@ -19,6 +18,7 @@ import salt.utils.event
 import salt.utils.files
 import salt.utils.master
 import salt.utils.process
+import salt.utils.tracing
 import salt.utils.yaml
 import salt.wheel
 
@@ -48,26 +48,6 @@ class Reactor(salt.utils.process.SignalHandlingProcess, salt.state.Compiler):
         self.minion = salt.minion.MasterMinion(local_minion_opts)
         salt.state.Compiler.__init__(self, opts, self.minion.rend)
         self.is_leader = True
-
-    # We need __setstate__ and __getstate__ to avoid pickling errors since
-    # 'self.rend' (from salt.state.Compiler) contains a function reference
-    # which is not picklable.
-    # These methods are only used when pickling so will not be used on
-    # non-Windows platforms.
-    def __setstate__(self, state):
-        Reactor.__init__(
-            self,
-            state["opts"],
-            log_queue=state["log_queue"],
-            log_queue_level=state["log_queue_level"],
-        )
-
-    def __getstate__(self):
-        return {
-            "opts": self.opts,
-            "log_queue": self.log_queue,
-            "log_queue_level": self.log_queue_level,
-        }
 
     def render_reaction(self, glob_ref, tag, data):
         """
@@ -209,7 +189,16 @@ class Reactor(salt.utils.process.SignalHandlingProcess, salt.state.Compiler):
                         reactors,
                     )
                     return []  # We'll return nothing since there was an error
-                chunks = self.order_chunks(self.compile_high_data(high))
+                chunks, errors = self.compile_high_data(high)
+                if errors:
+                    log.error(
+                        "Unable to render reactions for event %s due to "
+                        "errors (%s) in one or more of the sls files (%s)",
+                        tag,
+                        errors,
+                        reactors,
+                    )
+                    return []  # We'll return nothing since there was an error
         except Exception as exc:  # pylint: disable=broad-except
             log.exception("Exception encountered while compiling reactions")
 
@@ -227,8 +216,7 @@ class Reactor(salt.utils.process.SignalHandlingProcess, salt.state.Compiler):
         """
         Enter into the server loop
         """
-        salt.utils.process.appendproctitle(self.__class__.__name__)
-
+        salt.utils.tracing.configure(self.opts)
         if self.opts["reactor_niceness"] and not salt.utils.platform.is_windows():
             log.info("Reactor setting niceness to %i", self.opts["reactor_niceness"])
             os.nice(self.opts["reactor_niceness"])
@@ -237,7 +225,6 @@ class Reactor(salt.utils.process.SignalHandlingProcess, salt.state.Compiler):
         with salt.utils.event.get_event(
             self.opts["__role"],
             self.opts["sock_dir"],
-            self.opts["transport"],
             opts=self.opts,
             listen=True,
         ) as event:
@@ -254,7 +241,8 @@ class Reactor(salt.utils.process.SignalHandlingProcess, salt.state.Compiler):
                     master_key = salt.utils.master.get_master_key("root", self.opts)
                     if data["data"].get("key") != master_key:
                         log.error(
-                            "received salt/reactors/manage event without matching master_key. discarding"
+                            "received salt/reactors/manage event without matching"
+                            " master_key. discarding"
                         )
                         continue
                 if data["tag"].endswith("salt/reactors/manage/is_leader"):
@@ -297,10 +285,20 @@ class Reactor(salt.utils.process.SignalHandlingProcess, salt.state.Compiler):
                             continue
                         chunks = self.reactions(data["tag"], data["data"], reactors)
                         if chunks:
-                            try:
-                                self.call_reactions(chunks)
-                            except SystemExit:
-                                log.warning("Exit ignored by reactor")
+                            trace_ctx = salt.utils.tracing.extract(data.get("data", {}))
+                            with salt.utils.tracing.start_span(
+                                f"salt.reactor.{data['tag']}",
+                                kind=salt.utils.tracing.SpanKind.CONSUMER,
+                                attributes={
+                                    "salt.reactor.tag": data["tag"],
+                                    "salt.reactor.chunks": len(chunks),
+                                },
+                                context=trace_ctx,
+                            ):
+                                try:
+                                    self.call_reactions(chunks)
+                                except SystemExit:
+                                    log.warning("Exit ignored by reactor")
 
 
 class ReactWrap:
@@ -336,6 +334,7 @@ class ReactWrap:
         Populate the client cache with an instance of the specified type
         """
         reaction_type = low["state"]
+        # pylint: disable=unsupported-membership-test,unsupported-assignment-operation
         if reaction_type not in self.client_cache:
             log.debug("Reactor is populating %s client cache", reaction_type)
             if reaction_type in ("runner", "wheel"):
@@ -357,6 +356,7 @@ class ReactWrap:
                 self.client_cache[reaction_type] = self.reaction_class[reaction_type](
                     self.opts["conf_file"]
                 )
+        # pylint: enable=unsupported-membership-test,unsupported-assignment-operation
 
     def run(self, low):
         """
@@ -485,22 +485,42 @@ class ReactWrap:
         """
         Wrap RunnerClient for executing :ref:`runner modules <all-salt.runners>`
         """
+        # pylint: disable=unsupported-membership-test,unsupported-assignment-operation
+        if "runner" not in self.client_cache:
+            log.debug("reactor edge case: re-populating client_cache for runner")
+            low = {"state": "runner"}
+            self.populate_client_cache(low)
         return self.pool.fire_async(self.client_cache["runner"].low, args=(fun, kwargs))
 
     def wheel(self, fun, **kwargs):
         """
         Wrap Wheel to enable executing :ref:`wheel modules <all-salt.wheel>`
         """
+        # pylint: disable=unsupported-membership-test,unsupported-assignment-operation
+        if "wheel" not in self.client_cache:
+            log.debug("reactor edge case: re-populating client_cache for wheel")
+            low = {"state": "wheel"}
+            self.populate_client_cache(low)
         return self.pool.fire_async(self.client_cache["wheel"].low, args=(fun, kwargs))
 
     def local(self, fun, tgt, **kwargs):
         """
         Wrap LocalClient for running :ref:`execution modules <all-salt.modules>`
         """
+        # pylint: disable=unsupported-membership-test,unsupported-assignment-operation
+        if "local" not in self.client_cache:
+            log.debug("reactor edge case: re-populating client_cache for local")
+            low = {"state": "local"}
+            self.populate_client_cache(low)
         self.client_cache["local"].cmd_async(tgt, fun, **kwargs)
 
     def caller(self, fun, **kwargs):
         """
         Wrap LocalCaller to execute remote exec functions locally on the Minion
         """
+        # pylint: disable=unsupported-membership-test,unsupported-assignment-operation
+        if "caller" not in self.client_cache:
+            log.debug("reactor edge case: re-populating client_cache for caller")
+            low = {"state": "caller"}
+            self.populate_client_cache(low)
         self.client_cache["caller"].cmd(fun, *kwargs["arg"], **kwargs["kwarg"])

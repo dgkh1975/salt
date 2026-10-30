@@ -63,6 +63,10 @@
 #master_failback_interval: 0
 
 # Set whether the minion should connect to the master via IPv6:
+# When set to True, Salt also uses the IPv6 loopback address (::1) for
+# internal IPC connections instead of 127.0.0.1. On Windows, this is
+# required because Windows does not permit binding an AF_INET6 socket to
+# an IPv4 address.
 #ipv6: False
 
 # Set the number of seconds to wait before attempting to resolve
@@ -171,7 +175,8 @@
 # asynchronously, however, it still adds 5 seconds every time grains are
 # generated if an IP does not resolve. In Windows grains are regenerated each
 # time a new process is spawned. Therefore, the default for Windows is `False`.
-# All other OSes default to `True`
+# On macOS, FQDN resolution can be very slow, therefore the default for macOS is
+# `False` as well. All other OSes default to `True`
 # enable_fqdns_grains: True
 
 # The minion can take a while to start up when lspci and/or dmidecode is used
@@ -270,9 +275,8 @@
 #ping_interval: 0
 
 # To auto recover minions if master changes IP address (DDNS)
-#    auth_tries: 10
-#    auth_safemode: False
-#    ping_interval: 2
+#    master_alive_interval: 10
+#    master_tries: -1
 #
 # Minions won't know master is missing until a ping fails. After the ping fail,
 # the minion will attempt authentication and likely fails out and cause a restart.
@@ -369,6 +373,12 @@
 #
 # If the value is set to zero, this check is disabled.
 #grains_refresh_every: 1
+
+# The grains_refresh_pre_exec setting allows for a minion to check its grains
+# prior to the execution of any operation to see if they have changed and, if
+# so, to inform the master of the new grains. This operation is moderately
+# expensive, therefore care should be taken before enabling this behavior.
+#grains_refresh_pre_exec: False
 
 # Cache grains on the minion. Default is False.
 #grains_cache: False
@@ -477,6 +487,18 @@
 #  - test
 #  - config
 
+# The state-loader counterpart to whitelist_modules.  If set, only state
+# modules whose name is in this list will be loadable, and an SLS that
+# references any other state module will fail compile with
+# "State '<mod>.<fun>' was not found in SLS ...".  Unset (the default)
+# means every discoverable state module is available.  Case-sensitive
+# module-name (not function-name) allowlist.
+#whitelist_state_modules:
+#  - test
+#  - file
+#  - pkg
+#  - service
+
 # Modules can be loaded from arbitrary paths. This enables the easy deployment
 # of third party modules. Modules for returners and minions can be loaded.
 # Specify a list of extra directories to search for minion modules and
@@ -509,7 +531,7 @@
 # templating on the SLS file, and then load the result as YAML. This syntax is
 # documented in further depth at the following URL:
 #
-# https://docs.saltstack.com/en/latest/ref/renderers/#composing-renderers
+# https://docs.saltproject.io/en/latest/ref/renderers/#composing-renderers
 #
 # NOTE: The "shebang" prefix (e.g. "#!jinja|yaml") described in the
 # documentation linked above is for use in an SLS file to override the default
@@ -585,6 +607,16 @@
 #
 #state_aggregate: False
 
+# Instead of failing immediately when another state run is in progress, a value
+# of True will queue the new state run to begin running once the other has
+# finished. This option starts a new thread for each queued state run, so use
+# this option sparingly. Additionally, it can be set to an integer representing
+# the maximum queue size which can be attained before the state runs will fail
+# to be queued. This can prevent runaway conditions where new threads are
+# started until system performance is hampered.
+#
+#state_queue: False
+
 # Disable requisites during state runs by specifying a single requisite
 # or a list of requisites to disable.
 #
@@ -593,6 +625,14 @@
 # disabled_requisites:
 #     - require
 #     - require_in
+
+# If set, this parameter expects a dictionary of state module names as keys
+# and list of conditions which must be satisfied in order to run any functions
+# in that state module.
+#
+#global_state_conditions:
+#  "*": ["G@global_noop:false"]
+#  service: ["not G@virtual_subtype:chroot"]
 
 #####     File Directory Settings    #####
 ##########################################
@@ -638,14 +678,6 @@
 # files on the Master will not be returned to the Minion.
 #fileserver_ignoresymlinks: True
 #
-# By default, the Salt fileserver recurses fully into all defined environments
-# to attempt to find files. To limit this behavior so that the fileserver only
-# traverses directories with SLS files and special Salt directories like _modules,
-# enable the option below. This might be useful for installations where a file root
-# has a very large number of files and performance is negatively impacted. Default
-# is False.
-#fileserver_limit_traversal: False
-
 # The hash_type is the hash to use when discovering the hash of a file on
 # the local fileserver. The default is sha256, but md5, sha1, sha224, sha384
 # and sha512 are also supported.
@@ -663,6 +695,10 @@
 #pillar_roots:
 #  base:
 #    - /srv/pillar
+
+# If this is `True` and the ciphertext could not be decrypted, then an error is
+# raised.
+#gpg_decrypt_must_succeed: False
 
 # Set a hard-limit on the size of the files that can be pushed to the master.
 # It will be interpreted as megabytes. Default: 100
@@ -709,6 +745,14 @@
 # will be shown for each state run.
 #state_output_profile: True
 
+# The state_output_pct setting changes whether success and failure information
+# as a percent of total actions will be shown for each state run.
+#state_output_pct: False
+
+# The state_compress_ids setting aggregates information about states which have
+# multiple "names" under the same state ID in the highstate output.
+#state_compress_ids: False
+
 # Fingerprint of the master public key to validate the identity of your Salt master
 # before the initial key exchange. The master fingerprint can be found by running
 # "salt-key -f master.pub" on the Salt master.
@@ -732,7 +776,7 @@
 
 ######        Reactor Settings        #####
 ###########################################
-# Define a salt reactor. See https://docs.saltstack.com/en/latest/topics/reactor/
+# Define a salt reactor. See https://docs.saltproject.io/en/latest/topics/reactor/
 #reactor: []
 
 #Set the TTL for the cache of the reactor configuration.
@@ -780,7 +824,7 @@
 # One of 'garbage', 'trace', 'debug', 'info', 'warning', 'error', 'critical'.
 #
 # The following log levels are considered INSECURE and may log sensitive data:
-# ['garbage', 'trace', 'debug']
+# ['profile', 'garbage', 'trace', 'debug', 'all']
 #
 # Default: 'warning'
 #log_level: warning
@@ -921,12 +965,11 @@
 #
 #return: mysql
 #
-#return: mysql,slack,redis
+#return: mysql,redis
 #
 #return:
 #  - mysql
 #  - hipchat
-#  - slack
 
 
 ######    Miscellaneous  settings     ######

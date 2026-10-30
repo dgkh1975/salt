@@ -1,23 +1,20 @@
-# -*- coding: utf-8 -*-
 """
 Loader mechanism for caching data, with data expiration, etc.
 
 .. versionadded:: 2016.11.0
 """
 
-# Import Python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
+import datetime
 import logging
+import threading
 import time
+from collections import OrderedDict
 
-# Import Salt libs
 import salt.config
 import salt.loader
 import salt.syspaths
-from salt.ext import six
-from salt.payload import Serial
-from salt.utils.odict import OrderedDict
+from salt.exceptions import SaltCacheError
+from salt.utils.decorators import cached_property
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +32,7 @@ def factory(opts, **kwargs):
     return cls(opts, **kwargs)
 
 
-class Cache(object):
+class Cache:
     """
     Base caching object providing access to the modular cache subsystem.
 
@@ -45,18 +42,12 @@ class Cache(object):
         The name of the cache driver to use. This is the name of the python
         module of the `salt.cache` package. Default is `localfs`.
 
-    :param serial:
-        The module of `salt.serializers` package that should be used by the cache
-        driver to store data.
-        If a driver can't use a specific module or uses specific objects storage
-        it can ignore this parameter.
-
-    Terminology.
+    Terminology:
 
     Salt cache subsystem is organized as a tree with nodes and leafs like a
     filesystem. Cache consists of banks. Each bank can contain a number of
     keys. Each key can contain a dict or any other object serializable with
-    `salt.payload.Serial`. I.e. any data object in the cache can be
+    `salt.payload`. I.e. any data object in the cache can be
     addressed by the path to the bank and the key name:
         bank: 'minions/alpha'
         key:  'data'
@@ -71,29 +62,34 @@ class Cache(object):
 
     def __init__(self, opts, cachedir=None, **kwargs):
         self.opts = opts
-        if cachedir is None:
-            self.cachedir = opts.get("cachedir", salt.syspaths.CACHE_DIR)
+
+        if kwargs.get("driver"):
+            self.driver = kwargs["driver"]
         else:
-            self.cachedir = cachedir
-        self.driver = opts.get("cache", salt.config.DEFAULT_MASTER_OPTS["cache"])
-        self.serial = Serial(opts)
+            self.driver = opts.get("cache", salt.config.DEFAULT_MASTER_OPTS["cache"])
+
+        self.cachedir = kwargs["cachedir"] = cachedir or opts.get(
+            "cachedir", salt.syspaths.CACHE_DIR
+        )
         self._modules = None
         self._kwargs = kwargs
-        self._kwargs["cachedir"] = self.cachedir
 
-    def __lazy_init(self):
-        self._modules = salt.loader.cache(self.opts, self.serial)
-        fun = "{0}.init_kwargs".format(self.driver)
-        if fun in self.modules:
-            self._kwargs = self.modules[fun](self._kwargs)
-        else:
-            self._kwargs = {}
-
-    @property
+    @cached_property
     def modules(self):
-        if self._modules is None:
-            self.__lazy_init()
-        return self._modules
+        return salt.loader.cache(self.opts)
+
+    @cached_property
+    def kwargs(self):
+        try:
+            return self.modules[f"{self.driver}.init_kwargs"](self._kwargs)
+        except KeyError:
+            return {}
+
+    def destroy(self):
+        if hasattr(self, "_modules") and self._modules is not None:
+            if hasattr(self._modules, "destroy"):
+                self._modules.destroy()
+            self._modules = None
 
     def cache(self, bank, key, fun, loop_fun=None, **kwargs):
         """
@@ -133,7 +129,7 @@ class Cache(object):
 
         return data
 
-    def store(self, bank, key, data):
+    def store(self, bank, key, data, expires=None):
         """
         Store data using the specified module
 
@@ -148,14 +144,30 @@ class Cache(object):
 
         :param data:
             The data which will be stored in the cache. This data should be
-            in a format which can be serialized by msgpack/json/yaml/etc.
+            in a format which can be serialized by msgpack.
 
-        :raises SaltCacheError:
+        :param expires:
+            how many seconds from now the data should be considered stale.
+
+         :raises SaltCacheError:
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{0}.store".format(self.driver)
-        return self.modules[fun](bank, key, data, **self._kwargs)
+        fun = f"{self.driver}.store"
+        try:
+            return self.modules[fun](bank, key, data, expires=expires, **self.kwargs)
+        except TypeError:
+            # if the backing store doesnt natively support expiry, we handle it as a fallback
+            if expires:
+                expires_at = datetime.datetime.now().astimezone() + datetime.timedelta(
+                    seconds=expires
+                )
+                expires_at = int(expires_at.timestamp())
+                return self.modules[fun](
+                    bank, key, {"data": data, "_expires": expires_at}, **self.kwargs
+                )
+            else:
+                return self.modules[fun](bank, key, data, **self.kwargs)
 
     def fetch(self, bank, key):
         """
@@ -178,8 +190,18 @@ class Cache(object):
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{0}.fetch".format(self.driver)
-        return self.modules[fun](bank, key, **self._kwargs)
+        fun = f"{self.driver}.fetch"
+        ret = self.modules[fun](bank, key, **self.kwargs)
+
+        # handle fallback if necessary
+        if isinstance(ret, dict) and set(ret.keys()) == {"data", "_expires"}:
+            now = datetime.datetime.now().astimezone().timestamp()
+            if ret["_expires"] > now:
+                return ret["data"]
+            else:
+                return {}
+        else:
+            return ret
 
     def updated(self, bank, key):
         """
@@ -202,8 +224,8 @@ class Cache(object):
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{0}.updated".format(self.driver)
-        return self.modules[fun](bank, key, **self._kwargs)
+        fun = f"{self.driver}.updated"
+        return self.modules[fun](bank, key, **self.kwargs)
 
     def flush(self, bank, key=None):
         """
@@ -223,8 +245,8 @@ class Cache(object):
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{0}.flush".format(self.driver)
-        return self.modules[fun](bank, key=key, **self._kwargs)
+        fun = f"{self.driver}.flush"
+        return self.modules[fun](bank, key=key, **self.kwargs)
 
     def list(self, bank):
         """
@@ -242,8 +264,38 @@ class Cache(object):
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{0}.list".format(self.driver)
-        return self.modules[fun](bank, **self._kwargs)
+        fun = f"{self.driver}.list"
+        return self.modules[fun](bank, **self.kwargs)
+
+    def list_all(self, bank, include_data=False):
+        """
+        Lists all entries with their data from the specified bank.
+        This is more efficient than calling list() + fetch() for each entry.
+
+        :param bank:
+            The name of the location inside the cache which will hold the key
+            and its associated data.
+
+        :param include_data:
+            Whether to include the full data for each entry. For some drivers
+            (like localfs_key), setting this to False avoids expensive disk reads.
+
+        :return:
+            A dict of {key: data} for all entries in the bank. Returns an empty
+            dict if the bank doesn't exist or the driver doesn't support list_all.
+
+        :raises SaltCacheError:
+            Raises an exception if cache driver detected an error accessing data
+            in the cache backend (auth, permissions, etc).
+        """
+        fun = f"{self.driver}.list_all"
+        if fun in self.modules:
+            return self.modules[fun](bank, include_data=include_data, **self.kwargs)
+        else:
+            # Fallback for drivers that don't implement list_all
+            raise AttributeError(
+                f"Cache driver '{self.driver}' does not implement list_all"
+            )
 
     def contains(self, bank, key=None):
         """
@@ -267,8 +319,52 @@ class Cache(object):
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{0}.contains".format(self.driver)
-        return self.modules[fun](bank, key, **self._kwargs)
+        fun = f"{self.driver}.contains"
+        return self.modules[fun](bank, key, **self.kwargs)
+
+    def clean_expired(self, bank, *args, **kwargs):
+        """
+        Clean expired keys
+
+        :param bank:
+            The name of the location inside the cache which will hold the key
+            and its associated data.
+
+        :raises SaltCacheError:
+            Raises an exception if cache driver detected an error accessing data
+            in the cache backend (auth, permissions, etc).
+        """
+        # If the cache driver has a clean_expired() func, call it to clean up
+        # expired keys.
+        clean_expired = f"{self.driver}.clean_expired"
+        if clean_expired in self.modules:
+            self.modules[clean_expired](bank, *args, **{**self.kwargs, **kwargs})
+            return
+
+        # Fallback for drivers without native clean_expired. Use the
+        # ``_expires`` envelope written by ``Cache.store`` when ``expires``
+        # is supplied; entries without that envelope have no cache-level
+        # expiry and are left alone. (Previously this path treated the
+        # driver's ``updated()`` value -- the file mtime for ``localfs`` --
+        # as an absolute expiry epoch, which deleted every entry whose
+        # mtime was in the past, i.e. every entry. Issue #69307.)
+        list_ = f"{self.driver}.list"
+        fetch = f"{self.driver}.fetch"
+        flush = f"{self.driver}.flush"
+        now = time.time()
+        for key in self.modules[list_](bank, **self.kwargs):
+            try:
+                raw = self.modules[fetch](bank, key, **self.kwargs)
+            except SaltCacheError:
+                # Best-effort: don't let one unreadable key abort the sweep.
+                log.debug("clean_expired: unable to read %s/%s; skipping", bank, key)
+                continue
+            if (
+                isinstance(raw, dict)
+                and set(raw.keys()) == {"data", "_expires"}
+                and raw["_expires"] <= now
+            ):
+                self.modules[flush](bank, key, **self.kwargs)
 
 
 class MemCache(Cache):
@@ -279,9 +375,21 @@ class MemCache(Cache):
 
     # {<storage_id>: odict({<key>: [atime, data], ...}), ...}
     data = {}
+    # Class-level lock guarding all mutations of ``data`` and any per-storage
+    # OrderedDict inside it. The MWorker async migration dispatches many
+    # AESFuncs / AuthFuncs handlers through ``loop.run_in_executor(...)``,
+    # so this class-level dict is now touched by arbitrary worker threads
+    # under concurrent load. Without a lock, ``dict changed size during
+    # iteration`` and torn read-modify-write sequences (e.g. the
+    # ``pop`` -> re-``__setitem__`` atime update in :meth:`fetch`) are
+    # observable under stress. A single class-level lock is acceptable
+    # because the mutations are cheap (dict/OrderedDict ops) and the
+    # cache is expressly a short-lived hot path where contention would
+    # never dominate against the actual cache-miss returner call.
+    _lock = threading.Lock()
 
     def __init__(self, opts, **kwargs):
-        super(MemCache, self).__init__(opts, **kwargs)
+        super().__init__(opts, **kwargs)
         self.expire = opts.get("memcache_expire_seconds", 10)
         self.max = opts.get("memcache_max_items", 1024)
         self.cleanup = opts.get("memcache_full_cleanup", False)
@@ -294,7 +402,11 @@ class MemCache(Cache):
     @classmethod
     def __cleanup(cls, expire):
         now = time.time()
-        for storage in six.itervalues(cls.data):
+        # Caller holds :attr:`_lock`; we iterate the class-level dict and
+        # every OrderedDict inside it, so mutation from another thread
+        # mid-iteration would raise ``RuntimeError: dictionary changed
+        # size during iteration``.
+        for storage in cls.data.values():
             for key, data in list(storage.items()):
                 if data[0] + expire < now:
                     del storage[key]
@@ -302,7 +414,7 @@ class MemCache(Cache):
                     break
 
     def _get_storage_id(self):
-        fun = "{0}.storage_id".format(self.driver)
+        fun = f"{self.driver}.storage_id"
         if fun in self.modules:
             return self.modules[fun](self.kwargs)
         else:
@@ -312,51 +424,84 @@ class MemCache(Cache):
     def storage(self):
         if self._storage is None:
             storage_id = self._get_storage_id()
-            if storage_id not in MemCache.data:
-                MemCache.data[storage_id] = OrderedDict()
-            self._storage = MemCache.data[storage_id]
+            # Guard the check-then-create against two threads observing an
+            # empty ``MemCache.data`` slot and both writing a fresh
+            # OrderedDict (the second one would silently discard the first
+            # thread's stored records).
+            with MemCache._lock:
+                if storage_id not in MemCache.data:
+                    MemCache.data[storage_id] = OrderedDict()
+                self._storage = MemCache.data[storage_id]
         return self._storage
 
     def fetch(self, bank, key):
         if self.debug:
             self.call += 1
         now = time.time()
-        record = self.storage.pop((bank, key), None)
-        # Have a cached value for the key
-        if record is not None and record[0] + self.expire >= now:
-            if self.debug:
-                self.hit += 1
-                log.debug(
-                    "MemCache stats (call/hit/rate): %s/%s/%s",
-                    self.call,
-                    self.hit,
-                    float(self.hit) / self.call,
-                )
-            # update atime and return
-            record[0] = now
-            self.storage[(bank, key)] = record
-            return record[1]
+        expires = None
+        storage = self.storage
+        with MemCache._lock:
+            record = storage.pop((bank, key), None)
+            # Have a cached value for the key
+            if record is not None:
+                if len(record) == 2:
+                    (created_at, data) = record
+                elif len(record) == 3:
+                    (created_at, expires, data) = record
+                else:
+                    raise SaltCacheError("Unexpected record structure")
 
-        # Have no value for the key or value is expired
-        data = super(MemCache, self).fetch(bank, key)
-        if len(self.storage) >= self.max:
-            if self.cleanup:
-                MemCache.__cleanup(self.expire)
-            if len(self.storage) >= self.max:
-                self.storage.popitem(last=False)
-        self.storage[(bank, key)] = [now, data]
+                if (created_at + (expires or self.expire)) >= now:
+                    if self.debug:
+                        self.hit += 1
+                        log.debug(
+                            "MemCache stats (call/hit/rate): %s/%s/%s",
+                            self.call,
+                            self.hit,
+                            float(self.hit) / self.call,
+                        )
+                    # update atime and return
+                    record[0] = now
+                    storage[(bank, key)] = record
+                    return data
+
+        # Have no value for the key or value is expired. The underlying
+        # returner call (``super().fetch``) may perform disk / network I/O
+        # and must NOT hold the lock (would serialise all concurrent
+        # cache-miss loads across every MemCache instance in-process).
+        data = super().fetch(bank, key)
+        with MemCache._lock:
+            if len(storage) >= self.max:
+                if self.cleanup:
+                    MemCache.__cleanup(self.expire)
+                if len(storage) >= self.max:
+                    storage.popitem(last=False)
+            storage[(bank, key)] = [now, self.expire, data]
         return data
 
-    def store(self, bank, key, data):
-        self.storage.pop((bank, key), None)
-        super(MemCache, self).store(bank, key, data)
-        if len(self.storage) >= self.max:
-            if self.cleanup:
-                MemCache.__cleanup(self.expire)
-            if len(self.storage) >= self.max:
-                self.storage.popitem(last=False)
-        self.storage[(bank, key)] = [time.time(), data]
+    def store(self, bank, key, data, expires=None):
+        storage = self.storage
+        with MemCache._lock:
+            storage.pop((bank, key), None)
+        # ``super().store`` calls the driver (disk / db); keep it off the
+        # lock so concurrent stores don't serialise on returner I/O.
+        super().store(bank, key, data, expires=expires)
+        with MemCache._lock:
+            if len(storage) >= self.max:
+                if self.cleanup:
+                    MemCache.__cleanup(self.expire)
+                if len(storage) >= self.max:
+                    storage.popitem(last=False)
+            storage[(bank, key)] = [time.time(), expires, data]
 
     def flush(self, bank, key=None):
-        self.storage.pop((bank, key), None)
-        super(MemCache, self).flush(bank, key)
+        storage = self.storage
+        with MemCache._lock:
+            if key is None:
+                for bank_, key_ in tuple(storage):
+                    if bank == bank_:
+                        storage.pop((bank_, key_))
+            else:
+                storage.pop((bank, key), None)
+        # ``super().flush`` hits the driver; keep it off the lock.
+        super().flush(bank, key)

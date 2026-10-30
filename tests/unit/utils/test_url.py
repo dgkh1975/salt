@@ -1,14 +1,8 @@
-# -*- coding: utf-8 -*-
+from urllib.parse import unquote, urlparse
 
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
-# Import Salt Libs
 import salt.utils.platform
 import salt.utils.url
 from tests.support.mock import MagicMock, patch
-
-# Import Salt Testing Libs
 from tests.support.unit import TestCase
 
 
@@ -50,6 +44,31 @@ class UrlTestCase(TestCase):
 
         self.assertEqual(salt.utils.url.parse(url), (path, saltenv))
 
+    def test_parse_salt_three_slash_url(self):
+        """
+        Regression test for #69472: ``salt:///foo`` (empty authority, RFC 3986
+        valid) must resolve to the same path as ``salt://foo``. Without this
+        normalization the surplus leading slash propagates to the master
+        fileserver which rejects absolute paths in ``find_file``, breaking
+        ``cp.get_file salt:///path/to/file`` and similar calls.
+        """
+        path = "path/to/file"
+        url = "salt:///" + path
+
+        self.assertEqual(salt.utils.url.parse(url), (path, None))
+
+    def test_parse_salt_three_slash_url_with_saltenv(self):
+        """
+        Regression test for #69472: ``salt:///foo?saltenv=bar`` must also be
+        accepted and produce the same ``(path, saltenv)`` tuple as the
+        equivalent two-slash form.
+        """
+        saltenv = "ambience"
+        path = "path/to/file"
+        url = "salt:///" + path + "?saltenv=" + saltenv
+
+        self.assertEqual(salt.utils.url.parse(url), (path, saltenv))
+
     # create tests
 
     def test_create_url(self):
@@ -75,6 +94,32 @@ class UrlTestCase(TestCase):
         url = "salt://" + path + "?saltenv=" + saltenv
 
         self.assertEqual(salt.utils.url.create(path, saltenv), url)
+
+    def test_create_url_with_backslash_in_path(self):
+        """
+        Test creating a 'salt://' URL
+        """
+        src_path = r"? interesting\&path.filetype"
+        tgt_path = "? interesting/&path.filetype"
+        url = "salt://" + tgt_path
+        if salt.utils.platform.is_windows():
+            url = "salt://_ interesting/&path.filetype"
+
+        self.assertEqual(salt.utils.url.create(src_path), url)
+
+    def test_create_url_saltenv_with_backslash_in_path(self):
+        """
+        Test creating a 'salt://' URL with a saltenv
+        """
+        saltenv = "raumklang"
+        src_path = r"? interesting\&path.filetype"
+        tgt_path = "? interesting/&path.filetype"
+        if salt.utils.platform.is_windows():
+            tgt_path = "_ interesting/&path.filetype"
+
+        url = "salt://" + tgt_path + "?saltenv=" + saltenv
+
+        self.assertEqual(salt.utils.url.create(src_path, saltenv), url)
 
     # is_escaped tests
 
@@ -345,6 +390,28 @@ class UrlTestCase(TestCase):
             expected = expected.replace("http://", "https://", 1)
             result = salt.utils.url.add_http_basic_auth(**kwargs)
             self.assertEqual(result, expected)
+
+    def test_http_basic_auth_quotes_userinfo(self):
+        """
+        Reserved characters in the user or password must be percent-encoded so
+        they do not corrupt the resulting URL (see #55561).
+        """
+        result = salt.utils.url.add_http_basic_auth(
+            "https://example.com/repo.git",
+            user="some@User",
+            password="some+Generated/Password",
+        )
+        self.assertEqual(
+            result,
+            "https://some%40User:some%2BGenerated%2FPassword@example.com/repo.git",
+        )
+        # The encoded URL must round-trip back to the original credentials and
+        # leave the host/path intact.
+        parsed = urlparse(result)
+        self.assertEqual(parsed.hostname, "example.com")
+        self.assertEqual(parsed.path, "/repo.git")
+        self.assertEqual(unquote(parsed.username), "some@User")
+        self.assertEqual(unquote(parsed.password), "some+Generated/Password")
 
     def test_http_basic_auth_https_only(self):
         """

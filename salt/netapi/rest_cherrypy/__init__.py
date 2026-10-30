@@ -1,14 +1,13 @@
-# encoding: utf-8
 """
 A script to start the CherryPy WSGI server
 
 This is run by ``salt-api`` and started in a multiprocess.
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
-# Import Python libs
 import logging
 import os
+
+from salt.utils.versions import Version
 
 # pylint: disable=C0103
 
@@ -29,7 +28,7 @@ cpy_min = "3.2.2"
 
 
 def __virtual__():
-    short_name = __name__.rsplit(".")[-1]
+    short_name = __name__.rsplit(".", maxsplit=1)[-1]
     mod_opts = __opts__.get(short_name, {})
 
     if mod_opts:
@@ -42,10 +41,10 @@ def __virtual__():
 
         # CherryPy wasn't imported; explain why
         if cpy_error:
-            from salt.utils.versions import LooseVersion as V
-
-            if "cherrypy" in globals() and V(cherrypy.__version__) < V(cpy_min):
-                error_msg = "Required version of CherryPy is {0} or " "greater.".format(
+            if "cherrypy" in globals() and Version(cherrypy.__version__) < Version(
+                cpy_min
+            ):
+                error_msg = "Required version of CherryPy is {} or greater.".format(
                     cpy_min
                 )
             else:
@@ -97,10 +96,38 @@ def start():
 
         verify_certs(apiopts["ssl_crt"], apiopts["ssl_key"])
 
+        ssl_chain = apiopts.get("ssl_chain")
+        ssl_ca_certs = apiopts.get("ssl_ca_certs")
+        ssl_cert_reqs = apiopts.get("ssl_cert_reqs")
+
         cherrypy.server.ssl_module = "builtin"
         cherrypy.server.ssl_certificate = apiopts["ssl_crt"]
         cherrypy.server.ssl_private_key = apiopts["ssl_key"]
-        if "ssl_chain" in apiopts.keys():
-            cherrypy.server.ssl_certificate_chain = apiopts["ssl_chain"]
+        if ssl_chain:
+            cherrypy.server.ssl_certificate_chain = ssl_chain
+
+        if ssl_ca_certs or ssl_cert_reqs:
+            # Client-cert validation
+            import ssl as _ssl
+
+            _ctx = _ssl.create_default_context(_ssl.Purpose.CLIENT_AUTH)
+            _ctx.load_cert_chain(
+                certfile=apiopts["ssl_crt"], keyfile=apiopts["ssl_key"]
+            )
+            if ssl_ca_certs:
+                _ctx.load_verify_locations(ssl_ca_certs)
+            if ssl_cert_reqs:
+                try:
+                    _ctx.verify_mode = getattr(_ssl, ssl_cert_reqs)
+                except AttributeError:
+                    logger.error(
+                        "Invalid ssl_cert_reqs '%s'; expected one of "
+                        "CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED",
+                        ssl_cert_reqs,
+                    )
+                    raise ValueError(
+                        f"Invalid ssl_cert_reqs configuration: {ssl_cert_reqs}"
+                    )
+            cherrypy.server.ssl_context = _ctx
 
     cherrypy.quickstart(root, apiopts.get("root_prefix", "/"), conf)

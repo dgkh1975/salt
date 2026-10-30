@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Use a postgresql server for the master job cache. This helps the job cache to
 cope with scale.
@@ -107,21 +106,17 @@ and then:
 Required python modules: psycopg2
 """
 
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
 import logging
 import re
 import sys
 
-# Import salt libs
 import salt.utils.jid
+import salt.utils.job
 import salt.utils.json
-from salt.ext import six
 
-# Import third party libs
 try:
     import psycopg2
+    import psycopg2.errors
 
     HAS_POSTGRES = True
 except ImportError:
@@ -237,9 +232,8 @@ def returner(load):
     sql = """INSERT INTO salt_returns
             (fun, jid, return, id, success)
             VALUES (%s, %s, %s, %s, %s)"""
-    job_ret = {
-        "return": six.text_type(six.text_type(load["return"]), "utf-8", "replace")
-    }
+    ret = str(load["return"])
+    job_ret = {"return": ret}
     if "retcode" in load:
         job_ret["retcode"] = load["retcode"]
     if "success" in load:
@@ -287,28 +281,53 @@ def save_load(jid, clear_load, minions=None):
     if conn is None:
         return None
     cur = conn.cursor()
-    sql = (
-        """INSERT INTO jids """
-        """(jid, started, tgt_type, cmd, tgt, kwargs, ret, username, arg,"""
-        """ fun) """
-        """VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-    )
+    # In active-active multi-master setups, more than one master may try to
+    # persist the same JID concurrently (see #69214). Use ON CONFLICT to make
+    # the duplicate insert a no-op on PostgreSQL >= 9.5; on older servers fall
+    # back to a plain INSERT and tolerate the resulting UniqueViolation in the
+    # except clause below.
+    if conn.server_version >= 90500:
+        sql = (
+            """INSERT INTO jids """
+            """(jid, started, tgt_type, cmd, tgt, kwargs, ret, username, arg,"""
+            """ fun) """
+            """VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+            """ ON CONFLICT (jid) DO NOTHING"""
+        )
+    else:
+        sql = (
+            """INSERT INTO jids """
+            """(jid, started, tgt_type, cmd, tgt, kwargs, ret, username, arg,"""
+            """ fun) """
+            """VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+        )
 
-    cur.execute(
-        sql,
-        (
-            jid,
-            salt.utils.jid.jid_to_time(jid),
-            six.text_type(clear_load.get("tgt_type")),
-            six.text_type(clear_load.get("cmd")),
-            six.text_type(clear_load.get("tgt")),
-            six.text_type(clear_load.get("kwargs")),
-            six.text_type(clear_load.get("ret")),
-            six.text_type(clear_load.get("user")),
-            six.text_type(salt.utils.json.dumps(clear_load.get("arg"))),
-            six.text_type(clear_load.get("fun")),
-        ),
-    )
+    try:
+        cur.execute(
+            sql,
+            (
+                jid,
+                salt.utils.jid.jid_to_time(jid),
+                str(clear_load.get("tgt_type")),
+                str(clear_load.get("cmd")),
+                str(clear_load.get("tgt")),
+                str(clear_load.get("kwargs")),
+                str(clear_load.get("ret")),
+                str(clear_load.get("user")),
+                str(salt.utils.json.dumps(clear_load.get("arg"))),
+                str(clear_load.get("fun")),
+            ),
+        )
+    except psycopg2.errors.UniqueViolation:
+        # PG >= 9.5 takes the ON CONFLICT path and never lands here; this
+        # branch covers PG < 9.5 and the (rare) race where a second master
+        # inserts the same jid between this connection's snapshot and the
+        # write. Tolerate it — other IntegrityErrors (FK, NOT NULL, CHECK)
+        # are not caught and surface as real bugs.
+        log.debug("save_load: duplicate jid %s ignored", jid)
+        conn.rollback()
+        conn.close()
+        return
     # TODO: Add Metadata support when it is merged from develop
     _close_conn(conn)
 
@@ -323,7 +342,7 @@ def _escape_jid(jid):
     """
     Do proper formatting of the jid
     """
-    jid = six.text_type(jid)
+    jid = str(jid)
     jid = re.sub(r"'*", "", jid)
     return jid
 
@@ -405,12 +424,13 @@ def get_jids():
         """jid, tgt_type, cmd, tgt, kwargs, ret, username, arg, fun """
         """FROM jids"""
     )
-    if __opts__["keep_jobs"] != 0:
+    keep_jobs_seconds = int(salt.utils.job.get_keep_jobs_seconds(__opts__))
+    if keep_jobs_seconds != 0:
         sql = (
             sql
             + " WHERE started > NOW() - INTERVAL '"
-            + six.text_type(__opts__["keep_jobs"])
-            + "' HOUR"
+            + str(keep_jobs_seconds)
+            + "' SECOND"
         )
 
     cur.execute(sql)

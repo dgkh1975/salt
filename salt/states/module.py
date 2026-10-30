@@ -4,15 +4,16 @@ Execution of Salt modules from within states
 
 .. note::
 
-    There are two styles of calling ``module.run``. **The legacy style will no
-    longer be available starting in the 3005 release.** To opt-in early to the
-    new style you must add the following to your ``/etc/salt/minion`` config
-    file:
+    As of the 3005 release, you no longer need to opt-in to the new style of
+    calling ``module.run``. The following config can be removed from ``/etc/salt/minion``:
 
     .. code-block:: yaml
 
         use_superseded:
           - module.run
+
+    Both 'new' and 'legacy' styles of calling ``module.run`` are supported.
+
 
 With `module.run` these states allow individual execution module calls to be
 made via states. Here's a contrived example, to show you how it's done:
@@ -297,16 +298,40 @@ Windows system:
               start_time: '11:59PM'
         }
 
-.. _file_roots: https://docs.saltstack.com/en/latest/ref/configuration/master.html#file-roots
+.. _file_roots: https://docs.saltproject.io/en/latest/ref/configuration/master.html#file-roots
 """
+
+import logging
 
 import salt.loader
 import salt.utils.args
 import salt.utils.functools
 import salt.utils.jid
 from salt.exceptions import SaltInvocationError
-from salt.ext.six.moves import range
-from salt.utils.decorators import with_deprecated
+
+log = logging.getLogger(__name__)
+
+
+def _wire_salt():
+    """
+    Return the whitelist-filtered execution-module loader for SLS-directed
+    dispatch (``module.run`` / ``module.function``).
+
+    Under the two-loader model implemented by :func:`salt.loader.minion_mods`
+    and :func:`salt.loader.states`, ``__salt__`` for a state module is the
+    unfiltered inner exec-module loader so trusted shipped code (e.g.
+    ``file.managed``) can compose freely.  ``salt.states.module`` however
+    exists to invoke an arbitrary execution module whose name is supplied by
+    the SLS author, which would otherwise be an escape hatch around
+    ``whitelist_modules``.  When the state loader was built with the
+    two-loader model it packs the wire-filtered loader as ``__wire_salt__``;
+    fall back to ``__salt__`` when the pack isn't present (single-loader /
+    unit-test contexts).
+    """
+    try:
+        return __wire_salt__  # noqa: F821  (packed by salt.loader.states)
+    except NameError:
+        return __salt__
 
 
 def wait(name, **kwargs):
@@ -338,7 +363,6 @@ def wait(name, **kwargs):
 watch = salt.utils.functools.alias_function(wait, "watch")
 
 
-@with_deprecated(globals(), "Phosphorus", policy=with_deprecated.OPT_IN)
 def run(**kwargs):
     """
     Run a single module function or a range of module functions in a batch.
@@ -371,6 +395,31 @@ def run(**kwargs):
 
     :return:
     """
+    # Detect if this call is using legacy or new style syntax.
+    legacy_run = False
+
+    keys = list(kwargs)
+    ignored_kwargs = ["name", "__reqs__", "sfun"]
+    for item in ignored_kwargs:
+        if item in keys:
+            keys.remove(item)
+
+    # The rest of the keys should be function names for new-style syntax
+    for name in keys:
+        if name.find(".") == -1:
+            legacy_run = True
+    if not keys and kwargs:
+        legacy_run = True
+
+    if legacy_run:
+        log.debug("Detected legacy module.run syntax: %s", __low__["__id__"])
+        return _legacy_run(**kwargs)
+    else:
+        log.debug("Using new style module.run syntax: %s", __low__["__id__"])
+        return _run(**kwargs)
+
+
+def _run(**kwargs):
 
     if "name" in kwargs:
         kwargs.pop("name")
@@ -381,69 +430,79 @@ def run(**kwargs):
         "result": None,
     }
 
+    # Route SLS-supplied dispatch through the wire-filtered loader so
+    # ``whitelist_modules`` gates ``module.run: - <mod>.<fun>`` even though
+    # the surrounding state module has an unfiltered ``__salt__``.
+    wire_salt = _wire_salt()
     functions = [func for func in kwargs if "." in func]
     missing = []
     tests = []
     for func in functions:
         func = func.split(":")[0]
-        if func not in __salt__:
+        if func not in wire_salt:
             missing.append(func)
         elif __opts__["test"]:
             tests.append(func)
+
+    if not functions:
+        ret["comment"] = "No function provided."
+        ret["result"] = False
+        return ret
 
     if tests or missing:
         ret["comment"] = " ".join(
             [
                 missing
-                and "Unavailable function{plr}: "
-                "{func}.".format(
+                and "Unavailable function{plr}: {func}.".format(
                     plr=(len(missing) > 1 or ""), func=(", ".join(missing) or "")
                 )
                 or "",
                 tests
-                and "Function{plr} {func} to be "
-                "executed.".format(
-                    plr=(len(tests) > 1 or ""), func=(", ".join(tests)) or ""
+                and "Function{plr} {func} to be executed.".format(
+                    plr=(len(tests) > 1 or ""), func=", ".join(tests) or ""
                 )
                 or "",
             ]
         ).strip()
-        ret["result"] = not (missing or not tests)
 
-    if ret["result"] is None:
-        ret["result"] = True
+        if missing:
+            ret["result"] = False
 
-        failures = []
-        success = []
-        for func in functions:
-            _func = func.split(":")[0]
-            try:
-                func_ret = _call_function(
-                    _func, returner=kwargs.get("returner"), func_args=kwargs.get(func)
-                )
-                if not _get_result(func_ret, ret["changes"].get("ret", {})):
-                    if isinstance(func_ret, dict):
-                        failures.append(
-                            "'{}' failed: {}".format(
-                                func, func_ret.get("comment", "(error message N/A)")
-                            )
-                        )
-                    if func_ret is False:
-                        failures.append("'{}': {}".format(func, func_ret))
-                else:
-                    success.append(
-                        "{}: {}".format(
-                            func,
-                            func_ret.get("comment", "Success")
-                            if isinstance(func_ret, dict)
-                            else func_ret,
+        return ret
+
+    failures = []
+    success = []
+    for func in functions:
+        _func = func.split(":")[0]
+        try:
+            func_ret = _call_function(
+                _func, returner=kwargs.get("returner"), func_args=kwargs.get(func)
+            )
+            if not _get_result(func_ret):
+                if isinstance(func_ret, dict):
+                    failures.append(
+                        "'{}' failed: {}".format(
+                            func, func_ret.get("comment", "(error message N/A)")
                         )
                     )
-                    ret["changes"][func] = func_ret
-            except (SaltInvocationError, TypeError) as ex:
-                failures.append("'{}' failed: {}".format(func, ex))
-        ret["comment"] = ", ".join(failures + success)
-        ret["result"] = not bool(failures)
+                if func_ret is False:
+                    failures.append(f"'{func}': {func_ret}")
+            else:
+                success.append(
+                    "{}: {}".format(
+                        func,
+                        (
+                            func_ret.get("comment", "Success")
+                            if isinstance(func_ret, dict)
+                            else func_ret
+                        ),
+                    )
+                )
+                ret["changes"][func] = func_ret
+        except (SaltInvocationError, TypeError) as ex:
+            failures.append(f"'{func}' failed: {ex}")
+    ret["comment"] = ", ".join(failures + success)
+    ret["result"] = not bool(failures)
 
     return ret
 
@@ -464,9 +523,17 @@ def _call_function(name, returner=None, func_args=None, func_kwargs=None):
     if func_kwargs is None:
         func_kwargs = {}
 
-    mret = salt.utils.functools.call_function(__salt__[name], *func_args, **func_kwargs)
+    wire_salt = _wire_salt()
+    if name not in wire_salt:
+        raise SaltInvocationError(
+            "Module function {} is not available (not on "
+            "``whitelist_modules``)".format(name)
+        )
+    mret = salt.utils.functools.call_function(
+        wire_salt[name], *func_args, **func_kwargs
+    )
     if returner is not None:
-        returners = salt.loader.returners(__opts__, __salt__)
+        returners = salt.loader.returners(__opts__, wire_salt)
         if returner in returners:
             returners[returner](
                 {
@@ -479,7 +546,7 @@ def _call_function(name, returner=None, func_args=None, func_kwargs=None):
     return mret
 
 
-def _run(name, **kwargs):
+def _legacy_run(name, **kwargs):
     """
     .. deprecated:: 2017.7.0
        Function name stays the same, behaviour will change.
@@ -496,16 +563,17 @@ def _run(name, **kwargs):
         Pass any arguments needed to execute the function
     """
     ret = {"name": name, "changes": {}, "comment": "", "result": None}
-    if name not in __salt__:
-        ret["comment"] = "Module function {} is not available".format(name)
+    wire_salt = _wire_salt()
+    if name not in wire_salt:
+        ret["comment"] = f"Module function {name} is not available"
         ret["result"] = False
         return ret
 
     if __opts__["test"]:
-        ret["comment"] = "Module function {} is set to execute".format(name)
+        ret["comment"] = f"Module function {name} is set to execute"
         return ret
 
-    aspec = salt.utils.args.get_function_argspec(__salt__[name])
+    aspec = salt.utils.args.get_function_argspec(wire_salt[name])
     args = []
     defaults = {}
 
@@ -560,7 +628,7 @@ def _run(name, **kwargs):
     if missing:
         comment = "The following arguments are missing:"
         for arg in missing:
-            comment += " {}".format(arg)
+            comment += f" {arg}"
         ret["comment"] = comment
         ret["result"] = False
         return ret
@@ -601,9 +669,9 @@ def _run(name, **kwargs):
 
     try:
         if aspec.keywords:
-            mret = __salt__[name](*args, **nkwargs)
+            mret = wire_salt[name](*args, **nkwargs)
         else:
-            mret = __salt__[name](*args)
+            mret = wire_salt[name](*args)
     except Exception as e:  # pylint: disable=broad-except
         ret["comment"] = "Module function {} threw an exception. Exception: {}".format(
             name, e
@@ -621,35 +689,23 @@ def _run(name, **kwargs):
             "fun": name,
             "jid": salt.utils.jid.gen_jid(__opts__),
         }
-        returners = salt.loader.returners(__opts__, __salt__)
+        returners = salt.loader.returners(__opts__, wire_salt)
         if kwargs["returner"] in returners:
             returners[kwargs["returner"]](ret_ret)
-    ret["comment"] = "Module function {} executed".format(name)
-    ret["result"] = _get_result(mret, ret["changes"])
+    ret["comment"] = f"Module function {name} executed"
+    ret["result"] = _get_result(mret)
 
     return ret
 
 
-def _get_result(func_ret, changes):
+def _get_result(func_ret):
     res = True
-    # if mret is a dict and there is retcode and its non-zero
-    if isinstance(func_ret, dict) and func_ret.get("retcode", 0) != 0:
-        res = False
-        # if its a boolean, return that as the result
-    elif isinstance(func_ret, bool):
+    # if mret a boolean, return that as the result
+    if isinstance(func_ret, bool):
         res = func_ret
-    else:
-        changes_ret = changes.get("ret", {})
-        if isinstance(changes_ret, dict):
-            if isinstance(changes_ret.get("result", {}), bool):
-                res = changes_ret.get("result", {})
-            elif changes_ret.get("retcode", 0) != 0:
-                res = False
-            # Explore dict in depth to determine if there is a
-            # 'result' key set to False which sets the global
-            # state result.
-            else:
-                res = _get_dict_result(changes_ret)
+    # if mret is a dict, check if certain keys exist
+    elif isinstance(func_ret, dict):
+        res = _get_dict_result(func_ret)
 
     return res
 
@@ -657,7 +713,7 @@ def _get_result(func_ret, changes):
 def _get_dict_result(node):
     ret = True
     for key, val in node.items():
-        if key == "result" and val is False:
+        if (key == "result" and val is False) or (key == "retcode" and val != 0):
             ret = False
             break
         elif isinstance(val, dict):

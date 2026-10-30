@@ -1,29 +1,22 @@
-# -*- coding: utf-8 -*-
 """
 Alex Martelli's soulution for recursive dict update from
 http://stackoverflow.com/a/3233356
 """
 
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
-# Import 3rd-party libs
 import copy
 import logging
+from collections import OrderedDict
 from collections.abc import Mapping
 
-# Import salt libs
-import salt.ext.six as six
 import salt.utils.data
 from salt.defaults import DEFAULT_TARGET_DELIM
 from salt.exceptions import SaltInvocationError
 from salt.utils.decorators.jinja import jinja_filter
-from salt.utils.odict import OrderedDict
 
 log = logging.getLogger(__name__)
 
 
-def update(dest, upd, recursive_update=True, merge_lists=False):
+def update(dest, upd, recursive_update=True, merge_lists=False, strict=False):
     """
     Recursive version of the default dict.update
 
@@ -37,9 +30,15 @@ def update(dest, upd, recursive_update=True, merge_lists=False):
     is ``dest[key] + upd[key]``. This behavior is only activated when
     recursive_update=True. By default merge_lists=False.
 
-    .. versionchanged: 2016.11.6
+    if strict=True, then we will raise a TypeError when trying to merge a list
+    with a mapping when ``merge_lists=True``.
+
+    .. versionchanged:: 2016.11.6
         When merging lists, duplicate values are removed. Values already
         present in the ``dest`` list are not added from the ``upd`` list.
+    .. versionchanged:: 3008.0
+        Throw a TypeError when trying to merge a list with a mapping when
+        ``merge_lists=True``.
     """
     if (not isinstance(dest, Mapping)) or (not isinstance(upd, Mapping)):
         raise TypeError("Cannot update using non-dict types in dictupdate.update()")
@@ -63,22 +62,26 @@ def update(dest, upd, recursive_update=True, merge_lists=False):
                     dest[key] = merged
                 else:
                     dest[key] = upd[key]
+            elif (
+                strict
+                and merge_lists
+                and isinstance(dest_subkey, list)
+                and isinstance(val, Mapping)
+            ):
+                raise TypeError(
+                    f"With {merge_lists=} we cannot update list under {key=} with mapping containing keys {val.keys()=} in dictupdate.update()"
+                )
             else:
                 dest[key] = upd[key]
         return dest
-    try:
-        for k in upd:
-            dest[k] = upd[k]
-    except AttributeError:
-        # this mapping is not a dict
-        for k in upd:
-            dest[k] = upd[k]
+    for k in upd:
+        dest[k] = upd[k]
     return dest
 
 
 def merge_list(obj_a, obj_b):
     ret = {}
-    for key, val in six.iteritems(obj_a):
+    for key, val in obj_a.items():
         if key in obj_b:
             ret[key] = [val, obj_b[key]]
         else:
@@ -237,13 +240,15 @@ def update_dict_key_value(
         dict_pointer[last_key].update(value)
     except AttributeError:
         raise SaltInvocationError(
-            "The last key contains a {}, which cannot update."
-            "".format(type(dict_pointer[last_key]))
+            "The last key contains a {}, which cannot update.".format(
+                type(dict_pointer[last_key])
+            )
         )
     except (ValueError, TypeError):
         raise SaltInvocationError(
-            "Cannot update {} with a {}."
-            "".format(type(dict_pointer[last_key]), type(value))
+            "Cannot update {} with a {}.".format(
+                type(dict_pointer[last_key]), type(value)
+            )
         )
     return in_dict
 
@@ -275,8 +280,9 @@ def append_dict_key_value(
         dict_pointer[last_key].append(value)
     except AttributeError:
         raise SaltInvocationError(
-            "The last key contains a {}, which cannot append."
-            "".format(type(dict_pointer[last_key]))
+            "The last key contains a {}, which cannot append.".format(
+                type(dict_pointer[last_key])
+            )
         )
     return in_dict
 
@@ -308,12 +314,14 @@ def extend_dict_key_value(
         dict_pointer[last_key].extend(value)
     except AttributeError:
         raise SaltInvocationError(
-            "The last key contains a {}, which cannot extend."
-            "".format(type(dict_pointer[last_key]))
+            "The last key contains a {}, which cannot extend.".format(
+                type(dict_pointer[last_key])
+            )
         )
     except TypeError:
         raise SaltInvocationError(
-            "Cannot extend {} with a {}."
-            "".format(type(dict_pointer[last_key]), type(value))
+            "Cannot extend {} with a {}.".format(
+                type(dict_pointer[last_key]), type(value)
+            )
         )
     return in_dict

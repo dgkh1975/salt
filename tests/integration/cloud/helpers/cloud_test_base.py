@@ -2,17 +2,18 @@
 Tests for the Openstack Cloud Provider
 """
 
-
 import logging
 import os
 import shutil
 from time import sleep
 
+import pytest
+from saltfactories.utils import random_string
+
+import salt.utils.files
 from salt.config import cloud_config, cloud_providers_config
-from salt.ext.six.moves import range
 from salt.utils.yaml import safe_load
 from tests.support.case import ShellCase
-from tests.support.helpers import expensiveTest, random_string
 from tests.support.paths import FILES
 from tests.support.runtests import RUNTIME_VARS
 
@@ -21,7 +22,7 @@ TIMEOUT = 500
 log = logging.getLogger(__name__)
 
 
-@expensiveTest
+@pytest.mark.expensive_test
 class CloudTest(ShellCase):
     PROVIDER = ""
     REQUIRED_PROVIDER_CONFIG_ITEMS = tuple()
@@ -60,7 +61,7 @@ class CloudTest(ShellCase):
         if not query:
             query = self.query_instances()
 
-        log.debug('Checking for "{}" in {}'.format(instance_name, query))
+        log.debug('Checking for "%s" in %s', instance_name, query)
         if isinstance(query, set):
             return instance_name in query
         return any(instance_name == q.strip(": ") for q in query)
@@ -88,9 +89,9 @@ class CloudTest(ShellCase):
             for tries in range(self.__RE_TRIES):
                 if self._instance_exists(instance_name, query):
                     log.debug(
-                        'Instance "{}" reported after {} seconds'.format(
-                            instance_name, tries * self.__RE_RUN_DELAY
-                        )
+                        'Instance "%s" reported after %s seconds',
+                        instance_name,
+                        tries * self.__RE_RUN_DELAY,
                     )
                     break
                 else:
@@ -105,16 +106,16 @@ class CloudTest(ShellCase):
                 ),
             )
 
-            log.debug('Instance exists and was created: "{}"'.format(instance_name))
+            log.debug('Instance exists and was created: "%s"', instance_name)
 
     def assertDestroyInstance(self, instance_name=None, timeout=None):
         if timeout is None:
             timeout = TIMEOUT
         if not instance_name:
             instance_name = self.instance_name
-        log.debug('Deleting instance "{}"'.format(instance_name))
+        log.debug('Deleting instance "%s"', instance_name)
         delete_str = self.run_cloud(
-            "-d {} --assume-yes --out=yaml".format(instance_name), timeout=timeout
+            f"-d {instance_name} --assume-yes --out=yaml", timeout=timeout
         )
         if delete_str:
             delete = safe_load("\n".join(delete_str))
@@ -142,9 +143,10 @@ class CloudTest(ShellCase):
             if self._instance_exists(query=query):
                 sleep(30)
                 log.debug(
-                    'Instance "{}" still found in query after {} tries: {}'.format(
-                        instance_name, tries, query
-                    )
+                    'Instance "%s" still found in query after %s tries: %s',
+                    instance_name,
+                    tries,
+                    query,
                 )
                 query = self.query_instances()
         # The last query should have been successful
@@ -157,7 +159,7 @@ class CloudTest(ShellCase):
             subclass = self.__class__.__name__.strip("Test")
             # Use the first three letters of the subclass, fill with '-' if too short
             self._instance_name = random_string(
-                "cloud-test-{:-<3}-".format(subclass[:3]), uppercase=False
+                f"cloud-test-{subclass[:3]:-<3}-", uppercase=False
             ).lower()
         return self._instance_name
 
@@ -194,6 +196,18 @@ class CloudTest(ShellCase):
     @property
     def profile_str(self):
         return self.PROVIDER + "-config"
+
+    def add_profile_config(self, name, data, conf, new_profile):
+        """
+        copy the current profile and add a new profile in the same file
+        """
+        conf_path = os.path.join(RUNTIME_VARS.TMP_CONF_DIR, "cloud.profiles.d", conf)
+        with salt.utils.files.fopen(conf_path, "r") as fp:
+            conf = safe_load(fp)
+        conf[new_profile] = conf[name].copy()
+        conf[new_profile].update(data)
+        with salt.utils.files.fopen(conf_path, "w") as fp:
+            salt.utils.yaml.safe_dump(conf, fp)
 
     def setUp(self):
         """
@@ -241,9 +255,7 @@ class CloudTest(ShellCase):
             ):
                 instances.add(q)
                 log.debug(
-                    'Adding "{}" to the set of instances that needs to be deleted'.format(
-                        q
-                    )
+                    'Adding "%s" to the set of instances that needs to be deleted', q
                 )
         return instances
 
@@ -262,15 +274,15 @@ class CloudTest(ShellCase):
                     self.assertDestroyInstance(instance_name)
                     return (
                         False,
-                        'The instance "{}" was deleted during the tearDown, not the test.'.format(
-                            instance_name
-                        ),
+                        'The instance "{}" was deleted during the tearDown, not the'
+                        " test.".format(instance_name),
                     )
                 except AssertionError as e:
                     log.error(
-                        'Failed to delete instance "{}". Tries: {}\n{}'.format(
-                            instance_name, tries, str(e)
-                        )
+                        'Failed to delete instance "%s". Tries: %s\n%s',
+                        instance_name,
+                        tries,
+                        str(e),
                     )
                 if not self._instance_exists():
                     destroyed = True
@@ -310,9 +322,7 @@ class CloudTest(ShellCase):
                 success = False
                 fail_messages.append(alt_destroy_message)
                 log.error(
-                    'Failed to destroy instance "{}": {}'.format(
-                        instance, alt_destroy_message
-                    )
+                    'Failed to destroy instance "%s": %s', instance, alt_destroy_message
                 )
         self.assertTrue(success, "\n".join(fail_messages))
         self.assertFalse(

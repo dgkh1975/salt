@@ -2,44 +2,49 @@
 Jinja loading utils to enable a more powerful backend for jinja templates
 """
 
-
-import atexit
+import itertools
 import logging
 import os.path
-import pipes
 import pprint
 import re
+import shlex
 import time
 import uuid
 import warnings
-from collections.abc import Hashable
+from collections import OrderedDict
+from collections.abc import Hashable, Mapping, Sequence
 from functools import wraps
 from xml.dom import minidom
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 import jinja2
-import salt.fileclient
+from jinja2 import BaseLoader, TemplateNotFound, nodes
+from jinja2.environment import TemplateModule
+from jinja2.exceptions import TemplateRuntimeError
+from jinja2.ext import Extension
+
 import salt.utils.data
 import salt.utils.files
 import salt.utils.json
 import salt.utils.stringutils
 import salt.utils.url
 import salt.utils.yaml
-from jinja2 import BaseLoader, Markup, TemplateNotFound, nodes
-from jinja2.environment import TemplateModule
-from jinja2.exceptions import TemplateRuntimeError
-from jinja2.ext import Extension
 from salt.exceptions import TemplateError
 from salt.utils.decorators.jinja import jinja_filter, jinja_global, jinja_test
-from salt.utils.odict import OrderedDict
-from salt.utils.versions import LooseVersion
+from salt.utils.versions import Version
+
+try:
+    from markupsafe import Markup
+except ImportError:
+    # jinja < 3.1
+    from jinja2 import Markup  # pylint: disable=no-name-in-module
 
 log = logging.getLogger(__name__)
 
 __all__ = ["SaltCacheLoader", "SerializerExtension"]
 
 GLOBAL_UUID = uuid.UUID("91633EBF-1C86-5E33-935A-28061F4B480E")
-JINJA_VERSION = LooseVersion(jinja2.__version__)
+JINJA_VERSION = Version(jinja2.__version__)
 
 
 class SaltCacheLoader(BaseLoader):
@@ -50,19 +55,6 @@ class SaltCacheLoader(BaseLoader):
     Templates are cached like regular salt states
     and only loaded once per loader instance.
     """
-
-    _cached_pillar_client = None
-    _cached_client = None
-
-    @classmethod
-    def shutdown(cls):
-        for attr in ("_cached_client", "_cached_pillar_client"):
-            client = getattr(cls, attr, None)
-            if client is not None:
-                # PillarClient and LocalClient objects do not have a destroy method
-                if hasattr(client, "destroy"):
-                    client.destroy()
-                setattr(cls, attr, None)
 
     def __init__(
         self,
@@ -82,12 +74,16 @@ class SaltCacheLoader(BaseLoader):
             else:
                 self.searchpath = opts["pillar_roots"][saltenv]
         else:
-            self.searchpath = [os.path.join(opts["cachedir"], "files", saltenv)]
+            # In salt-ssh context, _caller_cachedir is the master's cachedir
+            # while cachedir points to the thin minion's remote path.
+            # The fileclient caches files to the master's cachedir, so we
+            # must use _caller_cachedir as the Jinja search path when present.
+            effective_cachedir = opts.get("_caller_cachedir", opts["cachedir"])
+            self.searchpath = [os.path.join(effective_cachedir, "files", saltenv)]
         log.debug("Jinja search path: %s", self.searchpath)
         self.cached = []
         self._file_client = _file_client
-        # Instantiate the fileclient
-        self.file_client()
+        self._close_file_client = _file_client is None
 
     def file_client(self):
         """
@@ -96,15 +92,17 @@ class SaltCacheLoader(BaseLoader):
         # If there was no file_client passed to the class, create a cache_client
         # and use that. This avoids opening a new file_client every time this
         # class is instantiated
-        if self._file_client is None:
-            attr = "_cached_pillar_client" if self.pillar_rend else "_cached_client"
-            cached_client = getattr(self, attr, None)
-            if cached_client is None:
-                cached_client = salt.fileclient.get_file_client(
-                    self.opts, self.pillar_rend
-                )
-                setattr(SaltCacheLoader, attr, cached_client)
-            self._file_client = cached_client
+        if (
+            self._file_client is None
+            or not hasattr(self._file_client, "opts")
+            or self._file_client.opts["file_roots"] != self.opts["file_roots"]
+        ):
+            import salt.fileclient
+
+            self._file_client = salt.fileclient.get_file_client(
+                self.opts, self.pillar_rend
+            )
+            self._close_file_client = True
         return self._file_client
 
     def cache_file(self, template):
@@ -112,15 +110,17 @@ class SaltCacheLoader(BaseLoader):
         Cache a file from the salt master
         """
         saltpath = salt.utils.url.create(template)
-        self.file_client().get_file(saltpath, "", True, self.saltenv)
+        fcl = self.file_client()
+        return fcl.get_file(saltpath, "", True, self.saltenv)
 
     def check_cache(self, template):
         """
         Cache a file only once
         """
         if template not in self.cached:
-            self.cache_file(template)
-            self.cached.append(template)
+            ret = self.cache_file(template)
+            if ret is not False:
+                self.cached.append(template)
 
     def get_source(self, environment, template):
         """
@@ -133,7 +133,7 @@ class SaltCacheLoader(BaseLoader):
         the importing file.
 
         """
-        # FIXME: somewhere do seprataor replacement: '\\' => '/'
+        # FIXME: somewhere do separator replacement: '\\' => '/'
         _template = template
         if template.split("/", 1)[0] in ("..", "."):
             is_relative = True
@@ -142,13 +142,12 @@ class SaltCacheLoader(BaseLoader):
         # checks for relative '..' paths that step-out of file_roots
         if is_relative:
             # Starts with a relative path indicator
-
             if not environment or "tpldir" not in environment.globals:
                 log.warning(
                     'Relative path "%s" cannot be resolved without an environment',
                     template,
                 )
-                raise TemplateNotFound
+                raise TemplateNotFound(template)
             base_path = environment.globals["tpldir"]
             _template = os.path.normpath("/".join((base_path, _template)))
             if _template.split("/", 1)[0] == "..":
@@ -158,6 +157,12 @@ class SaltCacheLoader(BaseLoader):
                     template,
                 )
                 raise TemplateNotFound(template)
+            # local file clients should pass the dot-expanded relative path
+            # when it's an absolute local filesystem location
+            if environment.globals.get("opts", {}).get(
+                "file_client"
+            ) == "local" and os.path.isabs(base_path):
+                _template = os.path.relpath(_template, base_path)
 
         self.check_cache(_template)
 
@@ -174,31 +179,89 @@ class SaltCacheLoader(BaseLoader):
             }
             environment.globals.update(tpldata)
 
-        # pylint: disable=cell-var-from-loop
-        for spath in self.searchpath:
-            filepath = os.path.join(spath, _template)
-            try:
-                with salt.utils.files.fopen(filepath, "rb") as ifile:
-                    contents = ifile.read().decode(self.encoding)
-                    mtime = os.path.getmtime(filepath)
+        if _template in self.cached or os.path.exists(_template):
+            # pylint: disable=cell-var-from-loop
+            for spath in self.searchpath:
+                filepath = os.path.join(spath, _template)
+                try:
+                    with salt.utils.files.fopen(filepath, "rb") as ifile:
+                        contents = ifile.read().decode(self.encoding)
+                        mtime = os.path.getmtime(filepath)
 
-                    def uptodate():
-                        try:
-                            return os.path.getmtime(filepath) == mtime
-                        except OSError:
-                            return False
+                        def uptodate():
+                            try:
+                                return os.path.getmtime(filepath) == mtime
+                            except OSError:
+                                return False
 
-                    return contents, filepath, uptodate
-            except OSError:
-                # there is no file under current path
-                continue
-        # pylint: enable=cell-var-from-loop
+                        return contents, filepath, uptodate
+                except OSError:
+                    # there is no file under current path
+                    continue
+            # pylint: enable=cell-var-from-loop
 
         # there is no template file within searchpaths
         raise TemplateNotFound(template)
 
+    def destroy(self):
+        if self._close_file_client is False:
+            return
+        if self._file_client is None:
+            return
+        file_client = self._file_client
+        self._file_client = None
 
-atexit.register(SaltCacheLoader.shutdown)
+        try:
+            file_client.destroy()
+        except AttributeError:
+            # PillarClient and LocalClient objects do not have a destroy method
+            pass
+
+    def __enter__(self):
+        self.file_client()
+        return self
+
+    def __exit__(self, *args):
+        self.destroy()
+
+
+def _yaml_safe_repr(value):
+    """
+    Return a YAML-safe repr for a string value.
+
+    Python's ``repr()`` of a string containing a newline produces ``'foo\\nbar'``
+    where ``\\n`` is the two-character backslash-n escape sequence. When such a
+    repr is embedded into a YAML state file via Jinja interpolation (e.g.
+    ``{{ some_dict }}``), the YAML parser sees the literal ``\\n`` and not an
+    actual newline, breaking multi-line scalars loaded via ``import_yaml``.
+
+    For strings containing characters that would be escaped by ``repr()`` in a
+    way YAML wouldn't round-trip (newlines, tabs, etc.), emit a YAML
+    double-quoted scalar instead. Otherwise fall back to ``repr()`` for
+    backward compatibility.
+
+    See https://github.com/saltstack/salt/issues/30690
+    """
+    if isinstance(value, str) and any(c in value for c in "\n\r\t"):
+        # safe_dump always emits a trailing newline; strip it. default_style='"'
+        # forces a double-quoted scalar which encodes newlines as the YAML \n
+        # escape sequence that the YAML parser will decode back to a real
+        # newline. width=2**31-1 disables PyYAML's default line-folding at
+        # ~80 columns; folding would introduce real newlines inside the
+        # scalar, which breaks YAML block-scalar interpolation via Jinja
+        # (see issue #69658).
+        return (
+            salt.utils.yaml.safe_dump(
+                value,
+                default_style='"',
+                default_flow_style=True,
+                width=2**31 - 1,
+            )
+            .rstrip("\n")
+            .rstrip("...")
+            .rstrip("\n")
+        )
+    return repr(value)
 
 
 class PrintableDict(OrderedDict):
@@ -220,23 +283,24 @@ class PrintableDict(OrderedDict):
         output = []
         for key, value in self.items():
             if isinstance(value, str):
-                # keeps quotes around strings
-                # pylint: disable=repr-flag-used-in-string
-                output.append("{!r}: {!r}".format(key, value))
-                # pylint: enable=repr-flag-used-in-string
+                # keeps quotes around strings; use YAML-safe quoting for
+                # strings containing newlines (see issue #30690)
+                output.append(f"{key!r}: {_yaml_safe_repr(value)}")
             else:
                 # let default output
-                output.append("{!r}: {!s}".format(key, value))
+                output.append(f"{key!r}: {value!s}")
         return "{" + ", ".join(output) + "}"
 
     def __repr__(self):  # pylint: disable=W0221
         output = []
         for key, value in self.items():
             # Raw string formatter required here because this is a repr
-            # function.
-            # pylint: disable=repr-flag-used-in-string
-            output.append("{!r}: {!r}".format(key, value))
-            # pylint: enable=repr-flag-used-in-string
+            # function. Use YAML-safe quoting for strings containing newlines
+            # (see issue #30690).
+            if isinstance(value, str):
+                output.append(f"{key!r}: {_yaml_safe_repr(value)}")
+            else:
+                output.append(f"{key!r}: {value!r}")
         return "{" + ", ".join(output) + "}"
 
 
@@ -386,25 +450,6 @@ def indent(s, width=4, first=False, blank=False, indentfirst=None):
     return rv
 
 
-@jinja_filter("tojson")
-def tojson(val, indent=None):
-    """
-    Implementation of tojson filter (only present in Jinja 2.9 and later). If
-    Jinja 2.9 or later is installed, then the upstream version of this filter
-    will be used.
-    """
-    options = {"ensure_ascii": True}
-    if indent is not None:
-        options["indent"] = indent
-    return (
-        salt.utils.json.dumps(val, **options)
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-        .replace("'", "\\u0027")
-    )
-
-
 @jinja_filter("quote")
 def quote(txt):
     """
@@ -421,7 +466,7 @@ def quote(txt):
 
         'my_text'
     """
-    return pipes.quote(txt)
+    return shlex.quote(txt)
 
 
 @jinja_filter()
@@ -453,6 +498,9 @@ def regex_search(txt, rgx, ignorecase=False, multiline=False):
     obj = re.search(rgx, txt, flag)
     if not obj:
         return
+    # Handle regular expressions which do not not use grouping
+    if obj and not obj.groups():
+        return (obj.group(),)
     return obj.groups()
 
 
@@ -480,6 +528,9 @@ def regex_match(txt, rgx, ignorecase=False, multiline=False):
     obj = re.match(rgx, txt, flag)
     if not obj:
         return
+    # Handle regular expressions which do not use grouping
+    if obj and not obj.groups():
+        return (obj.group(),)
     return obj.groups()
 
 
@@ -706,10 +757,85 @@ def method_call(obj, f_name, *f_args, **f_kwargs):
     return getattr(obj, f_name, lambda *args, **kwargs: None)(*f_args, **f_kwargs)
 
 
-@jinja2.contextfunction
+try:
+    pass_context = jinja2.pass_context
+except AttributeError:
+    # Old and deprecated method
+    pass_context = jinja2.contextfunction
+
+
+@pass_context
 def show_full_context(ctx):
     return salt.utils.data.simple_types_filter(
         {key: value for key, value in ctx.items()}
+    )
+
+
+def __get_strict_undefined(value, ids):
+    if id(value) in ids:
+        return []
+    ids.add(id(value))
+    undefined = []
+    if isinstance(value, jinja2.StrictUndefined):
+        undefined.append(value)
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            # StrictUndefined cant be a key in dict, but still check for other mapping types
+            undefined.extend(__get_strict_undefined(key, ids))
+            undefined.extend(__get_strict_undefined(item, ids))
+    elif isinstance(value, Sequence) and not isinstance(value, str):
+        for item in value:
+            undefined.extend(__get_strict_undefined(item, ids))
+    return undefined
+
+
+def _get_strict_undefined(value):
+    return tuple(__get_strict_undefined(value, set()))
+
+
+def _join_strict_undefined(undefined):
+    return jinja2.StrictUndefined("\n".join(u._undefined_message for u in undefined))
+
+
+def _handle_strict_undefined(function):
+    @wraps(function)
+    def __handle_strict_undefined(value, *args, **kwargs):
+        undefined = _get_strict_undefined(value)
+        if undefined:
+            return _join_strict_undefined(undefined)
+        return function(value, *args, **kwargs)
+
+    return __handle_strict_undefined
+
+
+def _handle_method_strict_undefined(function):
+    @wraps(function)
+    def __handle_method_strict_undefined(self, value, *args, **kwargs):
+        undefined = _get_strict_undefined(value)
+        if undefined:
+            return _join_strict_undefined(undefined)
+        return function(self, value, *args, **kwargs)
+
+    return __handle_method_strict_undefined
+
+
+@jinja_filter("tojson")
+@_handle_strict_undefined
+def tojson(val, indent=None, **options):
+    """
+    Implementation of tojson filter (only present in Jinja 2.9 and later).
+    Unlike the Jinja built-in filter, this allows arbitrary options to be
+    passed in to the underlying JSON library.
+    """
+    options.setdefault("ensure_ascii", True)
+    if indent is not None:
+        options["indent"] = indent
+    return (
+        salt.utils.json.dumps(val, **options)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("'", "\\u0027")
     )
 
 
@@ -777,7 +903,7 @@ class SerializerExtension(Extension):
     .. code-block:: jinja
 
         {%- set yaml_src = "{foo: it works}"|load_yaml %}
-        {%- set json_src = "{'bar': 'for real'}"|load_json %}
+        {%- set json_src = '{"bar": "for real"}'|load_json %}
         Dude, {{ yaml_src.foo }} {{ json_src.bar }}!
 
     will be rendered as::
@@ -877,7 +1003,95 @@ class SerializerExtension(Extension):
 
         unique = ['foo', 'bar']
 
+    ** Salt State Parameter Format Filters **
+
+    .. versionadded:: 3005
+
+    Renders a formatted multi-line YAML string from a Python dictionary. Each
+    key/value pair in the dictionary will be added as a single-key dictionary
+    to a list that will then be sent to the YAML formatter.
+
+    For example:
+
+    .. code-block:: jinja
+
+        {% set thing_params = {
+            "name": "thing",
+            "changes": True,
+            "warnings": "OMG! Stuff is happening!"
+           }
+        %}
+
+        thing:
+          test.configurable_test_state:
+            {{ thing_params | dict_to_sls_yaml_params | indent }}
+
+    will be rendered as::
+
+    .. code-block:: yaml
+
+        thing:
+          test.configurable_test_state:
+            - name: thing
+            - changes: true
+            - warnings: OMG! Stuff is happening!
+
+    .. _jinja-fileopts:
+
+    **Jinja Environment Configuration Override**
+
+    .. versionadded:: 3006.28
+
+    A header can be added to a jinja (or jinja|yaml, etc.) template to override
+    the jinja environment configuration for that template only. This lets an
+    individual file -- notably a third-party formula -- opt in or out of
+    options such as ``trim_blocks`` and ``lstrip_blocks`` without changing the
+    global :conf_master:`jinja_env` / :conf_master:`jinja_sls_env` settings,
+    which would otherwise force the same options onto every template and can
+    break unrelated states or formulas.
+
+    The header is a single line beginning with ``#jinja2:`` followed by a JSON
+    object whose keys are `Jinja2 Environment`_ settings. It is honored on the
+    first line of the template, or on the line immediately following a renderer
+    shebang (e.g. ``#!jinja|yaml``), since the shebang is not stripped before
+    the jinja renderer runs. The recognized header line is removed before
+    rendering; a ``#jinja2:`` line anywhere else in the template is left
+    untouched.
+
+    For example:
+
+    .. code-block:: jinja
+
+        #jinja2: {"lstrip_blocks": true, "trim_blocks": true}
+        thing:
+        {% for n in range(1, 6) %}
+          - some thing {{ n }}
+        {% endfor %}
+
+    or, combined with a renderer shebang:
+
+    .. code-block:: jinja
+
+        #!jinja|yaml
+        #jinja2: {"lstrip_blocks": true, "trim_blocks": true}
+        thing:
+        {% for n in range(1, 6) %}
+          - some thing {{ n }}
+        {% endfor %}
+
+    both render as:
+
+    .. code-block:: yaml
+
+        thing:
+          - some thing 1
+          - some thing 2
+          - some thing 3
+          - some thing 4
+          - some thing 5
+
     .. _`import tag`: https://jinja.palletsprojects.com/en/2.11.x/templates/#import
+    .. _`Jinja2 Environment`: https://jinja.palletsprojects.com/en/stable/api/#jinja2.Environment
     '''
 
     tags = {
@@ -901,6 +1115,16 @@ class SerializerExtension(Extension):
                 "load_yaml": self.load_yaml,
                 "load_json": self.load_json,
                 "load_text": self.load_text,
+                "dict_to_sls_yaml_params": self.dict_to_sls_yaml_params,
+                "combinations": _handle_strict_undefined(itertools.combinations),
+                "combinations_with_replacement": _handle_strict_undefined(
+                    itertools.combinations_with_replacement
+                ),
+                "compress": _handle_strict_undefined(itertools.compress),
+                "permutations": _handle_strict_undefined(itertools.permutations),
+                "product": _handle_strict_undefined(itertools.product),
+                "zip": _handle_strict_undefined(zip),
+                "zip_longest": _handle_strict_undefined(itertools.zip_longest),
             }
         )
 
@@ -931,6 +1155,7 @@ class SerializerExtension(Extension):
 
         return explore(data)
 
+    @_handle_method_strict_undefined
     def format_json(self, value, sort_keys=True, indent=None):
         json_txt = salt.utils.json.dumps(
             value, sort_keys=sort_keys, indent=indent
@@ -940,17 +1165,19 @@ class SerializerExtension(Extension):
         except UnicodeDecodeError:
             return Markup(salt.utils.stringutils.to_unicode(json_txt))
 
+    @_handle_method_strict_undefined
     def format_yaml(self, value, flow_style=True):
         yaml_txt = salt.utils.yaml.safe_dump(
             value, default_flow_style=flow_style
         ).strip()
-        if yaml_txt.endswith("\n..."):  # future lint: disable=blacklisted-function
+        if yaml_txt.endswith("\n..."):
             yaml_txt = yaml_txt[: len(yaml_txt) - 4]
         try:
             return Markup(yaml_txt)
         except UnicodeDecodeError:
             return Markup(salt.utils.stringutils.to_unicode(yaml_txt))
 
+    @_handle_method_strict_undefined
     def format_xml(self, value):
         """Render a formatted multi-line XML string from a complex Python
         data structure. Supports tag attributes and nested dicts/lists.
@@ -1007,9 +1234,11 @@ class SerializerExtension(Extension):
             ).toprettyxml(indent=" ")
         )
 
+    @_handle_method_strict_undefined
     def format_python(self, value):
         return Markup(pprint.pformat(value).strip())
 
+    @_handle_method_strict_undefined
     def load_yaml(self, value):
         if isinstance(value, TemplateModule):
             value = str(value)
@@ -1027,22 +1256,31 @@ class SerializerExtension(Extension):
                 # to the stringified version of the exception.
                 msg += str(exc)
             else:
-                msg += "{}\n".format(problem)
-                msg += salt.utils.stringutils.get_context(
-                    buf, line, marker="    <======================"
-                )
+                if buf is None:
+                    # The libyaml (C) loader populates problem_mark but leaves
+                    # its buffer unset, so there is no source text to render
+                    # context from; fall back to the stringified exception
+                    # rather than crash in get_context.
+                    msg += str(exc)
+                else:
+                    msg += f"{problem}\n"
+                    msg += salt.utils.stringutils.get_context(
+                        buf, line, marker="    <======================"
+                    )
             raise TemplateRuntimeError(msg)
         except AttributeError:
-            raise TemplateRuntimeError("Unable to load yaml from {}".format(value))
+            raise TemplateRuntimeError(f"Unable to load yaml from {value}")
 
+    @_handle_method_strict_undefined
     def load_json(self, value):
         if isinstance(value, TemplateModule):
             value = str(value)
         try:
             return salt.utils.json.loads(value)
         except (ValueError, TypeError, AttributeError):
-            raise TemplateRuntimeError("Unable to load json from {}".format(value))
+            raise TemplateRuntimeError(f"Unable to load json from {value}")
 
+    @_handle_method_strict_undefined
     def load_text(self, value):
         if isinstance(value, TemplateModule):
             value = str(value)
@@ -1076,16 +1314,17 @@ class SerializerExtension(Extension):
         return self._parse_profile_block(parser, label, "profile block", body, lineno)
 
     def _create_profile_id(self, parser):
-        return "_salt_profile_{}".format(parser.free_identifier().name)
+        return f"_salt_profile_{parser.free_identifier().name}"
 
     def _profile_start(self, label, source):
         return (label, source, time.time())
 
     def _profile_end(self, label, source, previous_time):
         log.profile(
-            "Time (in seconds) to render {} '{}': {}".format(
-                source, label, time.time() - previous_time
-            )
+            "Time (in seconds) to render %s '%s': %s",
+            source,
+            label,
+            time.time() - previous_time,
         )
 
     def _parse_profile_block(self, parser, label, source, body, lineno):
@@ -1117,7 +1356,7 @@ class SerializerExtension(Extension):
         filter_name = parser.stream.current.value
         lineno = next(parser.stream).lineno
         if filter_name not in self.environment.filters:
-            parser.fail("Unable to parse {}".format(filter_name), lineno)
+            parser.fail(f"Unable to parse {filter_name}", lineno)
 
         parser.stream.expect("name:as")
         target = parser.parse_assign_target()
@@ -1156,7 +1395,7 @@ class SerializerExtension(Extension):
                 nodes.Name(target, "store").set_lineno(lineno),
                 nodes.Filter(
                     nodes.Name(target, "load").set_lineno(lineno),
-                    "load_{}".format(converter),
+                    f"load_{converter}",
                     [],
                     [],
                     None,
@@ -1165,7 +1404,26 @@ class SerializerExtension(Extension):
             ).set_lineno(lineno),
         ]
         return self._parse_profile_block(
-            parser, import_node.template, "import_{}".format(converter), body, lineno
+            parser, import_node.template, f"import_{converter}", body, lineno
         )
 
-    # pylint: enable=E1120,E1121
+    @_handle_method_strict_undefined
+    def dict_to_sls_yaml_params(self, value, flow_style=False):
+        """
+        .. versionadded:: 3005
+
+        Render a formatted multi-line YAML string from a Python dictionary. Each
+        key/value pair in the dictionary will be added as a single-key dictionary
+        to a list that will then be sent to the YAML formatter.
+
+        :param value: Python dictionary representing Salt state parameters
+
+        :param flow_style: Setting flow_style to False will enforce indentation
+                           mode
+
+        :returns: Formatted SLS YAML string rendered with newlines and
+                  indentation
+        """
+        return self.format_yaml(
+            [{key: val} for key, val in value.items()], flow_style=flow_style
+        )

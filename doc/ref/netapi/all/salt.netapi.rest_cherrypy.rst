@@ -1,4 +1,3 @@
-=============
 rest_cherrypy
 =============
 
@@ -32,6 +31,12 @@ REST URI Reference
 -----------
 
 .. autoclass:: Logout
+    :members: POST
+
+``/token``
+----------
+
+.. autoclass:: Token
     :members: POST
 
 ``/minions``
@@ -80,4 +85,10 @@ REST URI Reference
 ----------
 
 .. autoclass:: Stats
+    :members: GET
+
+``/app``
+--------
+
+.. autoclass:: App
     :members: GET

@@ -4,13 +4,229 @@ Utility functions for state functions
 .. versionadded:: 2018.3.0
 """
 
+import errno
+import logging
+import os
 
-import copy
-
+import salt.payload
 import salt.state
+import salt.utils.files
+import salt.utils.optsdict
+import salt.utils.process
 from salt.exceptions import CommandExecutionError
 
+log = logging.getLogger(__name__)
+
 _empty = object()
+
+_SAFE_MASTER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _sanitize_master_id(master):
+    """
+    Return a filesystem-safe identifier for a master.
+
+    In multimaster, each Minion has its own opts["master"] string. The string
+    may contain characters (``:`` for host:port, ``/`` for IPv6 zone ids, etc.)
+    that are not valid in path components on every OS we support — Windows
+    in particular rejects ``:`` in filenames.
+    """
+    if master is None:
+        return "_default"
+    if isinstance(master, (list, tuple)):
+        master = ",".join(str(m) for m in master)
+    master = str(master)
+    if not master:
+        return "_default"
+    return "".join(c if c in _SAFE_MASTER_CHARS else "_" for c in master)
+
+
+def queue_base_dir(opts):
+    """
+    Return the per-master queue base directory.
+    """
+    return os.path.join(
+        opts["cachedir"], "queues", _sanitize_master_id(opts.get("master"))
+    )
+
+
+def queue_lock_path(opts):
+    """
+    Return the per-master queue lock file path.
+    """
+    return os.path.join(queue_base_dir(opts), "queue.lock")
+
+
+def job_queue_dir(opts):
+    """
+    Return the per-master job queue directory.
+    """
+    return os.path.join(queue_base_dir(opts), "job_queue")
+
+
+def state_queue_dir(opts):
+    """
+    Return the per-master state queue directory.
+    """
+    return os.path.join(queue_base_dir(opts), "state_queue")
+
+
+def acquire_queue_lock(opts):
+    """
+    Acquire the state queue lock
+    """
+    lock_path = queue_lock_path(opts)
+    # Ensure the parent directory exists; the lock lives under the per-master
+    # queue base which may not have been created yet on a fresh minion.
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    except OSError:
+        pass
+    # Use a large timeout to mimic infinite blocking of FileLock, as wait_lock defaults to 5s
+    return salt.utils.files.wait_lock(lock_path, lock_fn=lock_path, timeout=86400)
+
+
+def acquire_async_queue_lock(opts):
+    """
+    Acquire the job queue lock asynchronously
+    """
+    lock_path = queue_lock_path(opts)
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    except OSError:
+        pass
+    # Use timeout that allows queue processing to work but doesn't hang tests
+    return salt.utils.files.await_lock(
+        lock_path, lock_fn=lock_path, timeout=5.0, sleep=0.1
+    )
+
+
+def get_active_states(opts):
+    """
+    Return a list of active state jobs from the proc directory.
+    Unlike saltutil.is_running, this does NOT filter out the current process.
+    """
+    ret = []
+    proc_dir = os.path.join(opts["cachedir"], "proc")
+    if not os.path.isdir(proc_dir):
+        return ret
+
+    try:
+        proc_files = os.listdir(proc_dir)
+    except OSError as exc:
+        if exc.errno in (errno.EMFILE, errno.ENFILE, errno.ENOMEM):
+            # System is resource constrained, we cannot reliably determine active states.
+            # Re-raising ensures we don't assume "no jobs" and cause a storm.
+            raise
+        log.error("Unable to list proc directory %s: %s", proc_dir, exc)
+        return ret
+
+    for fn_ in proc_files:
+        path = os.path.join(proc_dir, fn_)
+        try:
+            with salt.utils.files.fopen(path, "rb") as fp_:
+                buf = fp_.read()
+
+            if not buf:
+                continue
+
+            try:
+                data = salt.payload.loads(buf)
+            except NameError:
+                # msgpack error
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            pid = data.get("pid")
+            if not pid:
+                continue
+
+            if salt.utils.process.os_is_running(pid):
+                if data.get("fun", "").startswith("state."):
+                    ret.append(data)
+
+        except (OSError, ValueError) as exc:
+            # If we run out of FDs while reading a specific file, stop and raise.
+            if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
+                raise
+            continue
+
+    return ret
+
+
+def check_prior_running_states(opts, jid, active_jobs):
+    """
+    Check for prior running states that would block the execution of the current job.
+    Returns a list of blocking jobs.
+    """
+    ret = []
+    # Work on a copy to avoid side effects
+    active_jobs = list(active_jobs)
+
+    # Check for queued jobs in BOTH state_queue and job_queue
+    for queue_dir in (state_queue_dir(opts), job_queue_dir(opts)):
+        if not os.path.exists(queue_dir):
+            continue
+
+        try:
+            for fn in os.listdir(queue_dir):
+                if fn.startswith("queued_") and fn.endswith(".p"):
+                    # fn is queued_<timestamp>_<jid>.p
+                    parts = fn.split("_")
+                    if len(parts) >= 3:
+                        # The JID is the third part
+                        job_jid = parts[2]
+                        if job_jid.endswith(".p"):
+                            job_jid = job_jid[:-2]
+
+                        # We use PID 0 to indicate it's not a real process yet
+                        active_jobs.append(
+                            {"jid": job_jid, "fun": "state.apply", "pid": 0}
+                        )
+        except OSError as exc:
+            log.error("Unable to list queue directory %s: %s", queue_dir, exc)
+
+    for data in active_jobs:
+        data_jid = data.get("jid")
+        if data_jid is None:
+            continue
+
+        if jid is None:
+            # If no JID is provided (e.g. local call without JID), assume current job is newer
+            # than any running job, so any running job is a "prior" job.
+            ret.append(data)
+            continue
+
+        try:
+            # Explicitly ignore the current JID to prevent self-queueing loops
+            if str(data_jid) == str(jid):
+                continue
+
+            # A real running state.* job (non-zero PID) must always block,
+            # regardless of how its JID sorts relative to ours. Comparing by
+            # JID here would let a concurrently running job whose JID sorts
+            # *higher* than ours slip past the check, breaking the "one
+            # state run at a time per minion" guarantee (issue #69825).
+            #
+            # Queued placeholder entries (pid == 0, produced by scanning the
+            # queue directories above) represent jobs that have not yet
+            # started. For those, block only when the placeholder's JID
+            # sorts before ours so the queue processor can dequeue the
+            # oldest queued JID without deadlocking on younger siblings.
+            # Salt JIDs are usually timestamp-based strings (e.g.
+            # 20230524100000) which sort correctly as strings OR ints.
+            pid = data.get("pid")
+            if pid:
+                ret.append(data)
+            elif str(data_jid) < str(jid):
+                ret.append(data)
+        except (ValueError, TypeError):
+            continue
+    return ret
 
 
 def gen_tag(low):
@@ -170,6 +386,7 @@ def merge_subreturn(original_return, sub_return, subkey=None):
     Code Example:
 
     .. code-block:: python
+
         def state_func(name, config, alarm=None):
             ret = {'name': name, 'comment': '', 'changes': {}}
             if alarm:
@@ -208,7 +425,8 @@ def get_sls_opts(opts, **kwargs):
     """
     Return a copy of the opts for use, optionally load a local config on top
     """
-    opts = copy.deepcopy(opts)
+    # Use OptsDict for copy-on-write instead of deep copy
+    opts = salt.utils.optsdict.safe_opts_copy(opts, name="get_sls_opts")
 
     if "localconfig" in kwargs:
         return salt.config.minion_config(kwargs["localconfig"], defaults=opts)
@@ -224,11 +442,23 @@ def get_sls_opts(opts, **kwargs):
                 )
             opts["saltenv"] = kwargs["saltenv"]
 
-    if "pillarenv" in kwargs or opts.get("pillarenv_from_saltenv", False):
-        pillarenv = kwargs.get("pillarenv") or kwargs.get("saltenv")
+    if "pillarenv" in kwargs:
+        # Explicit pillarenv kwarg wins — including an explicit ``None`` which
+        # is how callers request "merge all envs".
+        pillarenv = kwargs["pillarenv"]
         if pillarenv is not None and not isinstance(pillarenv, str):
             opts["pillarenv"] = str(pillarenv)
         else:
             opts["pillarenv"] = pillarenv
+    elif opts.get("pillarenv_from_saltenv", False) and "saltenv" in kwargs:
+        # ``pillarenv_from_saltenv`` only kicks in when the caller actually
+        # passes a ``saltenv`` kwarg; if they didn't, respect whatever
+        # ``pillarenv`` was already in opts (typically the minion config).
+        # Fixes #68791.
+        saltenv = kwargs["saltenv"]
+        if saltenv is not None and not isinstance(saltenv, str):
+            opts["pillarenv"] = str(saltenv)
+        else:
+            opts["pillarenv"] = saltenv
 
     return opts

@@ -37,12 +37,12 @@ def bin_pkg_info(path, saltenv="base"):
     """
     .. versionadded:: 2015.8.0
 
-    Parses RPM metadata and returns a dictionary of information about the
+    Parses DEB metadata and returns a dictionary of information about the
     package (name, version, etc.).
 
     path
         Path to the file. Can either be an absolute path to a file on the
-        minion, or a salt fileserver URL (e.g. ``salt://path/to/file.rpm``).
+        minion, or a salt fileserver URL (e.g. ``salt://path/to/file.deb``).
         If a salt fileserver URL is passed, the file will be cached to the
         minion so that it can be examined.
 
@@ -62,14 +62,14 @@ def bin_pkg_info(path, saltenv="base"):
         newpath = __salt__["cp.cache_file"](path, saltenv)
         if not newpath:
             raise CommandExecutionError(
-                "Unable to retrieve {} from saltenv '{}'".format(path, saltenv)
+                f"Unable to retrieve {path} from saltenv '{saltenv}'"
             )
         path = newpath
     else:
         if not os.path.exists(path):
-            raise CommandExecutionError("{} does not exist on minion".format(path))
+            raise CommandExecutionError(f"{path} does not exist on minion")
         elif not os.path.isabs(path):
-            raise SaltInvocationError("{} does not exist on minion".format(path))
+            raise SaltInvocationError(f"{path} does not exist on minion")
 
     cmd = ["dpkg", "-I", path]
     result = __salt__["cmd.run_all"](cmd, output_loglevel="trace")
@@ -99,7 +99,7 @@ def bin_pkg_info(path, saltenv="base"):
         osarch = __grains__.get("osarch", "")
         arch = ret["arch"]
         if arch != "all" and osarch == "amd64" and osarch != arch:
-            ret["name"] += ":{}".format(arch)
+            ret["name"] += f":{arch}"
 
     return ret
 
@@ -120,7 +120,7 @@ def unpurge(*packages):
     ret = {}
     __salt__["cmd.run"](
         ["dpkg", "--set-selections"],
-        stdin=r"\n".join(["{} install".format(x) for x in packages]),
+        stdin=r"\n".join([f"{x} install" for x in packages]),
         python_shell=False,
         output_loglevel="trace",
     )
@@ -254,8 +254,10 @@ def _get_pkg_info(*packages, **kwargs):
         bin_var = "${Package}"
 
     ret = []
-    cmd = (
-        "dpkg-query -W -f='package:" + bin_var + "\\n"
+    cmd = [
+        "dpkg-query",
+        "-W",
+        "-f=package:" + bin_var + "\\n"
         "revision:${binary:Revision}\\n"
         "architecture:${Architecture}\\n"
         "maintainer:${Maintainer}\\n"
@@ -271,14 +273,12 @@ def _get_pkg_info(*packages, **kwargs):
         "origin:${Origin}\\n"
         "homepage:${Homepage}\\n"
         "status:${db:Status-Abbrev}\\n"
-        "======\\n"
+        "install_date:${db-fsys:Last-Modified}\\n"
         "description:${Description}\\n"
-        "------\\n'"
-    )
-    cmd += " {}".format(" ".join(packages))
-    cmd = cmd.strip()
+        "\\n*/~^\\\\*\\n",
+    ] + list(packages)
 
-    call = __salt__["cmd.run_all"](cmd, python_chell=False)
+    call = __salt__["cmd.run_all"](cmd, python_shell=False)
     if call["retcode"]:
         if failhard:
             raise CommandExecutionError(
@@ -287,19 +287,34 @@ def _get_pkg_info(*packages, **kwargs):
         else:
             return ret
 
-    for pkg_info in [elm for elm in re.split(r"------", call["stdout"]) if elm.strip()]:
+    for pkg_info in [
+        elm
+        for elm in re.split(r"\r?\n\*/~\^\\\*(\r?\n|)", call["stdout"])
+        if elm.strip()
+    ]:
         pkg_data = {}
-        pkg_info, pkg_descr = re.split(r"======", pkg_info)
+        pkg_info, pkg_descr = pkg_info.split("\ndescription:", 1)
         for pkg_info_line in [
             el.strip() for el in pkg_info.split(os.linesep) if el.strip()
         ]:
             key, value = pkg_info_line.split(":", 1)
+            if key == "install_date":
+                # ${db-fsys:Last-Modified} is a Unix timestamp; convert to ISO
+                # format in UTC. Empty/non-integer values (older dpkg, packages
+                # without that field) are skipped.
+                try:
+                    value = (
+                        datetime.datetime.fromtimestamp(
+                            int(value), tz=datetime.timezone.utc
+                        )
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+                except ValueError:
+                    value = None
             if value:
                 pkg_data[key] = value
-            install_date = _get_pkg_install_time(pkg_data.get("package"))
-            if install_date:
-                pkg_data["install_date"] = install_date
-        pkg_data["description"] = pkg_descr.split(":", 1)[-1]
+        pkg_data["description"] = pkg_descr
         ret.append(pkg_data)
 
     return ret
@@ -314,9 +329,9 @@ def _get_pkg_license(pkg):
     :return:
     """
     licenses = set()
-    cpr = "/usr/share/doc/{}/copyright".format(pkg)
+    cpr = f"/usr/share/doc/{pkg}/copyright"
     if os.path.exists(cpr):
-        with salt.utils.files.fopen(cpr) as fp_:
+        with salt.utils.files.fopen(cpr, errors="ignore") as fp_:
             for line in salt.utils.stringutils.to_unicode(fp_.read()).split(os.linesep):
                 if line.startswith("License:"):
                     licenses.add(line.split(":", 1)[1].strip())
@@ -324,53 +339,42 @@ def _get_pkg_license(pkg):
     return ", ".join(sorted(licenses))
 
 
-def _get_pkg_install_time(pkg):
-    """
-    Return package install time, based on the /var/lib/dpkg/info/<package>.list
-
-    :return:
-    """
-    iso_time = None
-    if pkg is not None:
-        location = "/var/lib/dpkg/info/{}.list".format(pkg)
-        if os.path.exists(location):
-            iso_time = (
-                datetime.datetime.utcfromtimestamp(
-                    int(os.path.getmtime(location))
-                ).isoformat()
-                + "Z"
-            )
-
-    return iso_time
-
-
 def _get_pkg_ds_avail():
     """
-    Get the package information of the available packages, maintained by dselect.
-    Note, this will be not very useful, if dselect isn't installed.
+    Get the package information of the available packages via
+    ``dpkg-query --print-avail``. Returns an empty dict when ``dselect`` is
+    not installed (the legacy ``/var/lib/dpkg/available`` file is only
+    maintained by dselect).
+
+    Previously this read ``/var/lib/dpkg/available`` directly, which is a
+    dpkg internal file. Now uses the public ``dpkg-query`` interface to get
+    the same data; see https://lintian.debian.org/tags/uses-dpkg-database-directly.
 
     :return:
     """
-    avail = "/var/lib/dpkg/available"
-    if not salt.utils.path.which("dselect") or not os.path.exists(avail):
-        return dict()
+    if not salt.utils.path.which("dselect"):
+        return {}
 
-    # Do not update with dselect, just read what is.
-    ret = dict()
+    call = __salt__["cmd.run_all"](
+        ["dpkg-query", "--print-avail"], python_shell=False, ignore_retcode=True
+    )
+    if call["retcode"]:
+        return {}
+
+    ret = {}
     pkg_mrk = "Package:"
     pkg_name = "package"
-    with salt.utils.files.fopen(avail) as fp_:
-        for pkg_info in salt.utils.stringutils.to_unicode(fp_.read()).split(pkg_mrk):
-            nfo = dict()
-            for line in (pkg_mrk + pkg_info).split(os.linesep):
-                line = line.split(": ", 1)
-                if len(line) != 2:
-                    continue
-                key, value = line
-                if value.strip():
-                    nfo[key.lower()] = value
-            if nfo.get(pkg_name):
-                ret[nfo[pkg_name]] = nfo
+    for pkg_info in call["stdout"].split(pkg_mrk):
+        nfo = {}
+        for line in (pkg_mrk + pkg_info).split(os.linesep):
+            line = line.split(": ", 1)
+            if len(line) != 2:
+                continue
+            key, value = line
+            if value.strip():
+                nfo[key.lower()] = value
+        if nfo.get(pkg_name):
+            ret[nfo[pkg_name]] = nfo
 
     return ret
 
@@ -391,7 +395,7 @@ def info(*packages, **kwargs):
 
         .. versionadded:: 2016.11.3
 
-    CLI example:
+    CLI Example:
 
     .. code-block:: bash
 
@@ -399,8 +403,9 @@ def info(*packages, **kwargs):
         salt '*' lowpkg.info apache2 bash
         salt '*' lowpkg.info 'php5*' failhard=false
     """
-    # Get the missing information from the /var/lib/dpkg/available, if it is there.
-    # However, this file is operated by dselect which has to be installed.
+    # Get the missing information via `dpkg-query --print-avail`, if dselect is
+    # installed. This data is only kept up-to-date by dselect, so it is only
+    # queried when dselect is present.
     dselect_pkg_avail = _get_pkg_ds_avail()
 
     kwargs = salt.utils.args.clean_kwargs(**kwargs)

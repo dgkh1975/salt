@@ -70,7 +70,7 @@ def active(display_progress=False):
     for minion, data in active_.items():
         if display_progress:
             __jid_event__.fire_event(
-                {"message": "Received reply from minion {}".format(minion)}, "progress"
+                {"message": f"Received reply from minion {minion}"}, "progress"
             )
         if not isinstance(data, list):
             continue
@@ -88,7 +88,7 @@ def active(display_progress=False):
         returner = _get_returner(
             (__opts__["ext_job_cache"], __opts__["master_job_cache"])
         )
-        data = mminion.returners["{}.get_jid".format(returner)](jid)
+        data = mminion.returners[f"{returner}.get_jid"](jid)
         if data:
             for minion in data:
                 if minion not in ret[jid]["Returned"]:
@@ -139,7 +139,7 @@ def lookup_jid(
     try:
         data = list_job(jid, ext_source=ext_source, display_progress=display_progress)
     except TypeError:
-        return "Requested returner could not be loaded. " "No JIDs could be retrieved."
+        return "Requested returner could not be loaded. No JIDs could be retrieved."
 
     targeted_minions = data.get("Minions", [])
     returns = data.get("Result", {})
@@ -199,12 +199,12 @@ def list_job(jid, ext_source=None, display_progress=False):
     )
     if display_progress:
         __jid_event__.fire_event(
-            {"message": "Querying returner: {}".format(returner)}, "progress"
+            {"message": f"Querying returner: {returner}"}, "progress"
         )
 
-    job = mminion.returners["{}.get_load".format(returner)](jid)
+    job = mminion.returners[f"{returner}.get_load"](jid)
     ret.update(_format_jid_instance(jid, job))
-    ret["Result"] = mminion.returners["{}.get_jid".format(returner)](jid)
+    ret["Result"] = mminion.returners[f"{returner}.get_jid"](jid)
 
     fstr = "{}.get_endtime".format(__opts__["master_job_cache"])
     if __opts__.get("job_cache_store_endtime") and fstr in mminion.returners:
@@ -306,11 +306,11 @@ def list_jobs(
     )
     if display_progress:
         __jid_event__.fire_event(
-            {"message": "Querying returner {} for jobs.".format(returner)}, "progress"
+            {"message": f"Querying returner {returner} for jobs."}, "progress"
         )
     mminion = salt.minion.MasterMinion(__opts__)
 
-    ret = mminion.returners["{}.get_jids".format(returner)]()
+    ret = mminion.returners[f"{returner}.get_jids"]()
 
     mret = {}
     for item in ret:
@@ -355,8 +355,7 @@ def list_jobs(
                     _match = True
             else:
                 log.error(
-                    "'dateutil' library not available, skipping start_time "
-                    "comparison."
+                    "'dateutil' library not available, skipping start_time comparison."
                 )
 
         if end_time and _match:
@@ -368,7 +367,7 @@ def list_jobs(
                     _match = True
             else:
                 log.error(
-                    "'dateutil' library not available, skipping end_time " "comparison."
+                    "'dateutil' library not available, skipping end_time comparison."
                 )
 
         if _match:
@@ -402,15 +401,13 @@ def list_jobs_filter(
     )
     if display_progress:
         __jid_event__.fire_event(
-            {"message": "Querying returner {} for jobs.".format(returner)}, "progress"
+            {"message": f"Querying returner {returner} for jobs."}, "progress"
         )
     mminion = salt.minion.MasterMinion(__opts__)
 
-    fun = "{}.get_jids_filter".format(returner)
+    fun = f"{returner}.get_jids_filter"
     if fun not in mminion.returners:
-        raise NotImplementedError(
-            "'{}' returner function not implemented yet.".format(fun)
-        )
+        raise NotImplementedError(f"'{fun}' returner function not implemented yet.")
     ret = mminion.returners[fun](count, filter_find_job)
 
     if outputter:
@@ -437,7 +434,7 @@ def print_job(jid, ext_source=None):
     mminion = salt.minion.MasterMinion(__opts__)
 
     try:
-        job = mminion.returners["{}.get_load".format(returner)](jid)
+        job = mminion.returners[f"{returner}.get_load"](jid)
         ret[jid] = _format_jid_instance(jid, job)
     except TypeError:
         ret[jid]["Result"] = (
@@ -445,7 +442,7 @@ def print_job(jid, ext_source=None):
             "retrieved. Check master log for details.".format(returner)
         )
         return ret
-    ret[jid]["Result"] = mminion.returners["{}.get_jid".format(returner)](jid)
+    ret[jid]["Result"] = mminion.returners[f"{returner}.get_jid"](jid)
 
     fstr = "{}.get_endtime".format(__opts__["master_job_cache"])
     if __opts__.get("job_cache_store_endtime") and fstr in mminion.returners:
@@ -501,7 +498,32 @@ def last_run(
     """
     .. versionadded:: 2015.8.0
 
-    List all detectable jobs and associated functions
+    Return the most recent job (the one with the highest JID) that matches
+    the supplied filters. With no filters this returns the single most
+    recent job recorded by the active master job cache.
+
+    ext_source
+        The external job cache to read from. Defaults to the master job
+        cache configured via ``master_job_cache``.
+
+    outputter
+        Override the default outputter when returning the job result.
+
+    metadata
+        A dictionary of metadata values to filter on. Only jobs whose
+        recorded metadata matches every key/value pair will be considered.
+
+    function
+        Only consider jobs that invoked the named execution function (for
+        example ``cmd.run``).
+
+    target
+        Only consider jobs that ran against the specified target.
+
+    display_progress
+        When ``True``, display progress events while scanning jobs.
+
+    Returns ``False`` when no matching job is found.
 
     CLI Example:
 
@@ -561,10 +583,22 @@ def _format_job_instance(job):
 
     if "metadata" in job:
         ret["Metadata"] = job.get("metadata", {})
+    elif "kwargs" in job and "metadata" in job["kwargs"]:
+        ret["Metadata"] = job["kwargs"].get("metadata", {})
     else:
-        if "kwargs" in job:
-            if "metadata" in job["kwargs"]:
-                ret["Metadata"] = job["kwargs"].get("metadata", {})
+        # When ``metadata`` is passed as a keyword argument on the CLI
+        # (e.g. ``salt '*' state.apply foo metadata='{...}'``) it is
+        # carried inside ``arg`` as a ``__kwarg__: True`` dict rather
+        # than at the top of the job payload. Surface it as ``Metadata``
+        # so ``jobs.list_jobs search_metadata=...`` can match it.
+        for arg in job.get("arg", []) or []:
+            if (
+                isinstance(arg, dict)
+                and arg.get("__kwarg__") is True
+                and "metadata" in arg
+            ):
+                ret["Metadata"] = arg.get("metadata", {})
+                break
 
     if "Minions" in job:
         ret["Minions"] = job["Minions"]
@@ -584,24 +618,20 @@ def _walk_through(job_dir, display_progress=False):
     """
     Walk through the job dir and return jobs
     """
-    serial = salt.payload.Serial(__opts__)
-
     for top in os.listdir(job_dir):
         t_path = os.path.join(job_dir, top)
 
         for final in os.listdir(t_path):
             load_path = os.path.join(t_path, final, ".load.p")
             with salt.utils.files.fopen(load_path, "rb") as rfh:
-                job = serial.load(rfh)
+                job = salt.payload.load(rfh)
 
             if not os.path.isfile(load_path):
                 continue
 
             with salt.utils.files.fopen(load_path, "rb") as rfh:
-                job = serial.load(rfh)
+                job = salt.payload.load(rfh)
             jid = job["jid"]
             if display_progress:
-                __jid_event__.fire_event(
-                    {"message": "Found JID {}".format(jid)}, "progress"
-                )
+                __jid_event__.fire_event({"message": f"Found JID {jid}"}, "progress")
             yield jid, job, t_path, final

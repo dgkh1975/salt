@@ -1,6 +1,7 @@
 import os.path
 
 import pytest
+
 import salt.modules.archive as archive
 from salt.exceptions import CommandNotFoundError
 from tests.support.mock import MagicMock, patch
@@ -71,6 +72,76 @@ def test_tar():
                     template=None,
                     cwd=None,
                 )
+
+
+def test_tar_dest_precedes_sources_on_create():
+    """
+    When packing, the ``-C <dest>`` option must come before the source
+    operands or tar ignores it and archives the wrong directory (#57847).
+    """
+    with patch("glob.glob", lambda pathname: [pathname]):
+        with patch("salt.utils.path.which", lambda exe: exe):
+            mock = MagicMock(return_value="salt")
+            with patch.dict(archive.__salt__, {"cmd.run": mock}):
+                archive.tar("jpcf", "/srv/img/foo.tar.bz2", ".", dest="/tmp/foo/bar")
+                mock.assert_called_once_with(
+                    [
+                        "tar",
+                        "jpcf",
+                        "/srv/img/foo.tar.bz2",
+                        "-C",
+                        "/tmp/foo/bar",
+                        ".",
+                    ],
+                    runas=None,
+                    python_shell=False,
+                    template=None,
+                    cwd=None,
+                )
+
+
+def test_tar_dest_precedes_sources_on_extract():
+    """
+    On extraction of specific members the ``-C <dest>`` option must also
+    precede the member operands so they land in the destination directory.
+    """
+    with patch("glob.glob", lambda pathname: [pathname]):
+        with patch("salt.utils.path.which", lambda exe: exe):
+            mock = MagicMock(return_value="salt")
+            with patch.dict(archive.__salt__, {"cmd.run": mock}):
+                archive.tar("xf", "foo.tar", "somefile", dest="/target/directory")
+                mock.assert_called_once_with(
+                    [
+                        "tar",
+                        "xf",
+                        "foo.tar",
+                        "-C",
+                        "/target/directory",
+                        "somefile",
+                    ],
+                    runas=None,
+                    python_shell=False,
+                    template=None,
+                    cwd=None,
+                )
+
+
+def test_tar_dest_without_sources():
+    """
+    The documented extract-into-dest case (no sources) is unchanged: the
+    archive is followed directly by ``-C <dest>``.
+    """
+    with patch("salt.utils.path.which", lambda exe: exe):
+        mock = MagicMock(return_value="salt")
+        with patch.dict(archive.__salt__, {"cmd.run": mock}):
+            archive.tar("xf", "foo.tar", dest="/target/directory")
+            mock.assert_called_once_with(
+                ["tar", "xf", "foo.tar", "-C", "/target/directory"],
+                runas=None,
+                python_shell=False,
+                template=None,
+                cwd=None,
+            )
 
 
 def test_tar_raises_exception_if_not_found():
@@ -183,7 +254,7 @@ def test_zip():
             **{
                 "isdir": MagicMock(return_value=False),
                 "exists": MagicMock(return_value=True),
-            }
+            },
         ):
             with patch("zipfile.ZipFile", MagicMock()):
                 ret = archive.zip_(
@@ -377,6 +448,48 @@ def test_unzip():
         assert ["salt"] == ret
 
 
+def test_unzip_password():
+    mock = ZipFileMock()
+    target = "/tmp/salt.zip"
+    dest = "/tmp/dest"
+    # This is the file inside target zip file, returned by ZipFileMock.namelist
+    expected_file_name = "salt"
+    with patch("zipfile.ZipFile", mock):
+        ret = archive.unzip(target, dest, password="spongebob", extract_perms=False)
+        assert [expected_file_name] == ret
+        # mock needs to be mock() because contextlib.closing appears to actually
+        # call the mock
+        mock().extract.assert_called_once_with(expected_file_name, dest, b"spongebob")
+
+
+def test_unzip_password_bytestring():
+    mock = ZipFileMock()
+    target = "/tmp/salt.zip"
+    dest = "/tmp/dest"
+    # This is the file inside target zip file, returned by ZipFileMock.namelist
+    expected_file_name = "salt"
+    with patch("zipfile.ZipFile", mock):
+        ret = archive.unzip(target, dest, password=b"spongebob", extract_perms=False)
+        assert [expected_file_name] == ret
+        # mock needs to be mock() because contextlib.closing appears to actually
+        # call the mock
+        mock().extract.assert_called_once_with(expected_file_name, dest, b"spongebob")
+
+
+def test_unzip_password_integer():
+    mock = ZipFileMock()
+    target = "/tmp/salt.zip"
+    dest = "/tmp/dest"
+    # This is the file inside target zip file, returned by ZipFileMock.namelist
+    expected_file_name = "salt"
+    with patch("zipfile.ZipFile", mock):
+        ret = archive.unzip(target, dest, password=12345, extract_perms=False)
+        assert [expected_file_name] == ret
+        # mock needs to be mock() because contextlib.closing appears to actually
+        # call the mock
+        mock().extract.assert_called_once_with(expected_file_name, dest, b"12345")
+
+
 def test_unzip_raises_exception_if_not_found():
     mock = MagicMock(return_value="salt")
     with patch.dict(archive.__salt__, {"cmd.run": mock}):
@@ -446,7 +559,7 @@ def test_rar_raises_exception_if_not_found():
             assert not mock.called
 
 
-@pytest.mark.skip_if_binaries_missing("unrar", "rar", message="unrar not installed")
+@pytest.mark.skip_if_binaries_missing("unrar", "rar", reason="unrar not installed")
 def test_unrar():
     with patch(
         "salt.utils.path.which_bin",
@@ -511,7 +624,8 @@ def test_unrar_raises_exception_if_not_found():
         with patch.dict(archive.__salt__, {"cmd.run": mock}):
             with pytest.raises(CommandNotFoundError):
                 archive.unrar(
-                    "/tmp/rarfile.rar", "/home/strongbad/",
+                    "/tmp/rarfile.rar",
+                    "/home/strongbad/",
                 )
             assert not mock.called
 

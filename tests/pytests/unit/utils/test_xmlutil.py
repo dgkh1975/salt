@@ -1,6 +1,8 @@
+import xml.etree.ElementTree as ET
+
 import pytest
+
 import salt.utils.xmlutil as xml
-from salt._compat import ElementTree as ET
 
 
 @pytest.fixture
@@ -213,7 +215,7 @@ def test_change_xml_template_list(xml_doc):
 def test_strip_spaces():
     xml_str = """<domain>
             <name>test01</name>
-            <memory unit="MiB" >1024</memory> 
+            <memory unit="MiB" >1024</memory>
         </domain>
     """
     expected_str = (

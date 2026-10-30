@@ -10,10 +10,11 @@ Two configurations can be set to modify the highstate outputter. These values
 can be set in the master config to change the output of the ``salt`` command or
 set in the minion config to change the output of the ``salt-call`` command.
 
-state_verbose
+state_verbose:
     By default `state_verbose` is set to `True`, setting this to `False` will
     instruct the highstate outputter to omit displaying anything in green, this
     means that nothing with a result of True and no changes will not be printed
+
 state_output:
     The highstate outputter has six output modes,
     ``full``, ``terse``, ``mixed``, ``changes`` and ``filter``
@@ -43,17 +44,37 @@ state_output:
       These can be set as such from the command line, or in the Salt config as
       `state_output_exclude` or `state_output_terse`, respectively.
 
-    The output modes have one modifier:
+    The output modes have two modifiers that can be combined:
 
     ``full_id``, ``terse_id``, ``mixed_id``, ``changes_id`` and ``filter_id``
     If ``_id`` is used, then the corresponding form will be used, but the value for ``name``
     will be drawn from the state ID. This is useful for cases where the name
     value might be very long and hard to read.
 
+    ``full_color``, ``terse_color``, ``mixed_color``, ``changes_color`` and ``filter_color``
+    If ``_color`` is used, unified diffs in the changes section will be
+    colorized: added lines in green, removed lines in red, hunk headers
+    (``@@``) in cyan, file headers (``---`` / ``+++``) in bold red/green, and
+    context lines in gray. All other output behavior is identical to the base
+    mode.
+
+    The ``_id`` and ``_color`` modifiers can be combined, e.g. ``full_id_color``
+    or ``full_color_id``.
+
 state_tabular:
     If `state_output` uses the terse output, set this to `True` for an aligned
     output format.  If you wish to use a custom format, this can be set to a
     string.
+
+state_output_pct:
+    Set `state_output_pct` to `True` in order to add "Success %" and "Failure %"
+    to the "Summary" section at the end of the highstate output.
+
+state_compress_ids:
+    Set `state_compress_ids` to `True` to aggregate information about states
+    which have multiple "names" under the same state ID in the highstate output.
+    This is useful in combination with the `terse_id` value set in the
+    `state_output` option when states are using the `names` state parameter.
 
 Example usage:
 
@@ -112,21 +133,167 @@ Example output with no special settings in configuration files:
     Total:     0
 """
 
-# Import python libs
-
+import collections
 import logging
 import pprint
 import re
 import textwrap
 
 import salt.output
-
-# Import salt libs
 import salt.utils.color
 import salt.utils.data
 import salt.utils.stringutils
 
 log = logging.getLogger(__name__)
+
+# Placeholder injected in place of each diff string before the nested outputter
+# runs, then swapped back for a colorized diff.  ``{}`` is filled with a unique
+# index; the regex below matches every such placeholder in a single pass,
+# capturing the leading indent (group 1) and the sentinel id (group 2).
+_COLORDIFF_SENTINEL = "__COLORDIFF_{}__"
+_COLORDIFF_RE = re.compile(
+    r"^( *)(?:\x1b\[[0-9;]*m)*(__COLORDIFF_\d+__)(?:\x1b\[[0-9;]*m)*$",
+    re.MULTILINE,
+)
+
+
+def _compress_ids(data):
+    """
+    Function to take incoming raw state data and roll IDs with multiple names
+    into a single state block for reporting purposes. This functionality is most
+    useful for any "_id" state_output options, such as ``terse_id``.
+
+    The following example state has one ID and four names.
+
+    .. code-block:: yaml
+
+    mix-matched results:
+      cmd.run:
+        - names:
+          - "true"
+          - "false"
+          - "/bin/true"
+          - "/bin/false"
+
+    With ``state_output: terse_id`` set, this can create many lines of output
+    which are not unique enough to be worth the screen real estate they occupy.
+
+    .. code-block:: text
+
+        19:10:10.969049 [  8.546 ms]        cmd.run        Changed   Name: mix-matched results
+        19:10:10.977998 [  8.606 ms]        cmd.run        Failed    Name: mix-matched results
+        19:10:10.987116 [  7.618 ms]        cmd.run        Changed   Name: mix-matched results
+        19:10:10.995172 [  9.344 ms]        cmd.run        Failed    Name: mix-matched results
+
+    Enabling ``state_compress_ids: True`` consolidates the state data by ID and
+    result (e.g. success or failure). The earliest start time is chosen for
+    display, duration is aggregated, and the total number of names if shown in
+    parentheses to the right of the ID.
+
+    .. code-block:: text
+
+        19:10:46.283323 [ 16.236 ms]        cmd.run        Changed   Name: mix-matched results (2)
+        19:10:46.292181 [ 16.255 ms]        cmd.run        Failed    Name: mix-matched results (2)
+
+    A better real world use case would be passing dozens of files and
+    directories to the ``names`` parameter of the ``file.absent`` state. The
+    amount of lines consolidated in that case would be substantial.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    compressed = {}
+
+    # any failures to compress result in passing the original data
+    # to the highstate outputter without modification
+    try:
+        for host, hostdata in data.items():
+            compressed[host] = {}
+            # count the number of unique IDs. use sls name and result in the key
+            # so differences can be shown separately in the output
+            id_count = collections.Counter(
+                [
+                    "_".join(
+                        map(
+                            str,
+                            [
+                                tname.split("_|-")[0],
+                                info["__id__"],
+                                info["__sls__"],
+                                info["result"],
+                            ],
+                        )
+                    )
+                    for tname, info in hostdata.items()
+                ]
+            )
+            for tname, info in hostdata.items():
+                comps = tname.split("_|-")
+                _id = "_".join(
+                    map(
+                        str, [comps[0], info["__id__"], info["__sls__"], info["result"]]
+                    )
+                )
+                # state does not need to be compressed
+                if id_count[_id] == 1:
+                    compressed[host][tname] = info
+                    continue
+
+                # replace name to create a single key by sls and result
+                comps[2] = "_".join(
+                    map(
+                        str,
+                        [
+                            "state_compressed",
+                            info["__sls__"],
+                            info["__id__"],
+                            info["result"],
+                        ],
+                    )
+                )
+                comps[1] = "{} ({})".format(info["__id__"], id_count[_id])
+                tname = "_|-".join(comps)
+
+                # store the first entry as-is
+                if tname not in compressed[host]:
+                    compressed[host][tname] = info
+                    continue
+
+                # subsequent entries for compression will use the lowest
+                # __run_num__ value, the sum of the duration, and the earliest
+                # start time found
+                compressed[host][tname]["__run_num__"] = min(
+                    info["__run_num__"], compressed[host][tname]["__run_num__"]
+                )
+                compressed[host][tname]["duration"] = round(
+                    sum([info["duration"], compressed[host][tname]["duration"]]), 3
+                )
+                compressed[host][tname]["start_time"] = sorted(
+                    [info["start_time"], compressed[host][tname]["start_time"]]
+                )[0]
+
+                # changes are turned into a dict of changes keyed by name
+                if compressed[host][tname].get("changes") and info.get("changes"):
+                    if not compressed[host][tname]["changes"].get("compressed changes"):
+                        compressed[host][tname]["changes"] = {
+                            "compressed changes": {
+                                compressed[host][tname]["name"]: compressed[host][
+                                    tname
+                                ]["changes"]
+                            }
+                        }
+                    compressed[host][tname]["changes"]["compressed changes"].update(
+                        {info["name"]: info["changes"]}
+                    )
+                elif info.get("changes"):
+                    compressed[host][tname]["changes"] = {
+                        "compressed changes": {info["name"]: info["changes"]}
+                    }
+    except Exception:  # pylint: disable=broad-except
+        log.warning("Unable to compress state output by ID! Returning output normally.")
+        return data
+
+    return compressed
 
 
 def output(data, **kwargs):  # pylint: disable=unused-argument
@@ -168,6 +335,10 @@ def output(data, **kwargs):  # pylint: disable=unused-argument
     if orchestrator_output:
         del data["retcode"]
 
+    # pre-process data if state_compress_ids is set
+    if __opts__.get("state_compress_ids", False):
+        data = _compress_ids(data)
+
     indent_level = kwargs.get("indent_level", 1)
     ret = [
         _format_host(host, hostdata, indent_level=indent_level)[0]
@@ -189,12 +360,19 @@ def _format_host(host, data, indent_level=1):
     """
     host = salt.utils.data.decode(host)
 
-    colors = salt.utils.color.get_colors(
-        __opts__.get("color"), __opts__.get("color_theme")
-    )
+    # There is no ``color`` key in the config defaults; ``get_printout``
+    # resolves it to True/False (default True) before the outputter normally
+    # runs.  On a direct call that resolution is skipped, so an unset value can
+    # reach here as None.  Fall back to Salt's default of True so it matches
+    # the ``color is False`` check used in ``_render_diff``.
+    color_opt = __opts__.get("color")
+    if color_opt is None:
+        color_opt = True
+    colors = salt.utils.color.get_colors(color_opt, __opts__.get("color_theme"))
     tabular = __opts__.get("state_tabular", False)
     rcounts = {}
     rdurations = []
+    pdurations = []
     hcolor = colors["GREEN"]
     hstrs = []
     nchanges = 0
@@ -244,18 +422,45 @@ def _format_host(host, data, indent_level=1):
             ret = data[tname]
             # Increment result counts
             rcounts.setdefault(ret["result"], 0)
-            rcounts[ret["result"]] += 1
-            rduration = ret.get("duration", 0)
-            try:
-                rdurations.append(float(rduration))
-            except ValueError:
-                rduration, _, _ = rduration.partition(" ms")
+
+            # unpack state compression counts
+            compressed_count = 1
+            if (
+                __opts__.get("state_compress_ids", False)
+                and "_|-state_compressed_" in tname
+            ):
+                _, _id, _, _ = tname.split("_|-")
+                count_match = re.search(r"\((\d+)\)$", _id)
+                if count_match:
+                    compressed_count = int(count_match.group(1))
+
+            rcounts[ret["result"]] += compressed_count
+            if "__parallel__" in ret:
+                pduration = ret.get("duration", 0)
+                try:
+                    pdurations.append(float(pduration))
+                except ValueError:
+                    pduration, _, _ = pduration.partition(" ms")
+                    try:
+                        pdurations.append(float(pduration))
+                    except ValueError:
+                        log.error(
+                            "Cannot parse a float from duration %s",
+                            ret.get("duration", 0),
+                        )
+            else:
+                rduration = ret.get("duration", 0)
                 try:
                     rdurations.append(float(rduration))
                 except ValueError:
-                    log.error(
-                        "Cannot parse a float from duration %s", ret.get("duration", 0)
-                    )
+                    rduration, _, _ = rduration.partition(" ms")
+                    try:
+                        rdurations.append(float(rduration))
+                    except ValueError:
+                        log.error(
+                            "Cannot parse a float from duration %s",
+                            ret.get("duration", 0),
+                        )
 
             tcolor = colors["GREEN"]
             if ret.get("name") in ["state.orch", "state.orchestrate", "state.sls"]:
@@ -266,8 +471,12 @@ def _format_host(host, data, indent_level=1):
                 schanged = True
                 nchanges += 1
             else:
-                schanged, ctext = _format_changes(ret["changes"])
-                nchanges += 1 if schanged else 0
+                schanged, ctext = _format_changes(ret["changes"], colors)
+                # if compressed, the changes are keyed by name
+                if schanged and compressed_count > 1:
+                    nchanges += len(ret["changes"].get("compressed changes", {})) or 1
+                else:
+                    nchanges += 1 if schanged else 0
 
             # Skip this state if it was successful & diff output was requested
             if (
@@ -296,6 +505,9 @@ def _format_host(host, data, indent_level=1):
                 tcolor = colors["LIGHT_YELLOW"]
 
             state_output = __opts__.get("state_output", "full").lower()
+            # Strip the _color modifier before all mode comparisons so that
+            # e.g. "full_color" behaves identically to "full" for layout purposes.
+            state_output = state_output.replace("_color", "")
             comps = tname.split("_|-")
 
             if state_output.endswith("_id"):
@@ -356,7 +568,7 @@ def _format_host(host, data, indent_level=1):
                 "    {tcolor}  Result: {ret[result]!s}{colors[ENDC]}",
                 "    {tcolor} Comment: {comment}{colors[ENDC]}",
             ]
-            if __opts__.get("state_output_profile", True) and "start_time" in ret:
+            if __opts__.get("state_output_profile") and "start_time" in ret:
                 state_lines.extend(
                     [
                         "    {tcolor} Started: {ret[start_time]!s}{colors[ENDC]}",
@@ -388,10 +600,10 @@ def _format_host(host, data, indent_level=1):
             if "data" in ret:
                 if isinstance(ret["data"], list):
                     for item in ret["data"]:
-                        comment = "{} {}".format(comment, item)
+                        comment = f"{comment} {item}"
                 elif isinstance(ret["data"], dict):
                     for key, value in ret["data"].items():
-                        comment = "{}\n\t\t{}: {}".format(comment, key, value)
+                        comment = f"{comment}\n\t\t{key}: {value}"
                 else:
                     comment = "{} {}".format(comment, ret["data"])
             for detail in ["start_time", "duration"]:
@@ -451,13 +663,13 @@ def _format_host(host, data, indent_level=1):
             changestats.append(
                 colorfmt.format(
                     colors["LIGHT_YELLOW"],
-                    "unchanged={}".format(rcounts.get(None, 0)),
+                    f"unchanged={rcounts.get(None, 0)}",
                     colors,
                 )
             )
         if nchanges > 0:
             changestats.append(
-                colorfmt.format(colors["GREEN"], "changed={}".format(nchanges), colors)
+                colorfmt.format(colors["GREEN"], f"changed={nchanges}", colors)
             )
         if changestats:
             changestats = " ({})".format(", ".join(changestats))
@@ -482,6 +694,46 @@ def _format_host(host, data, indent_level=1):
             )
         )
 
+        if __opts__.get("state_output_pct", False):
+            # Add success percentages to the summary output
+            try:
+                success_pct = round(
+                    (
+                        (rcounts.get(True, 0) + rcounts.get(None, 0))
+                        / (sum(rcounts.values()) - rcounts.get("warnings", 0))
+                    )
+                    * 100,
+                    2,
+                )
+
+                hstrs.append(
+                    colorfmt.format(
+                        colors["GREEN"],
+                        _counts("Success %", success_pct),
+                        colors,
+                    )
+                )
+            except ZeroDivisionError:
+                pass
+
+            # Add failure percentages to the summary output
+            try:
+                failed_pct = round(
+                    (num_failed / (sum(rcounts.values()) - rcounts.get("warnings", 0)))
+                    * 100,
+                    2,
+                )
+
+                hstrs.append(
+                    colorfmt.format(
+                        colors["RED"] if num_failed else colors["CYAN"],
+                        _counts("Failure %", failed_pct),
+                        colors,
+                    )
+                )
+            except ZeroDivisionError:
+                pass
+
         num_warnings = rcounts.get("warnings", 0)
         if num_warnings:
             hstrs.append(
@@ -498,45 +750,162 @@ def _format_host(host, data, indent_level=1):
         )
         hstrs.append(colorfmt.format(colors["CYAN"], totals, colors))
 
-        if __opts__.get("state_output_profile", True):
+        if __opts__.get("state_output_profile"):
             sum_duration = sum(rdurations)
+            if pdurations:
+                max_pduration = max(pdurations)
+                sum_duration = sum_duration + max_pduration
             duration_unit = "ms"
             # convert to seconds if duration is 1000ms or more
             if sum_duration > 999:
                 sum_duration /= 1000
                 duration_unit = "s"
             total_duration = "Total run time: {} {}".format(
-                "{:.3f}".format(sum_duration).rjust(line_max_len - 5), duration_unit
+                f"{sum_duration:.3f}".rjust(line_max_len - 5), duration_unit
             )
             hstrs.append(colorfmt.format(colors["CYAN"], total_duration, colors))
 
     if strip_colors:
         host = salt.output.strip_esc_sequence(host)
-    hstrs.insert(0, ("{0}{1}:{2[ENDC]}".format(hcolor, host, colors)))
+    hstrs.insert(0, "{0}{1}:{2[ENDC]}".format(hcolor, host, colors))
     return "\n".join(hstrs), nchanges > 0
+
+
+def _render_diff(diff_str, indent, colors):
+    """
+    Render a unified diff string with per-line ANSI colorization.
+
+    Each line is colored according to its unified-diff role:
+      ``---`` (from-file header)       -> LIGHT_RED (bold)
+      ``+++`` (to-file header)         -> LIGHT_GREEN (bold)
+      ``@@``  (hunk header)            -> CYAN
+      ``+``   (added line)             -> GREEN
+      ``-``   (removed line)           -> RED
+      context lines (leading space)    -> LIGHT_GRAY
+
+    The ``indent`` argument (an integer) is prepended as spaces to every line,
+    matching the nesting depth used by the surrounding nested outputter output.
+    The ``colors`` dict must be pre-built by the caller (e.g. from
+    ``salt.utils.color.get_colors``).  Embedded terminal escape sequences in
+    the (untrusted) diff content are neutralized when ``strip_colors`` is set,
+    matching the ``nested`` outputter.
+    """
+    prefix = " " * indent
+
+    # Diff content is untrusted; neutralize any embedded escape sequences up
+    # front (ESC is not a line boundary, so this is equivalent to stripping
+    # each line) before we add the colorization escape codes.
+    if __opts__.get("strip_colors", True):
+        diff_str = salt.output.strip_esc_sequence(diff_str)
+
+    if __opts__.get("color") is False:
+        return "\n".join(prefix + line for line in diff_str.splitlines())
+
+    GREEN = str(colors["GREEN"])
+    ENDC = str(colors["ENDC"])
+    RED = str(colors["RED"])
+    CYAN = str(colors["CYAN"])
+    WHITE = str(colors["LIGHT_GRAY"])
+    LIGHT_RED = str(colors["LIGHT_RED"])
+    LIGHT_GREEN = str(colors["LIGHT_GREEN"])
+
+    result = []
+    for line in diff_str.splitlines():
+        if line.startswith("---"):
+            color = LIGHT_RED
+        elif line.startswith("+++"):
+            color = LIGHT_GREEN
+        elif line.startswith("@@"):
+            color = CYAN
+        elif line.startswith("+"):
+            color = GREEN
+        elif line.startswith("-"):
+            color = RED
+        else:
+            color = WHITE
+        result.append(f"{prefix}{color}{line}{ENDC}")
+    return "\n".join(result)
 
 
 def _nested_changes(changes):
     """
-    Print the changes data using the nested outputter
+    Print the changes data using the nested outputter.
     """
     ret = "\n"
     ret += salt.output.out_format(changes, "nested", __opts__, nested_indent=14)
     return ret
 
 
-def _format_changes(changes, orchestration=False):
+def _nested_changes_colorized(changes, colors):
     """
-    Format the changes dict based on what the data is
+    Print the changes data with diff colorization (used when state_output
+    contains the ``_color`` modifier, e.g. ``full_color``).
+
+    Replaces every ``diff`` string value at any nesting depth with a unique
+    sentinel, delegates all structural formatting to the native nested
+    outputter, then swaps each sentinel line back for a per-line colorized
+    diff.  Note: ``colors`` must be pre-built by the caller.
+    """
+    sentinels = {}  # sentinel string -> raw diff string
+
+    def _replace_diffs(obj):
+        if isinstance(obj, dict):
+            return {
+                k: (
+                    _assign_sentinel(v)
+                    if k == "diff" and isinstance(v, str)
+                    else _replace_diffs(v)
+                )
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [_replace_diffs(i) for i in obj]
+        return obj
+
+    def _assign_sentinel(diff_str):
+        sentinel = _COLORDIFF_SENTINEL.format(len(sentinels))
+        sentinels[sentinel] = diff_str
+        return sentinel
+
+    nested_output = salt.output.out_format(
+        _replace_diffs(changes), "nested", __opts__, nested_indent=14
+    )
+
+    if not sentinels:
+        return "\n" + nested_output
+
+    # The nested outputter renders each sentinel as a single indented line
+    # (possibly wrapped in ANSI codes).  ``_COLORDIFF_RE`` matches every
+    # sentinel in a single pass: group 1 is the runtime indent, group 2 the
+    # sentinel id used to look up its raw diff string.
+    def _replacer(match):
+        indent = len(match.group(1))
+        diff_str = sentinels.get(match.group(2), "")
+        return _render_diff(diff_str, indent, colors)
+
+    nested_output = _COLORDIFF_RE.sub(_replacer, nested_output)
+
+    return "\n" + nested_output
+
+
+def _format_changes(changes, colors, orchestration=False):
+    """
+    Format the changes dict based on what the data is.
+
+    ``colors`` is the pre-built ANSI color mapping from the calling
+    ``_format_host`` invocation; passing it in avoids re-initializing the
+    color engine on every state block.
     """
     if not changes:
         return False, ""
+
+    colorize = "_color" in __opts__.get("state_output", "").lower()
 
     if orchestration:
         return True, _nested_changes(changes)
 
     if not isinstance(changes, dict):
-        return True, "Invalid Changes data: {}".format(changes)
+        return True, f"Invalid Changes data: {changes}"
 
     ret = changes.get("ret")
     if ret is not None and changes.get("out") == "highstate":
@@ -548,7 +917,10 @@ def _format_changes(changes, orchestration=False):
             changed = changed or c
     else:
         changed = True
-        ctext = _nested_changes(changes)
+        if colorize:
+            ctext = _nested_changes_colorized(changes, colors)
+        else:
+            ctext = _nested_changes(changes)
     return changed, ctext
 
 
@@ -570,7 +942,7 @@ def _format_terse(tcolor, comps, ret, colors, tabular):
                 c=colors, w="\n".join(ret["warnings"])
             )
         fmt_string += "{0}"
-        if __opts__.get("state_output_profile", True) and "start_time" in ret:
+        if __opts__.get("state_output_profile") and "start_time" in ret:
             fmt_string += "{6[start_time]!s} [{6[duration]!s:>7} ms] "
         fmt_string += "{2:>10}.{3:<10} {4:7}   Name: {1}{5}"
     elif isinstance(tabular, str):
@@ -582,8 +954,8 @@ def _format_terse(tcolor, comps, ret, colors, tabular):
                 c=colors, w="\n".join(ret["warnings"])
             )
         fmt_string += " {0} Name: {1} - Function: {2}.{3} - Result: {4}"
-        if __opts__.get("state_output_profile", True) and "start_time" in ret:
-            fmt_string += " Started: - {6[start_time]!s} Duration: {6[duration]!s} ms"
+        if __opts__.get("state_output_profile") and "start_time" in ret:
+            fmt_string += " - Started: {6[start_time]!s} - Duration: {6[duration]!s} ms"
         fmt_string += "{5}"
 
     msg = fmt_string.format(

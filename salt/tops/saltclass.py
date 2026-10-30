@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 r"""
 Saltclass Configuration
 =======================
@@ -35,7 +34,9 @@ Features
 - Expand variables ${} with possibility to escape them if needed \${} (see examples)
 - Ignores missing node/class and will simply return empty without breaking the pillar module completely - will be logged
 
-An example subset of datas is available here: http://git.mauras.ch/salt/saltclass/src/master/examples
+The original example subset hosted at ``git.mauras.ch`` is no longer
+reachable; see the ``salt/tops/saltclass`` test fixtures in the Salt
+source tree for working examples.
 
 ==========================  ===========
 Terms usable in yaml files  Description
@@ -72,35 +73,35 @@ A saltclass tree would look like this:
 .. code-block:: text
 
     <saltclass_path>
-    ├── classes
-    │   ├── app
-    │   │   ├── borgbackup.yml
-    │   │   └── ssh
-    │   │       └── server.yml
-    │   ├── default
-    │   │   ├── init.yml
-    │   │   ├── motd.yml
-    │   │   └── users.yml
-    │   ├── roles
-    │   │   ├── app.yml
-    │   │   └── nginx
-    │   │       ├── init.yml
-    │   │       └── server.yml
-    │   └── subsidiaries
-    │       ├── gnv.yml
-    │       ├── qls.yml
-    │       └── zrh.yml
-    └── nodes
-        ├── geneva
-        │   └── gnv.node1.yml
-        ├── lausanne
-        │   ├── qls.node1.yml
-        │   └── qls.node2.yml
-        ├── node127.yml
-        └── zurich
-            ├── zrh.node1.yml
-            ├── zrh.node2.yml
-            └── zrh.node3.yml
+    |--- classes
+    |   |--- app
+    |   |   |--- borgbackup.yml
+    |   |   `--- ssh
+    |   |       `--- server.yml
+    |   |--- default
+    |   |   |--- init.yml
+    |   |   |--- motd.yml
+    |   |   `--- users.yml
+    |   |--- roles
+    |   |   |--- app.yml
+    |   |   `--- nginx
+    |   |       |--- init.yml
+    |   |       `--- server.yml
+    |   `--- subsidiaries
+    |       |--- gnv.yml
+    |       |--- qls.yml
+    |       `--- zrh.yml
+    `--- nodes
+        |--- geneva
+        |   `--- gnv.node1.yml
+        |--- lausanne
+        |   |--- qls.node1.yml
+        |   `--- qls.node2.yml
+        |--- node127.yml
+        `--- zurich
+            |--- zrh.node1.yml
+            |--- zrh.node2.yml
+            `--- zrh.node3.yml
 
 
 Saltclass Examples
@@ -207,9 +208,6 @@ Not using ``^`` as the first entry will simply merge the lists
     Currently you can't have both a variable and an escaped variable in the same string as the
     escaped one will not be correctly rendered - '\${xx}' will stay as is instead of being rendered as '${xx}'
 """
-
-# import python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
 

@@ -7,8 +7,10 @@ Salt :index:`Best Practices`
 Salt's extreme flexibility leads to many questions concerning the structure of
 configuration files.
 
-This document exists to clarify these points through examples and
-code.
+This document exists to clarify these points through examples and code.
+
+.. important::
+   The guidance here should be taken in combination with :ref:`hardening-salt`.
 
 General rules
 -------------
@@ -19,7 +21,15 @@ General rules
 4. Store sensitive data in pillar.
 5. Don't use grains for matching in your pillar top file for any sensitive
    pillars.
+6. When accessing modules from within a template, use the mapping
+   key syntax instead of the attribute one to avoid edge cases. Example:
 
+   .. code-block:: jinja
+
+       {%- set do_this = salt['pillar.get']('foo:bar') %}
+       {%- set avoid_this = salt.pillar.get('foo:bar') %}
+
+   .. include:: ../_incl/grains_passwords.rst
 
 Structuring States and Formulas
 -------------------------------

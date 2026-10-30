@@ -3,6 +3,7 @@ Watch for pkgs that have upgrades, then fire an event.
 
 .. versionadded:: 2016.3.0
 """
+
 import logging
 
 __virtualname__ = "pkg"
@@ -14,7 +15,12 @@ def __virtual__():
     """
     Only load if strace is installed
     """
-    return __virtualname__ if "pkg.upgrade_available" in __salt__ else False
+    if "pkg.upgrade_available" in __salt__:
+        return __virtualname__
+    else:
+        err_msg = "pkg.upgrade_available is missing."
+        log.error("Unable to load %s beacon: %s", __virtualname__, err_msg)
+        return False, err_msg
 
 
 def validate(config):
@@ -23,7 +29,7 @@ def validate(config):
     """
     # Configuration for pkg beacon should be a list
     if not isinstance(config, list):
-        return False, ("Configuration for pkg beacon must be a list.")
+        return False, "Configuration for pkg beacon must be a list."
 
     # Configuration for pkg beacon should contain pkgs
     pkgs_found = False
@@ -53,6 +59,9 @@ def beacon(config):
                 - apache2
             - refresh: True
     """
+    if "beacon.pkg" not in __context__:
+        __context__["beacon.pkg"] = {}
+
     ret = []
 
     _refresh = False
@@ -64,9 +73,30 @@ def beacon(config):
             _refresh = True
 
     for pkg in pkgs:
-        _installed = __salt__["pkg.version"](pkg)
-        _latest = __salt__["pkg.latest_version"](pkg, refresh=_refresh)
-        if _installed and _latest:
-            _pkg = {"pkg": pkg, "version": _latest}
-            ret.append(_pkg)
+        if pkg not in __context__["beacon.pkg"]:
+            __context__["beacon.pkg"][pkg] = None
+        status = __context__["beacon.pkg"][pkg]
+
+        # Status is None, so skip the first pass
+        _installed = __salt__["pkg.version"](pkg, use_context=False)
+        if _installed:
+            version = _installed
+            __context__["beacon.pkg"][pkg] = "installed"
+
+            _latest = __salt__["pkg.latest_version"](pkg, refresh=_refresh)
+            if _latest:
+                version = _latest
+                __context__["beacon.pkg"][pkg] = "upgrade"
+        else:
+            __context__["beacon.pkg"][pkg] = "not-installed"
+            version = None
+
+        if status:
+            if __context__["beacon.pkg"][pkg] != status:
+                _pkg = {
+                    "pkg": pkg,
+                    "version": version,
+                    "status": __context__["beacon.pkg"][pkg],
+                }
+                ret.append(_pkg)
     return ret

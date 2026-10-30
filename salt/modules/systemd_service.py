@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Provides the service module for systemd
 
@@ -15,8 +14,6 @@ Provides the service module for systemd
     call it under the name 'service' and NOT 'systemd'. You can see that also
     in the examples below.
 """
-# Import Python libs
-from __future__ import absolute_import, print_function, unicode_literals
 
 import errno
 import fnmatch
@@ -26,16 +23,12 @@ import os
 import re
 import shlex
 
-# Import Salt libs
 import salt.utils.files
 import salt.utils.itertools
 import salt.utils.path
 import salt.utils.stringutils
 import salt.utils.systemd
 from salt.exceptions import CommandExecutionError
-
-# Import 3rd-party libs
-from salt.ext import six
 
 log = logging.getLogger(__name__)
 
@@ -58,19 +51,20 @@ VALID_UNIT_TYPES = (
     "path",
     "timer",
 )
+SALT_MINION_SERVICE = "salt-minion.service"
 
 # Define the module's virtual name
 __virtualname__ = "service"
-
-# Disable check for string substitution
-# pylint: disable=E1321
 
 
 def __virtual__():
     """
     Only work on systems that have been booted with systemd
     """
-    if __grains__.get("kernel") == "Linux" and salt.utils.systemd.booted(__context__):
+    is_linux = __grains__.get("kernel") == "Linux"
+    is_booted = salt.utils.systemd.booted(__context__)
+    is_offline = salt.utils.systemd.offline(__context__)
+    if is_linux and (is_booted or is_offline):
         return __virtualname__
     return (
         False,
@@ -94,8 +88,8 @@ def _canonical_unit_name(name):
     Build a canonical unit name treating unit names without one
     of the valid suffixes as a service.
     """
-    if not isinstance(name, six.string_types):
-        name = six.text_type(name)
+    if not isinstance(name, str):
+        name = str(name)
     if any(name.endswith(suffix) for suffix in VALID_UNIT_TYPES):
         return name
     return "%s.service" % name
@@ -105,6 +99,11 @@ def _check_available(name):
     """
     Returns boolean telling whether or not the named service is available
     """
+    if offline():
+        raise CommandExecutionError(
+            "Cannot run in offline mode. Failed to get information on unit '%s'" % name
+        )
+
     _status = _systemctl_status(name)
     sd_version = salt.utils.systemd.version(__context__)
     if sd_version is not None and sd_version >= 231:
@@ -137,12 +136,8 @@ def _check_for_unit_changes(name):
     Check for modified/updated unit files, and run a daemon-reload if any are
     found.
     """
-    contextkey = "systemd._check_for_unit_changes.{0}".format(name)
-    if contextkey not in __context__:
-        if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-            systemctl_reload()
-        # Set context key to avoid repeating this check
-        __context__[contextkey] = True
+    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
+        systemctl_reload()
 
 
 def _check_unmask(name, unmask, unmask_runtime, root=None):
@@ -154,20 +149,6 @@ def _check_unmask(name, unmask, unmask_runtime, root=None):
         unmask_(name, runtime=False, root=root)
     if unmask_runtime:
         unmask_(name, runtime=True, root=root)
-
-
-def _clear_context():
-    """
-    Remove context
-    """
-    # Using list() here because modifying a dictionary during iteration will
-    # raise a RuntimeError.
-    for key in list(__context__):
-        try:
-            if key.startswith("systemd._systemctl_status."):
-                __context__.pop(key)
-        except AttributeError:
-            continue
 
 
 def _default_runlevel():
@@ -199,9 +180,7 @@ def _default_runlevel():
 
     # The default runlevel can also be set via the kernel command-line.
     try:
-        valid_strings = set(
-            ("0", "1", "2", "3", "4", "5", "6", "s", "S", "-s", "single")
-        )
+        valid_strings = {"0", "1", "2", "3", "4", "5", "6", "s", "S", "-s", "single"}
         with salt.utils.files.fopen("/proc/cmdline") as fp_:
             for line in fp_:
                 line = salt.utils.stringutils.to_unicode(line)
@@ -291,7 +270,7 @@ def _get_service_exec():
                 break
         else:
             raise CommandExecutionError(
-                "Unable to find sysv service manager (tried {0})".format(
+                "Unable to find sysv service manager (tried {})".format(
                     ", ".join(executables)
                 )
             )
@@ -306,12 +285,18 @@ def _runlevel():
     contextkey = "systemd._runlevel"
     if contextkey in __context__:
         return __context__[contextkey]
-    out = __salt__["cmd.run"]("runlevel", python_shell=False, ignore_retcode=True)
-    try:
-        ret = out.split()[1]
-    except IndexError:
-        # The runlevel is unknown, return the default
+    runlevel_bin = salt.utils.path.which("runlevel")
+    if runlevel_bin is None:
+        # No runlevel binary (e.g. Ubuntu 26.04 ships without sysvinit-utils),
+        # return the default
         ret = _default_runlevel()
+    else:
+        out = __salt__["cmd.run"](runlevel_bin, python_shell=False, ignore_retcode=True)
+        try:
+            ret = out.split()[1]
+        except IndexError:
+            # The runlevel is unknown, return the default
+            ret = _default_runlevel()
     __context__[contextkey] = ret
     return ret
 
@@ -328,7 +313,9 @@ def _strip_scope(msg):
     return "\n".join(ret).strip()
 
 
-def _systemctl_cmd(action, name=None, systemd_scope=False, no_block=False, root=None):
+def _systemctl_cmd(
+    action, name=None, systemd_scope=False, no_block=False, root=None, extra_args=None
+):
     """
     Build a systemctl command line. Treat unit names without one
     of the valid suffixes as a service.
@@ -339,37 +326,41 @@ def _systemctl_cmd(action, name=None, systemd_scope=False, no_block=False, root=
         and salt.utils.systemd.has_scope(__context__)
         and __salt__["config.get"]("systemd.scope", True)
     ):
-        ret.extend(["systemd-run", "--scope"])
-    ret.append("systemctl")
+        if systemd_run_path := salt.utils.path.which("systemd-run"):
+            ret.extend([systemd_run_path, "--scope"])
+        else:
+            raise CommandExecutionError(
+                "systemd-run is required for running systemctl with --scope, but it was not found on the system. "
+                "Make sure systemd-run is installed and in the system's PATH "
+                "or disable it using the 'systemd.scope' config option."
+            )
+    ret.append(salt.utils.path.which("systemctl"))
     if no_block:
         ret.append("--no-block")
     if root:
         ret.extend(["--root", root])
-    if isinstance(action, six.string_types):
+    if isinstance(action, str):
         action = shlex.split(action)
     ret.extend(action)
     if name is not None:
         ret.append(_canonical_unit_name(name))
     if "status" in ret:
         ret.extend(["-n", "0"])
+    if isinstance(extra_args, list):
+        ret.extend(extra_args)
     return ret
 
 
 def _systemctl_status(name):
     """
-    Helper function which leverages __context__ to keep from running 'systemctl
-    status' more than once.
+    Helper function to run 'systemctl status'.
     """
-    contextkey = "systemd._systemctl_status.%s" % name
-    if contextkey in __context__:
-        return __context__[contextkey]
-    __context__[contextkey] = __salt__["cmd.run_all"](
+    return __salt__["cmd.run_all"](
         _systemctl_cmd("status", name),
         python_shell=False,
         redirect_stderr=True,
         ignore_retcode=True,
     )
-    return __context__[contextkey]
 
 
 def _sysv_enabled(name, root):
@@ -379,7 +370,7 @@ def _sysv_enabled(name, root):
     runlevel.
     """
     # Find exact match (disambiguate matches like "S01anacron" for cron)
-    rc = _root("/etc/rc{}.d/S*{}".format(_runlevel(), name), root)
+    rc = _root(f"/etc/rc{_runlevel()}.d/S*{name}", root)
     for match in glob.glob(rc):
         if re.match(r"S\d{,2}%s" % name, os.path.basename(match)):
             return True
@@ -405,6 +396,26 @@ def _unit_file_changed(name):
     return "'systemctl daemon-reload'" in status
 
 
+def _salt_minion_service(name):
+    """
+    Returns True if the service name is the salt-minion service, otherwise
+    returns False.
+    """
+    return _canonical_unit_name(name) == SALT_MINION_SERVICE
+
+
+def _no_block_default(name, no_block):
+    """
+    Return the default value for no_block if it is not set.
+
+    Defaults to True if the service is the salt-minion service, otherwise
+    defaults to False.
+    """
+    if no_block is None:
+        return True if _salt_minion_service(name) else False
+    return no_block
+
+
 def systemctl_reload():
     """
     .. versionadded:: 0.15.0
@@ -426,7 +437,6 @@ def systemctl_reload():
         raise CommandExecutionError(
             "Problem performing systemctl daemon-reload: %s" % out["stdout"]
         )
-    _clear_context()
     return True
 
 
@@ -492,7 +502,7 @@ def get_enabled(root=None):
     )
     for line in salt.utils.itertools.split(out, "\n"):
         try:
-            fullname, unit_state = line.strip().split(None, 1)
+            fullname, unit_state = line.strip().split()[:2]
         except ValueError:
             continue
         else:
@@ -507,7 +517,7 @@ def get_enabled(root=None):
             ret.add(unit_name if unit_type == "service" else fullname)
 
     # Add in any sysvinit services that are enabled
-    ret.update(set([x for x in _get_sysv_services(root) if _sysv_enabled(x, root)]))
+    ret.update({x for x in _get_sysv_services(root) if _sysv_enabled(x, root)})
     return sorted(ret)
 
 
@@ -534,7 +544,7 @@ def get_disabled(root=None):
     )
     for line in salt.utils.itertools.split(out, "\n"):
         try:
-            fullname, unit_state = line.strip().split(None, 1)
+            fullname, unit_state = line.strip().split()[:2]
         except ValueError:
             continue
         else:
@@ -549,7 +559,7 @@ def get_disabled(root=None):
             ret.add(unit_name if unit_type == "service" else fullname)
 
     # Add in any sysvinit services that are disabled
-    ret.update(set([x for x in _get_sysv_services(root) if not _sysv_enabled(x, root)]))
+    ret.update({x for x in _get_sysv_services(root) if not _sysv_enabled(x, root)})
     return sorted(ret)
 
 
@@ -578,7 +588,7 @@ def get_static(root=None):
     )
     for line in salt.utils.itertools.split(out, "\n"):
         try:
-            fullname, unit_state = line.strip().split(None, 1)
+            fullname, unit_state = line.strip().split()[:2]
         except ValueError:
             continue
         else:
@@ -872,7 +882,7 @@ def start(name, no_block=False, unmask=False, unmask_runtime=False):
     return True
 
 
-def stop(name, no_block=False):
+def stop(name, no_block=None):
     """
     .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
         On minions running systemd>=205, `systemd-run(1)`_ is now used to
@@ -888,9 +898,16 @@ def stop(name, no_block=False):
     Stop the specified service with systemd
 
     no_block : False
-        Set to ``True`` to start the service using ``--no-block``.
+        Set to ``True`` to stop the service using ``--no-block``.
+        Defaults to ``True`` for the salt-minion service.
 
         .. versionadded:: 2017.7.0
+
+        .. versionchanged:: 3006.15
+            The default value for this argument has changed if the service is
+            the salt-minion service, where it now defaults to ``True`` to
+            prevent a deadlock with the minion waiting for the service to stop
+            before exiting.
 
     CLI Example:
 
@@ -898,6 +915,7 @@ def stop(name, no_block=False):
 
         salt '*' service.stop <service name>
     """
+    no_block = _no_block_default(name, no_block)
     _check_for_unit_changes(name)
     # Using cmd.run_all instead of cmd.retcode here to make unit tests easier
     return (
@@ -909,7 +927,7 @@ def stop(name, no_block=False):
     )
 
 
-def restart(name, no_block=False, unmask=False, unmask_runtime=False):
+def restart(name, no_block=None, unmask=False, unmask_runtime=False):
     """
     .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
         On minions running systemd>=205, `systemd-run(1)`_ is now used to
@@ -925,9 +943,16 @@ def restart(name, no_block=False, unmask=False, unmask_runtime=False):
     Restart the specified service with systemd
 
     no_block : False
-        Set to ``True`` to start the service using ``--no-block``.
+        Set to ``True`` to restart the service using ``--no-block``.
+        Defaults to ``True`` for the salt-minion service.
 
         .. versionadded:: 2017.7.0
+
+        .. versionchanged:: 3006.15
+            The default value for this argument has changed if the service is
+            the salt-minion service, where it now defaults to ``True``
+            to prevent a deadlock with the minion waiting for the service to
+            stop before exiting.
 
     unmask : False
         Set to ``True`` to remove an indefinite mask before attempting to
@@ -951,6 +976,7 @@ def restart(name, no_block=False, unmask=False, unmask_runtime=False):
 
         salt '*' service.restart <service name>
     """
+    no_block = _no_block_default(name, no_block)
     _check_for_unit_changes(name)
     _check_unmask(name, unmask, unmask_runtime)
     ret = __salt__["cmd.run_all"](
@@ -1041,7 +1067,7 @@ def force_reload(name, no_block=True, unmask=False, unmask_runtime=False):
     Force-reload the specified service with systemd
 
     no_block : False
-        Set to ``True`` to start the service using ``--no-block``.
+        Set to ``True`` to force_reload the service using ``--no-block``.
 
         .. versionadded:: 2017.7.0
 
@@ -1148,7 +1174,7 @@ def enable(
     Enable the named service to start when the system boots
 
     no_block : False
-        Set to ``True`` to start the service using ``--no-block``.
+        Set to ``True`` to enable the service using ``--no-block``.
 
         .. versionadded:: 2017.7.0
 
@@ -1229,7 +1255,7 @@ def disable(
     Disable the named service to not start when the system boots
 
     no_block : False
-        Set to ``True`` to start the service using ``--no-block``.
+        Set to ``True`` to disable the service using ``--no-block``.
 
         .. versionadded:: 2017.7.0
 
@@ -1288,15 +1314,27 @@ def enabled(name, root=None, **kwargs):  # pylint: disable=unused-argument
     # Try 'systemctl is-enabled' first, then look for a symlink created by
     # systemctl (older systemd releases did not support using is-enabled to
     # check templated services), and lastly check for a sysvinit service.
-    if (
-        __salt__["cmd.retcode"](
-            _systemctl_cmd("is-enabled", name, root=root),
-            python_shell=False,
-            ignore_retcode=True,
-        )
-        == 0
-    ):
+    cmd_result = __salt__["cmd.run_all"](
+        _systemctl_cmd("is-enabled", name, root=root),
+        python_shell=False,
+        ignore_retcode=True,
+    )
+    if cmd_result["retcode"] == 0 and cmd_result["stdout"] != "alias":
         return True
+    elif cmd_result["stdout"] == "alias":
+        # check the service behind the alias
+        aliased_name = __salt__["cmd.run_stdout"](
+            _systemctl_cmd("show", name, root=root, extra_args=["-P", "Id"]),
+            python_shell=False,
+        )
+        if (
+            __salt__["cmd.retcode"](
+                _systemctl_cmd("is-enabled", aliased_name, root=root),
+                python_shell=False,
+                ignore_retcode=True,
+            )
+        ) == 0:
+            return True
     elif "@" in name:
         # On older systemd releases, templated services could not be checked
         # with ``systemctl is-enabled``. As a fallback, look for the symlinks
@@ -1349,6 +1387,8 @@ def show(name, root=None):
 
     CLI Example:
 
+    .. code-block:: bash
+
         salt '*' service.show <service name>
     """
     ret = {}
@@ -1384,6 +1424,8 @@ def execs(root=None):
 
     CLI Example:
 
+    .. code-block:: bash
+
         salt '*' service.execs
     """
     ret = {}
@@ -1405,7 +1447,7 @@ def firstboot(
     root=None,
 ):
     """
-    .. versionadded:: TBD
+    .. versionadded:: 3001
 
     Call systemd-firstboot to configure basic settings of the system
 
@@ -1432,10 +1474,12 @@ def firstboot(
 
     CLI Example:
 
+    .. code-block:: bash
+
         salt '*' service.firstboot keymap=jp locale=en_US.UTF-8
 
     """
-    cmd = ["systemd-firstboot"]
+    cmd = [salt.utils.path.which("systemd-firstboot")]
     parameters = [
         ("locale", locale),
         ("locale-message", locale_message),
@@ -1447,7 +1491,7 @@ def firstboot(
     ]
     for parameter, value in parameters:
         if value:
-            cmd.extend(["--{}".format(parameter), str(value)])
+            cmd.extend([f"--{parameter}", str(value)])
 
     out = __salt__["cmd.run_all"](cmd)
 
@@ -1455,3 +1499,21 @@ def firstboot(
         raise CommandExecutionError("systemd-firstboot error: {}".format(out["stderr"]))
 
     return True
+
+
+def offline():
+    """
+    .. versionadded:: 3004
+
+    Check if systemd is working in offline mode, where is not possible
+    to talk with PID 1.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' service.offline
+
+    """
+
+    return salt.utils.systemd.offline(__context__)

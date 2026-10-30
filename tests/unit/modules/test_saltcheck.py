@@ -1,11 +1,15 @@
 """Unit test for saltcheck execution module"""
 
+import os
 import os.path
+import shutil
+import tempfile
+
+import pytest
 
 import salt.config
 import salt.modules.saltcheck as saltcheck
 import salt.syspaths as syspaths
-from tests.support.helpers import slowTest
 from tests.support.mixins import LoaderModuleMockMixin
 from tests.support.mock import MagicMock, patch
 from tests.support.unit import TestCase
@@ -18,17 +22,24 @@ class SaltcheckTestCase(TestCase, LoaderModuleMockMixin):
 
     def setup_loader_modules(self):
         # Setting the environment to be local
+        tmp_root = tempfile.mkdtemp(prefix="saltcheck-test-")
+        self.addCleanup(lambda: shutil.rmtree(tmp_root, ignore_errors=True))
         local_opts = salt.config.minion_config(
             os.path.join(syspaths.CONFIG_DIR, "minion")
         )
         local_opts["file_client"] = "local"
         local_opts["conf_file"] = "/etc/salt/minion"
+        local_opts["root_dir"] = tmp_root
+        local_opts["cachedir"] = os.path.join(
+            tmp_root, "var", "cache", "salt", "minion"
+        )
+        os.makedirs(local_opts["cachedir"], exist_ok=True)
         patcher = patch("salt.config.minion_config", MagicMock(return_value=local_opts))
         patcher.start()
         self.addCleanup(patcher.stop)
         return {saltcheck: {"__opts__": local_opts}}
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_call_salt_command(self):
         """test simple test.echo module"""
         with patch.dict(
@@ -45,7 +56,7 @@ class SaltcheckTestCase(TestCase, LoaderModuleMockMixin):
             )
             self.assertEqual(returned, "hello")
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_call_salt_command2(self):
         """test simple test.echo module again"""
         with patch.dict(
@@ -61,6 +72,24 @@ class SaltcheckTestCase(TestCase, LoaderModuleMockMixin):
                 fun="test.echo", args=["hello"], kwargs=None
             )
             self.assertNotEqual(returned, "not-hello")
+
+    def test_call_saltcheck_with_proxy(self):
+        """test fail to load saltcheck module if proxy"""
+        with patch.dict(
+            saltcheck.__salt__,
+            {
+                "config.get": MagicMock(return_value=True),
+                "sys.list_modules": MagicMock(return_value=["module1"]),
+                "cp.cache_master": MagicMock(return_value=[True]),
+            },
+        ), patch("salt.utils.platform.is_proxy", MagicMock(return_value=[True])):
+            ret, message = saltcheck.__virtual__()
+            self.assertFalse(ret)
+            self.assertEqual(
+                message,
+                "The saltcheck execution module failed to load: only available on"
+                " minions.",
+            )
 
     def test__assert_equal1(self):
         """test"""
@@ -464,7 +493,7 @@ class SaltcheckTestCase(TestCase, LoaderModuleMockMixin):
             mybool = sc_instance._SaltCheck__assert_not_empty("")
             self.assertNotEqual(mybool, "Pass")
 
-    @slowTest
+    @pytest.mark.slow_test
     def test_run_test_1(self):
         """test"""
         with patch.dict(

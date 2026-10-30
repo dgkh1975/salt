@@ -1,5 +1,6 @@
 import salt.utils.parsers
-from salt.utils.verify import check_user, verify_log
+from salt.exceptions import SaltInvocationError
+from salt.utils.verify import check_user
 
 
 class SaltKey(salt.utils.parsers.SaltKeyOptionParser):
@@ -14,10 +15,12 @@ class SaltKey(salt.utils.parsers.SaltKeyOptionParser):
         import salt.key
 
         self.parse_args()
+        if self.options.delete_all:
+            if self.args:
+                raise SaltInvocationError(
+                    "Delete all takes no arguments. Use -d to delete specified keys"
+                )
 
-        self.setup_logfile_logger()
-        verify_log(self.config)
-
-        key = salt.key.KeyCLI(self.config)
-        if check_user(self.config["user"]):
-            key.run()
+        with salt.key.KeyCLI(self.config) as key:
+            if check_user(self.config["user"]):
+                key.run()

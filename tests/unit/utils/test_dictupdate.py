@@ -1,16 +1,8 @@
-# -*- coding: utf-8 -*-
-
-# Import python libs
-from __future__ import absolute_import, print_function, unicode_literals
-
 import copy
+from collections import OrderedDict
 
-# Import Salt libs
 import salt.utils.dictupdate as dictupdate
 from salt.exceptions import SaltInvocationError
-from salt.utils.odict import OrderedDict
-
-# Import Salt Testing libs
 from tests.support.unit import TestCase
 
 
@@ -351,3 +343,18 @@ class UtilDeepDictUpdateTestCase(TestCase):
                 dictupdate.update_dict_key_value(
                     {}, "foo", update_with, ordered_dict=True
                 )
+
+    def test_update_with_merge_lists_and_mapping(self):
+        """
+        Test that updating a list with a mapping raises a TypeError
+        when merge_lists=True.
+        """
+        mdict = copy.deepcopy(self.dict1)
+        mdict["A"] = [1, 2]
+        with self.assertRaises(TypeError):
+            dictupdate.update(
+                copy.deepcopy(mdict),
+                {"A": {"key": "value"}},
+                merge_lists=True,
+                strict=True,
+            )

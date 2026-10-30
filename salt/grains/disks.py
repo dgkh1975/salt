@@ -1,10 +1,7 @@
-# -*- coding: utf-8 -*-
 """
     Detect disks
 """
-from __future__ import absolute_import, print_function, unicode_literals
 
-# Import python libs
 import glob
 import logging
 import re
@@ -12,8 +9,6 @@ import re
 # Solve the Chicken and egg problem where grains need to run before any
 # of the modules are loaded and are generally available for any usage.
 import salt.modules.cmdmod
-
-# Import salt libs
 import salt.utils.files
 import salt.utils.path
 import salt.utils.platform
@@ -21,6 +16,7 @@ import salt.utils.platform
 __salt__ = {
     "cmd.run": salt.modules.cmdmod._run_quiet,
     "cmd.run_all": salt.modules.cmdmod._run_all_quiet,
+    "cmd.powershell": salt.modules.cmdmod.powershell,
 }
 
 log = logging.getLogger(__name__)
@@ -40,7 +36,7 @@ def disks():
         log.trace("Disk grain does not support OS")
 
 
-class _geomconsts(object):
+class _geomconsts:
     GEOMNAME = "Geom name"
     MEDIASIZE = "Mediasize"
     SECTORSIZE = "Sectorsize"
@@ -96,14 +92,14 @@ def _freebsd_geom():
     geom = salt.utils.path.which("geom")
     ret = {"disks": {}, "ssds": []}
 
-    devices = __salt__["cmd.run"]("{0} disk list".format(geom))
+    devices = __salt__["cmd.run"](f"{geom} disk list")
     devices = devices.split("\n\n")
 
     def parse_geom_attribs(device):
         tmp = {}
         for line in device.split("\n"):
             for attrib in _geom_attribs:
-                search = re.search(r"{0}:\s(.*)".format(attrib), line)
+                search = re.search(rf"{attrib}:\s(.*)", line)
                 if search:
                     value = _datavalue(
                         _geomconsts._datatypes.get(attrib), search.group(1)
@@ -152,47 +148,40 @@ def _linux_disks():
                             "not report 0 or 1",
                             device,
                         )
-        except IOError:
+        except OSError:
             pass
     return ret
 
 
 def _windows_disks():
-    wmic = salt.utils.path.which("wmic")
 
-    namespace = r"\\root\microsoft\windows\storage"
-    path = "MSFT_PhysicalDisk"
-    get = "DeviceID,MediaType"
-
+    cmd = "Get-PhysicalDisk | Select DeviceID, MediaType"
     ret = {"disks": [], "ssds": []}
 
-    cmdret = __salt__["cmd.run_all"](
-        "{0} /namespace:{1} path {2} get {3} /format:table".format(
-            wmic, namespace, path, get
-        )
-    )
+    drive_info = __salt__["cmd.powershell"](cmd)
 
-    if cmdret["retcode"] != 0:
-        log.trace("Disk grain does not support this version of Windows")
-    else:
-        for line in cmdret["stdout"].splitlines():
-            info = line.split()
-            if len(info) != 2 or not info[0].isdigit() or not info[1].isdigit():
-                continue
-            device = r"\\.\PhysicalDrive{0}".format(info[0])
-            mediatype = info[1]
-            if mediatype == "3":
-                log.trace("Device %s reports itself as an HDD", device)
-                ret["disks"].append(device)
-            elif mediatype == "4":
-                log.trace("Device %s reports itself as an SSD", device)
-                ret["ssds"].append(device)
-                ret["disks"].append(device)
-            elif mediatype == "5":
-                log.trace("Device %s reports itself as an SCM", device)
-                ret["disks"].append(device)
-            else:
-                log.trace("Device %s reports itself as Unspecified", device)
-                ret["disks"].append(device)
+    if not drive_info:
+        log.trace("No physical discs found")
+        return ret
+
+    # We need a list of dict
+    if isinstance(drive_info, dict):
+        drive_info = [drive_info]
+
+    for drive in drive_info:
+        media_type = drive.get("MediaType")
+        # Make sure we have a valid drive type
+        if media_type is None or media_type.lower() not in [
+            "hdd",
+            "ssd",
+            "scm",
+            "unspecified",
+        ]:
+            log.trace(f"Unknown media type: {media_type}")
+            continue
+        device = rf'\\.\PhysicalDrive{drive["DeviceID"]}'
+        ret["disks"].append(device)
+        if media_type.lower() == "ssd":
+            ret["ssds"].append(device)
 
     return ret

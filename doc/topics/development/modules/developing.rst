@@ -61,6 +61,71 @@ supports tab-completion.
 
 To exit IPython and continue running Salt, press ``Ctrl-d`` to logout.
 
+.. _loader:
+
+The Salt Loader
+===============
+
+Salt's loader system is responsible for reading `Special Module Contents`_ and
+providing the context for the special `Dunder Dictionaries`_. When modules
+developed for Salt's loader are imported directly, the dunder attributes won't
+be populated. You can use the `Loader Context`_ to work around this.
+
+Loader Context
+--------------
+
+Given the following.
+
+.. code-block:: python
+
+        # coolmod.py
+
+
+        def utils_func_getter(name):
+            return __utils__[name]
+
+You would not be able import ``coolmod`` and run ``utils_func_getter`` because
+``__utils__`` would not be defined. You must run ``coolmod.utils_func_getter``
+in the context of a loader.
+
+.. code-block:: python
+
+        import coolmod
+        import salt.loader
+
+        opts = {}
+        utils = salt.loader.utils(opts)
+        with salt.loader.context(utils):
+            func = coolmod.utils_func_getter("foo.bar")
+
+.. _module-naming-best-practices:
+
+Module Naming Best Practices
+-----------------------------
+
+For optimal loader performance, name module files to match their module name
+or include the module name in the filename.
+
+When the loader searches for a module, it performs the following stages:
+
+1. Exact filename match (e.g., ``test.py`` for module ``test``)
+2. Partial filename matches (files containing "test" in the name)
+3. Expensive search through every module file
+
+Naming your module files appropriately allows the loader to find modules using
+stages 1 or 2, avoiding the expensive full scan in stage 3. This reduces memory
+usage.
+
+Examples of good naming:
+
+- If a module provides functionality under the name ``mymod``, name the file
+  ``mymod.py``
+- If using virtual names via ``__virtualname__``, include the virtual name in
+  the filename (e.g., ``mymod_impl.py`` for virtual name ``mymod``)
+
+See :conf_minion:`lazy_loader_strict_matching` for a configuration option that
+disables the expensive stage 3 search entirely.
+
 Special Module Contents
 =======================
 
@@ -116,6 +181,11 @@ The following dunder dictionaries are always defined, but may be empty
 __opts__
 --------
 
+.. versionchanged:: 3006.0
+
+    The ``__opts__`` dictionary can now be accessed via
+    :py:mod:`~salt.loader.context``.
+
 Defined in: All modules
 
 The ``__opts__`` dictionary contains all of the options passed in the
@@ -125,7 +195,13 @@ configuration file for the master or minion.
 
     In many places in salt, instead of pulling raw data from the __opts__
     dict, configuration data should be pulled from the salt `get` functions
-    such as config.get, aka - ``__salt__['config.get']('foo:bar')``
+    such as config.get
+
+    .. code-block:: python
+
+        __salt__["config.get"]("foo:bar")
+
+
     The `get` functions also allow for dict traversal via the *:* delimiter.
     Consider using get functions whenever using ``__opts__`` or ``__pillar__``
     and ``__grains__`` (when using grains for configuration data)
@@ -155,6 +231,39 @@ functions to be called as they have been set up by the salt loader.
 
     When used in runners or outputters, ``__salt__`` references other
     runner/outputter modules, and not execution modules.
+
+Chained ``__salt__`` calls
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``__salt__`` is a fully populated loader dictionary by the time any
+execution module function is called. That means it is safe to call other
+execution modules from within an execution module, including transitively:
+the call to ``__salt__["pkg.install"]("nginx")`` can itself rely on
+``pkg.install`` calling ``__salt__["cmd.run"]`` internally. The execution
+loader is reentrant and the same ``__salt__`` instance is shared across
+the whole call chain.
+
+There are two cases where ``__salt__`` is *not* available, both of which
+happen *before* the loader has finished populating itself:
+
+* Inside ``__virtual__``. At this point the module is being decided about,
+  and other modules may not yet have been loaded. ``__pillar__`` and
+  ``__grains__`` are available; ``__salt__`` is not reliable.
+* Inside module-level code that runs at import time (top-level statements
+  in the file outside any function). Move such code into the function
+  bodies or guard it behind a helper that is called from a regular
+  function.
+
+Inside ``mod_init`` for state modules, ``__salt__`` is fully available.
+
+In renderers and pillar modules, ``__salt__`` and ``__pillar__`` are both
+available while the render or pillar compilation is in progress. This
+makes it safe to call execution modules from a Jinja template
+(``{{ salt['cmd.run']('uname -r') }}``) and to read other pillar values
+(``{{ pillar.get('mysql:password') }}``). The pillar passed to the
+renderer is the pillar as compiled up to that point; do not rely on a
+key being present in pillar if it was added later by a different ext
+pillar.
 
 __grains__
 ----------
@@ -197,13 +306,6 @@ When running an execution module ``__context__`` persists across all module
 executions until the modules are refreshed; such as when
 :py:func:`saltutil.sync_all <salt.modules.saltutil.sync_all>` or
 :py:func:`state.apply <salt.modules.state.apply_>` are executed.
-
-A great place to see how to use ``__context__`` is in the cp.py module in
-salt/modules/cp.py. The fileclient authenticates with the master when it is
-instantiated and then is used to copy files to the minion. Rather than create a
-new fileclient for each file that is to be copied down, one instance of the
-fileclient is instantiated in the ``__context__`` dictionary and is reused for
-each file. Here is an example from salt/modules/cp.py:
 
 .. code-block:: python
 
@@ -253,3 +355,13 @@ Defined in: State
 __sdb__
 -------
 Defined in: SDB
+
+
+__file_client__
+---------------
+
+.. versionchanged:: 3006.5
+
+The ``__file_client__`` dunder was added to states and execution modules. This
+enables the use of a file client without haveing to instantiate one in
+the module.

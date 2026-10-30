@@ -1,9 +1,7 @@
 """
-watchdog beacon
+Watch files and translate the changes into salt events.
 
 .. versionadded:: 2019.2.0
-
-Watch files and translate the changes into salt events
 
 :depends:   - watchdog Python module >= 0.8.3
 
@@ -12,16 +10,21 @@ Watch files and translate the changes into salt events
 import collections
 import logging
 
+import salt.utils.beacons
+
 try:
-    from watchdog.observers import Observer
+    # pylint: disable=no-name-in-module
     from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+
+    # pylint: enable=no-name-in-module
 
     HAS_WATCHDOG = True
 except ImportError:
     HAS_WATCHDOG = False
 
     class FileSystemEventHandler:
-        """ A dummy class to make the import work """
+        """A dummy class to make the import work"""
 
         def __init__(self):
             pass
@@ -70,7 +73,9 @@ class Handler(FileSystemEventHandler):
 def __virtual__():
     if HAS_WATCHDOG:
         return __virtualname__
-    return False
+    err_msg = "watchdog library is missing."
+    log.error("Unable to load %s beacon: %s", __virtualname__, err_msg)
+    return False, err_msg
 
 
 def _get_queue(config):
@@ -126,7 +131,7 @@ def _validate(config):
 
     if not isinstance(_config["directories"], dict):
         raise ValidationError(
-            "Configuration for watchdog beacon directories must be a " "dictionary."
+            "Configuration for watchdog beacon directories must be a dictionary."
         )
 
     for path in _config["directories"]:
@@ -136,7 +141,7 @@ def _validate(config):
 def _validate_path(path_config):
     if not isinstance(path_config, dict):
         raise ValidationError(
-            "Configuration for watchdog beacon directory path must be " "a dictionary."
+            "Configuration for watchdog beacon directory path must be a dictionary."
         )
 
     if "mask" in path_config:
@@ -186,16 +191,16 @@ def beacon(config):
 
     The mask list can contain the following events (the default mask is create,
     modify delete, and move):
+
     * create  - File or directory is created in watched directory
     * modify  - The watched directory is modified
     * delete  - File or directory is deleted from watched directory
     * move    - File or directory is moved or renamed in the watched directory
     """
 
-    _config = {}
-    list(map(_config.update, config))
+    config = salt.utils.beacons.list_to_dict(config)
 
-    queue = _get_queue(_config)
+    queue = _get_queue(config)
 
     ret = []
     while queue:
